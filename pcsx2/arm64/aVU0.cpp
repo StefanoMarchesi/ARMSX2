@@ -1873,7 +1873,11 @@ static u8* CompileBlock(u32 startPC, u32 numPairs, VU0BlockEntry* out_block)
 	armSetAsmPtr(code_start, static_cast<size_t>(s_code_end - code_start), &s_pool);
 	u8* const entry = armStartBlock();
 
-	armAsm->Stp(x29, x30, MemOperand(sp, -32, PreIndex));
+	// Frame grown 32 -> 64: [sp,#0..15]=x29/x30, [sp,#16..31]=x22/x23, and
+	// [sp,#32..47] / [sp,#48..63] are reserved as VF-hazard save/restore
+	// scratch slots (see steps 7/8 in the emit pass). The extra 32 bytes keep
+	// the frame 16-byte aligned. The single epilogue below mirrors the 64.
+	armAsm->Stp(x29, x30, MemOperand(sp, -64, PreIndex));
 	armAsm->Stp(x22, VU0_BASE_REG, MemOperand(sp, 16));
 	armAsm->Mov(x29, sp);
 	armMoveAddressToReg(VU0_BASE_REG, &VU0);
@@ -2077,9 +2081,30 @@ static u8* CompileBlock(u32 startPC, u32 numPairs, VU0BlockEntry* out_block)
 		// silently clobbering the upper FMAC result. This manifests as
 		// vertex/shadow corruption in titles like SA where transform
 		// pipelines pair `MUL vfX, ...` (upper) with `LQI vfX, ...` (lower).
-		const bool vf_hazard = !ibit && uregs.VFwrite != 0 &&
+		// vf_hazard == (vf_discard || vf_saverestore); retained only for the
+		// VU0_SHADOW_VERIFY fallback log below, so [[maybe_unused]] keeps a
+		// normal (non-shadow) build warning-clean now that it no longer gates
+		// the fallback.
+		[[maybe_unused]] const bool vf_hazard = !ibit && uregs.VFwrite != 0 &&
 			(lregs.VFwrite == uregs.VFwrite ||
 			 lregs.VFread0 == uregs.VFwrite ||
+			 lregs.VFread1 == uregs.VFwrite);
+		// VF hazard split for the NATIVE save/restore path (steps 7/8 below).
+		// Mirrors the interpreter's two cases in VU0microInterp.cpp:104-158:
+		//   vf_discard    : upper writes vfX AND lower ALSO writes vfX
+		//                   -> drop the lower op entirely (upper wins).
+		//   vf_saverestore: upper writes vfX AND lower READS vfX (not writes)
+		//                   -> lower must see the pre-upper vfX; save old,
+		//                      run upper, stash upper's result, restore old for
+		//                      lower, then restore upper's result so upper wins.
+		// Ordering matches interp exactly: discard is decided first and, when
+		// set, suppresses the whole lower block regardless of any read (interp
+		// gates lines 135-158 on `if (discard == 0)`), so vf_saverestore is
+		// mutually exclusive with vf_discard here.
+		const bool vf_write       = !ibit && uregs.VFwrite != 0;
+		const bool vf_discard     = vf_write && (lregs.VFwrite == uregs.VFwrite);
+		const bool vf_saverestore = vf_write && !vf_discard &&
+			(lregs.VFread0 == uregs.VFwrite ||
 			 lregs.VFread1 == uregs.VFwrite);
 		const bool vi_hazard = !ibit &&
 			(uregs.VIwrite & (1u << REG_CLIP_FLAG)) &&
@@ -2096,11 +2121,27 @@ static u8* CompileBlock(u32 startPC, u32 numPairs, VU0BlockEntry* out_block)
 #ifdef INTERP_VU0_PAIR
 		fallback = true;
 #endif
-		// Hazard fallback is always on: native VF/CLIP_FLAG save/restore (the
-		// thing _vu0Exec lines 104-158 / microVU does to make lower see pre-upper
-		// values) is not yet implemented in this JIT. INTERP_VU0_HAZARD is kept as
-		// a documentation handle but does not toggle behavior today.
-		if (vf_hazard || vi_hazard) fallback = true;
+		// VF hazards (vf_discard / vf_saverestore) are now handled NATIVELY in
+		// the else-branch below (steps 7/8) via a stack-based save/restore that
+		// reproduces _vu0Exec's dance (VU0microInterp.cpp:104-158). Only CLIP
+		// (vi_hazard) stays on the interpreter fallback: its interp gating keys
+		// off `uregs.VIread & CLIP` (VU0microInterp.cpp:119) whereas this
+		// predicate keys off `uregs.VIwrite & CLIP`, and the two differ, so
+		// porting CLIP natively needs separate care (deferred).
+		//
+		// This split is safe because VF-write uppers and CLIP-write uppers are
+		// mutually exclusive: the only upper that touches CLIP is the CLIP op,
+		// whose analyzer sets VFwrite==0 (VUops.cpp:2380, _vuRegsCLIP). Hence a
+		// pair taken natively here (vf_write) never also needs CLIP save/restore
+		// (uregs.VIread & CLIP is 0 whenever uregs.VFwrite != 0), so the VF-only
+		// native handling fully reproduces the interpreter for these pairs.
+		if (vi_hazard) fallback = true;
+#ifdef INTERP_VU0_HAZARD
+		// Opt-in A/B toggle: route the now-native VF hazards back through
+		// vu0Exec (compare native vs interpreter on-device without touching the
+		// per-pair native emit). Off in a normal build.
+		if (vf_discard || vf_saverestore) fallback = true;
+#endif
 #ifdef INTERP_VU0_MBIT
 		if (mbit_set) fallback = true;
 #endif
@@ -2203,16 +2244,26 @@ static u8* CompileBlock(u32 startPC, u32 numPairs, VU0BlockEntry* out_block)
 				armAsm->Str(w4, MemOperand(VU0_BASE_REG, flags_off));
 			}
 
-			// 5. Upper stalls
+			// 5. Upper stalls (Phase-1 inline guard). Only the FMAC pipe can stall,
+			// and _vuTestUpperStalls is a no-op when the FMAC ring is empty, so skip
+			// the call otherwise. Bit-exact by construction.
 			VU0_PERF_BEGIN(_pp_s5);
-			armAsm->Mov(x0, VU0_BASE_REG);
-			armMoveAddressToReg(x1, &uregs_data[i]);
-			armEmitCall(reinterpret_cast<const void*>(_vuTestUpperStalls));
+			if (uregs.pipe == VUPIPE_FMAC)
+			{
+				Label skip_upper;
+				armAsm->Ldr(w4, MemOperand(VU0_BASE_REG, offsetof(VURegs, fmaccount)));
+				armAsm->Cbz(w4, &skip_upper);
+				armAsm->Mov(x0, VU0_BASE_REG);
+				armMoveAddressToReg(x1, &uregs_data[i]);
+				armEmitCall(reinterpret_cast<const void*>(_vuTestUpperStalls));
+				armAsm->Bind(&skip_upper);
+			}
 			VU0_PERF_END(_pp_s5, "VU0_TestUpper_0x%04x", pc);
 
-			// 5b. Lower stalls
+			// 5b. Lower stalls (Phase-1 inline guard). NONE/IALU pipes are no-ops in
+			// _vuTestLowerStalls, so skip the call for them at compile time.
 			VU0_PERF_BEGIN(_pp_s5b);
-			if (!ibit)
+			if (!ibit && lregs.pipe != VUPIPE_NONE && lregs.pipe != VUPIPE_IALU)
 			{
 				armAsm->Mov(x0, VU0_BASE_REG);
 				armMoveAddressToReg(x1, &lregs_data[i]);
@@ -2220,16 +2271,44 @@ static u8* CompileBlock(u32 startPC, u32 numPairs, VU0BlockEntry* out_block)
 			}
 			VU0_PERF_END(_pp_s5b, "VU0_TestLower_0x%04x", pc);
 
-			// 6. Test pipes
+			// 6. Test pipes (Phase-1 inline guard). _vuTestPipes only drains
+			// non-empty pipes; skip the call when FMAC/IALU/FDIV/EFU are all idle.
+			// enable is the first field of fdivPipe/efuPipe (offset 0).
 			VU0_PERF_BEGIN(_pp_s6);
-			armAsm->Mov(x0, VU0_BASE_REG);
-			armEmitCall(reinterpret_cast<const void*>(_vuTestPipes));
+			{
+				Label skip_pipes;
+				armAsm->Ldr(w4, MemOperand(VU0_BASE_REG, offsetof(VURegs, fmaccount)));
+				armAsm->Ldr(w5, MemOperand(VU0_BASE_REG, offsetof(VURegs, ialucount)));
+				armAsm->Orr(w4, w4, w5);
+				armAsm->Ldr(w5, MemOperand(VU0_BASE_REG, offsetof(VURegs, fdiv)));
+				armAsm->Orr(w4, w4, w5);
+				armAsm->Ldr(w5, MemOperand(VU0_BASE_REG, offsetof(VURegs, efu)));
+				armAsm->Orr(w4, w4, w5);
+				armAsm->Cbz(w4, &skip_pipes);
+				armAsm->Mov(x0, VU0_BASE_REG);
+				armEmitCall(reinterpret_cast<const void*>(_vuTestPipes));
+				armAsm->Bind(&skip_pipes);
+			}
 			VU0_PERF_END(_pp_s6, "VU0_TestPipes_0x%04x", pc);
 
 			// 6b. VIBackupCycles
 			armAsm->Mov(x0, VU0_BASE_REG);
 			armAsm->Mov(x1, x22);
 			armEmitCall(reinterpret_cast<const void*>(vu0DecrementVIBackup));
+
+			// --- VF hazard: save pre-upper VF[vfX] to stack slot A (sp+32) ---
+			// The saved value MUST live on the stack, not in a NEON register:
+			// the upper FMAC emit below can `BL vu0_fmac_writeback`, which
+			// clobbers all caller-saved SIMD regs (v0-v7, v16-v31) under AAPCS64
+			// (no red zone). q16 is used ONLY transiently, adjacent to its own
+			// load/store, and is never held across a call. The prologue grew the
+			// frame 32->64 precisely to reserve [sp,#32] and [sp,#48].
+			const int64_t vf_haz_off = vf_write ? vfOff(uregs.VFwrite) : 0;
+			if (vf_saverestore)
+			{
+				armAsm->Ldr(q16, MemOperand(VU0_BASE_REG, vf_haz_off));
+				armAsm->Str(q16, MemOperand(sp, 32));
+			}
 
 			// 7. Upper instruction
 			if (use_ibit_hack)
@@ -2247,6 +2326,18 @@ static u8* CompileBlock(u32 startPC, u32 numPairs, VU0BlockEntry* out_block)
 			VU0_PERF_BEGIN(_pp_s7);
 			recVU0_UpperTable[upper & 0x3f]();
 			VU0_PERF_END(_pp_s7, "VU0_U_%02x_0x%04x", upper & 0x3f, pc);
+
+			// --- VF hazard: between upper and lower (interp lines 139-141) ---
+			// Stash upper's result to slot B (sp+48), then restore the pre-upper
+			// value into VF[vfX] so the lower op reads the OLD value. No call
+			// occurs between here and the lower emit, so q16 survives.
+			if (vf_saverestore)
+			{
+				armAsm->Ldr(q16, MemOperand(VU0_BASE_REG, vf_haz_off)); // upper result
+				armAsm->Str(q16, MemOperand(sp, 48));
+				armAsm->Ldr(q16, MemOperand(sp, 32));                   // pre-upper value
+				armAsm->Str(q16, MemOperand(VU0_BASE_REG, vf_haz_off));
+			}
 
 			// 8. Lower instruction
 			// NOP the lower when this pair is a branch AND the previous pair
@@ -2282,9 +2373,24 @@ static u8* CompileBlock(u32 startPC, u32 numPairs, VU0BlockEntry* out_block)
 				armAsm->Str(w4, MemOperand(VU0_BASE_REG, code_off));
 				VU0.code = lower;
 				VU0_PERF_BEGIN(_pp_s8);
-				if (!suppress_branch)
+				// vf_discard (interp VU0microInterp.cpp:106-110,135): upper and
+				// lower write the same VF -> drop the lower op entirely so upper
+				// wins. Only the op DISPATCH is skipped; the VU0.code store above
+				// and the lower stall bookkeeping (steps 5b/11) stay, matching
+				// interp which still runs _vuTestLowerStalls/_vuAddLowerStalls
+				// when discard==1 (those live outside its `if (discard==0)` gate).
+				if (!suppress_branch && !vf_discard)
 					recVU0_LowerTable[lower >> 25]();
 				VU0_PERF_END(_pp_s8, "VU0_L_%02x_0x%04x", lower >> 25, pc);
+			}
+
+			// --- VF hazard: after lower, restore upper's result (interp 150-153)
+			// Upper wins for a saverestore pair. Done before step 9's _vuClearFMAC
+			// BL; q16 is loaded and stored immediately with no call between.
+			if (vf_saverestore)
+			{
+				armAsm->Ldr(q16, MemOperand(sp, 48));
+				armAsm->Str(q16, MemOperand(VU0_BASE_REG, vf_haz_off));
 			}
 
 			// 9. FMAC clear
@@ -2538,7 +2644,7 @@ static u8* CompileBlock(u32 startPC, u32 numPairs, VU0BlockEntry* out_block)
 #endif
 
 	armAsm->Ldp(x22, VU0_BASE_REG, MemOperand(sp, 16));
-	armAsm->Ldp(x29, x30, MemOperand(sp, 32, PostIndex));
+	armAsm->Ldp(x29, x30, MemOperand(sp, 64, PostIndex)); // mirror 32->64 prologue
 	armAsm->Ret();
 
 	u8* end = armEndBlock();
