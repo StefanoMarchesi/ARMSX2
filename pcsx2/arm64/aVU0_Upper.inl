@@ -30,16 +30,46 @@ static constexpr int64_t accOff()
 static void vu0_fmac_writeback(VURegs* VU, VECTOR* dst, u32 xyzw,
                                 float rx, float ry, float rz, float rw)
 {
-	// VF[0] is hardwired to {0,0,0,1} — discard writes but still update flags
+	// VF[0] is hardwired to {0,0,0,1} — discard writes but still update flags.
+	// Branchless equivalent of four VU_MACx_UPDATE / VU_MACx_CLEAR calls: compute
+	// each written lane\x27s Zero/Sign/Underflow/Overflow bits and clamped output,
+	// then write macflag once (unwritten lanes contribute no bits == CLEAR).
+	// Bit-exact with VUflags.cpp:VU_MAC_UPDATE (VU is always &VU0 here, so the
+	// overflow-clamp gate is CHECK_VU_OVERFLOW(0)).
 	const bool write = (dst != &VU->VF[0]);
-	if (xyzw & 8) { u32 v = VU_MACx_UPDATE(VU, rx); if (write) dst->i.x = v; }
-	else VU_MACx_CLEAR(VU);
-	if (xyzw & 4) { u32 v = VU_MACy_UPDATE(VU, ry); if (write) dst->i.y = v; }
-	else VU_MACy_CLEAR(VU);
-	if (xyzw & 2) { u32 v = VU_MACz_UPDATE(VU, rz); if (write) dst->i.z = v; }
-	else VU_MACz_CLEAR(VU);
-	if (xyzw & 1) { u32 v = VU_MACw_UPDATE(VU, rw); if (write) dst->i.w = v; }
-	else VU_MACw_CLEAR(VU);
+	const bool clamp_ovf = CHECK_VU_OVERFLOW(0);
+	const float in[4] = { rx, ry, rz, rw }; // lane 0..3 -> x,y,z,w (shift 3..0)
+	u32 mac = 0;
+	u32 out[4] = { 0, 0, 0, 0 };
+	for (int lane = 0; lane < 4; lane++)
+	{
+		if (!(xyzw & (8u >> lane)))
+			continue; // lane not written -> CLEAR contributes no bits
+		const float f = in[lane];
+		u32 v = *(u32*)&f;
+		const u32 exp = (v >> 23) & 0xff;
+		const u32 s = v & 0x80000000u;
+		const bool is_zero = (f == 0.0f);
+		const bool is_denorm = (exp == 0) && !is_zero;
+		const bool is_inf = (exp == 255);
+		const int shift = 3 - lane;
+		mac |= ((u32)(is_zero || is_denorm) << (0 + shift))   // Zero
+		     | ((u32)(s != 0u)              << (4 + shift))   // Sign
+		     | ((u32)is_denorm              << (8 + shift))   // Underflow
+		     | ((u32)is_inf                 << (12 + shift)); // Overflow
+		u32 o = v;
+		if (is_denorm) o = s;
+		if (is_inf && clamp_ovf) o = s | 0x7f7fffffu;
+		out[lane] = o;
+	}
+	VU->macflag = mac;
+	if (write)
+	{
+		if (xyzw & 8) dst->i.x = out[0];
+		if (xyzw & 4) dst->i.y = out[1];
+		if (xyzw & 2) dst->i.z = out[2];
+		if (xyzw & 1) dst->i.w = out[3];
+	}
 	VU_STAT_UPDATE(VU);
 }
 
