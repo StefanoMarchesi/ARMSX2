@@ -108,13 +108,14 @@ static u32 GetSpinTime()
 	{
 		return 1000 * atoi(req);
 	}
-#if defined(__ANDROID__)
-	// Mobile producer arrival is bimodal: either sub-µs (EE→MTGS handoff with
-	// work already queued) or many-ms (waiting for a frame boundary). A
-	// 50µs spin window is wrong for both cases — longer than the sub-µs hit
-	// rewards and uselessly short for the many-ms wait. Cut to 2µs to keep
-	// the fast path but stop bleeding CPU on the slow path; the simpleperf
-	// trace showed ~30% of total CPU in ShortSpin at the 50µs default.
+#if defined(__ANDROID__) || (defined(__linux__) && defined(__aarch64__))
+	// Mobile / ARM64-SBC producer arrival is bimodal: either sub-µs (EE→MTGS
+	// handoff with work already queued) or many-ms (waiting for a frame
+	// boundary). A 50µs spin window is wrong for both cases — longer than the
+	// sub-µs hit rewards and uselessly short for the many-ms wait. Cut to 2µs
+	// to keep the fast path but stop bleeding CPU on the slow path. On few-core
+	// ARM64 Linux devices (e.g. Raspberry Pi 5) a perf trace shows the same
+	// ~15-30%% of CPU wasted in ShortSpin at the 50µs default that Android saw.
 	return 2 * 1000;
 #else
 	return 50 * 1000; // 50µs
