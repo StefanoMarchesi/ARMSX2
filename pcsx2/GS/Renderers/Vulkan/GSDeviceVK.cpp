@@ -1045,7 +1045,7 @@ bool GSDeviceVK::CreateCommandBuffers()
 			static constexpr u32 MAX_FRAME_TEXTURE_SETS = 8192;
 			const VkDescriptorPoolSize frame_pool_sizes[] = {
 				{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_FRAME_TEXTURE_SETS * 2},
-				{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAX_FRAME_TEXTURE_SETS * 3},
+				{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAX_FRAME_TEXTURE_SETS * 5},
 				{VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, MAX_FRAME_TEXTURE_SETS * 2},
 				{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, MAX_FRAME_TEXTURE_SETS * 2},
 			};
@@ -3007,6 +3007,19 @@ bool GSDeviceVK::CheckFeatures()
 		vkGetPhysicalDeviceFormatProperties(m_physical_device, VK_FORMAT_D32_SFLOAT_S8_UINT, &props);
 		m_features.stencil_buffer =
 			((props.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0);
+		if (!m_features.stencil_buffer)
+		{
+			// V3D: no D32S8, but D24S8 is fully supported. Use it so stencil DATE keeps
+			// working (24-bit depth quantization is an acceptable approximation).
+			vkGetPhysicalDeviceFormatProperties(m_physical_device, VK_FORMAT_D24_UNORM_S8_UINT, &props);
+			if ((props.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0 &&
+				(props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0)
+			{
+				m_features.stencil_buffer = true;
+				m_use_d24s8_depth = true;
+				Console.Warning("VK: D32S8 not supported - using D24_UNORM_S8_UINT depth-stencil (V3D).");
+			}
+		}
 	}
 
 	// Fbfetch is useless if we don't have barriers enabled.
@@ -3064,6 +3077,15 @@ bool GSDeviceVK::CheckFeatures()
 		Console.WriteLn("VK: Adreno colorWriteMask-with-depthtest workaround active (deviceID=0x%08X driver=0x%08X)",
 			m_device_properties.deviceID, m_device_properties.driverVersion);
 
+	// V3D: no D32_SFLOAT_S8, so CheckFeatures fell back to D24_UNORM_S8 and set
+	// m_use_d24s8_depth. But when framebuffer-fetch is available (VK_EXT_rasterization_
+	// order_attachment_access on V3D) DATE no longer needs a HW stencil, so prefer
+	// full-precision D32_SFLOAT: a 24-bit Z normalized by 2^-32 lands in the bottom
+	// 1/256 of [0,1] -> only ~16 effective bits on UNORM24 -> Z-fighting. D32_SFLOAT
+	// keeps ~24 bits there thanks to the float exponent.
+	if (m_features.framebuffer_fetch)
+		m_use_d24s8_depth = false;
+
 	// whether we can do point/line expand depends on the range of the device
 	const float f_upscale = static_cast<float>(GSConfig.UpscaleMultiplier);
 	m_features.point_expand = (m_device_features.largePoints && limits.pointSizeRange[0] <= f_upscale &&
@@ -3093,9 +3115,24 @@ bool GSDeviceVK::CheckFeatures()
 
 	bool has_rov_storage_flags = true;
 
+	// V3D can't render R16G16B16A16_UNORM (the ColorClip HDR RT). Disable HW colclip so the
+	// renderer uses the in-shader SW colclip path; the ColorClip RT is then never created.
+	{
+		VkFormatProperties ccprops = {};
+		vkGetPhysicalDeviceFormatProperties(m_physical_device, VK_FORMAT_R16G16B16A16_UNORM, &ccprops);
+		m_features.no_hw_colclip =
+			(ccprops.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) == 0;
+		if (m_features.no_hw_colclip)
+			Console.Warning("VK: ColorClip R16G16B16A16_UNORM not renderable - disabling HW colclip (using SW colclip path).");
+	}
+
 	// Check texture format support before we try to create them.
 	for (u32 fmt = static_cast<u32>(GSTexture::Format::Color); fmt < static_cast<u32>(GSTexture::Format::PrimID); fmt++)
 	{
+		// ColorClip's HDR RT isn't created when HW colclip is disabled (V3D); skip its check.
+		if (static_cast<GSTexture::Format>(fmt) == GSTexture::Format::ColorClip && m_features.no_hw_colclip)
+			continue;
+
 		const VkFormat vkfmt = LookupNativeFormat(static_cast<GSTexture::Format>(fmt));
 		VkFormatFeatureFlags bits = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
 
@@ -3108,10 +3145,8 @@ bool GSDeviceVK::CheckFeatures()
 		vkGetPhysicalDeviceFormatProperties(m_physical_device, vkfmt, &props);
 		if ((props.optimalTilingFeatures & bits) != bits)
 		{
-			Host::ReportFormattedErrorAsync("VK: Renderer Unavailable",
-				"Required format %u is missing bits, you may need to update your driver. (vk:%u, has:0x%x, needs:0x%x)",
+			Console.Warning("VK: Format %u missing bits (vk:%u, has:0x%x, needs:0x%x) - continuing anyway (V3D workaround).",
 				fmt, static_cast<unsigned>(vkfmt), props.optimalTilingFeatures, bits);
-			return false;
 		}
 
 		if (GSTexture::IsShaderWriteFormat(static_cast<GSTexture::Format>(fmt)))
@@ -3215,9 +3250,15 @@ VkFormat GSDeviceVK::LookupNativeFormat(GSTexture::Format format) const
 		VK_FORMAT_BC7_UNORM_BLOCK, // BC7
 	}};
 
-	return (format != GSTexture::Format::DepthStencil || m_features.stencil_buffer) ?
-		s_format_mapping[static_cast<int>(format)] :
-		VK_FORMAT_D32_SFLOAT;
+	if (format == GSTexture::Format::DepthStencil)
+	{
+		// V3D: no D32S8 support, remapped to D24S8 (see CheckFeatures).
+		if (m_use_d24s8_depth)
+			return VK_FORMAT_D24_UNORM_S8_UINT;
+		if (!m_features.stencil_buffer)
+			return VK_FORMAT_D32_SFLOAT;
+	}
+	return s_format_mapping[static_cast<int>(format)];
 }
 
 GSTexture* GSDeviceVK::CreateSurface(GSTexture::Usage usage, int width, int height, int levels, GSTexture::Format format)
