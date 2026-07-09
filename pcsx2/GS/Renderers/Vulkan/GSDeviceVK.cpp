@@ -79,9 +79,13 @@ static constexpr VkClearValue s_present_clear_color = {{{0.0f, 0.0f, 0.0f, 1.0f}
 static std::mutex s_instance_mutex;
 
 // Device extensions that are required for PCSX2.
-static constexpr const char* s_required_device_extensions[] = {
-	VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-};
+// No hard-required device extensions beyond the swapchain (handled separately).
+// VK_KHR_push_descriptor used to be required, but it's now OPTIONAL: some Mali
+// drivers (e.g. Mali-G52) don't expose it at all, and we have a full
+// non-push-descriptor binding fallback — so requiring it needlessly rejected
+// otherwise-capable GPUs ("No physical devices found"). Kept as a (currently
+// empty) list so the existing required-extension scan loops stay valid.
+static constexpr std::array<const char*, 0> s_required_device_extensions = {};
 
 GSDeviceVK::GSDeviceVK()
 {
@@ -411,6 +415,9 @@ bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enab
 			return false;
 	}
 
+	// Optional now (was required). Enabled when present; CreateDevice decides
+	// whether to actually use it (never on Mali — driver bug) or fall back.
+	m_optional_extensions.vk_khr_push_descriptor = SupportsExtension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, false);
 	m_optional_extensions.vk_ext_provoking_vertex = SupportsExtension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, false);
 	m_optional_extensions.vk_ext_memory_budget = SupportsExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, false);
 	m_optional_extensions.vk_ext_calibrated_timestamps =
@@ -775,18 +782,29 @@ bool GSDeviceVK::ProcessDeviceExtensions()
 
 	VkPhysicalDevicePushDescriptorPropertiesKHR push_descriptor_properties = {
 		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
-	Vulkan::AddPointerToChain(&properties2, &push_descriptor_properties);
+	if (m_optional_extensions.vk_khr_push_descriptor)
+		Vulkan::AddPointerToChain(&properties2, &push_descriptor_properties);
 
 	// query
 	vkGetPhysicalDeviceProperties2(m_physical_device, &properties2);
 
-	// confirm we actually support it
-	if (push_descriptor_properties.maxPushDescriptors < NUM_TFX_TEXTURES)
+	// Decide whether to bind textures via VK_KHR_push_descriptor. It's optional
+	// now — when it's absent (some Mali, e.g. Mali-G52), unusable, or known-buggy
+	// we fall back to per-frame allocated descriptor sets so Vulkan still runs.
+	m_use_push_descriptors = m_optional_extensions.vk_khr_push_descriptor;
+	if (m_use_push_descriptors && push_descriptor_properties.maxPushDescriptors < NUM_TFX_TEXTURES)
 	{
-		Console.Error("VK: maxPushDescriptors (%u) is below required (%u)", push_descriptor_properties.maxPushDescriptors,
-			NUM_TFX_TEXTURES);
-		return false;
+		Console.Warning("VK: maxPushDescriptors (%u) below required (%u) - using descriptor-set fallback.",
+			push_descriptor_properties.maxPushDescriptors, NUM_TFX_TEXTURES);
+		m_use_push_descriptors = false;
 	}
+	// Mali (ARM, vendorID 0x13B5) advertises VK_KHR_push_descriptor but its driver
+	// null-derefs inside vkCmdPushDescriptorSetKHR on the first textured draw, so
+	// never use it there even when present.
+	if (m_use_push_descriptors && properties2.properties.vendorID == 0x13B5u)
+		m_use_push_descriptors = false;
+	if (!m_use_push_descriptors)
+		Console.Warning("VK: Using non-push-descriptor texture binding fallback.");
 
 	if (m_optional_extensions.vk_ext_line_rasterization && !line_rasterization_feature.bresenhamLines)
 	{
@@ -961,6 +979,31 @@ bool GSDeviceVK::CreateCommandBuffers()
 			return false;
 		}
 		Vulkan::SetObjectName(m_device, resources.fence, "Frame Fence %u", frame_index);
+
+		// Non-push-descriptor path (Mali): per-frame pool for texture descriptor sets, reset wholesale
+		// in ActivateCommandBuffer when the frame is recycled. Sized generously for a heavy frame; if a
+		// frame ever exceeds this, AllocateFrameDescriptorSet logs and the bind is skipped (visual only,
+		// no crash) - this is the tuning knob if a Mali tester reports missing textures.
+		if (!m_use_push_descriptors)
+		{
+			static constexpr u32 MAX_FRAME_TEXTURE_SETS = 8192;
+			const VkDescriptorPoolSize frame_pool_sizes[] = {
+				{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_FRAME_TEXTURE_SETS * 2},
+				{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAX_FRAME_TEXTURE_SETS * 5},
+				{VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, MAX_FRAME_TEXTURE_SETS * 2},
+				{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, MAX_FRAME_TEXTURE_SETS * 2},
+			};
+			const VkDescriptorPoolCreateInfo frame_pool_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+				nullptr, 0, MAX_FRAME_TEXTURE_SETS, static_cast<u32>(std::size(frame_pool_sizes)), frame_pool_sizes};
+			res = vkCreateDescriptorPool(m_device, &frame_pool_info, nullptr, &resources.descriptor_pool);
+			if (res != VK_SUCCESS)
+			{
+				LOG_VULKAN_ERROR(res, "vkCreateDescriptorPool (frame) failed: ");
+				return false;
+			}
+			Vulkan::SetObjectName(m_device, resources.descriptor_pool, "Frame Texture Descriptor Pool %u", frame_index);
+		}
+
 		++frame_index;
 	}
 
@@ -1087,6 +1130,25 @@ VkDescriptorSet GSDeviceVK::AllocatePersistentDescriptorSet(VkDescriptorSetLayou
 void GSDeviceVK::FreePersistentDescriptorSet(VkDescriptorSet set)
 {
 	vkFreeDescriptorSets(m_device, m_global_descriptor_pool, 1, &set);
+}
+
+VkDescriptorSet GSDeviceVK::AllocateFrameDescriptorSet(VkDescriptorSetLayout set_layout)
+{
+	// Non-push-descriptor path only. The pool is reset wholesale each frame, so no per-set free.
+	const VkDescriptorPool pool = m_frame_resources[m_current_frame].descriptor_pool;
+	const VkDescriptorSetAllocateInfo allocate_info = {
+		VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, pool, 1, &set_layout};
+
+	VkDescriptorSet descriptor_set;
+	VkResult res = vkAllocateDescriptorSets(m_device, &allocate_info, &descriptor_set);
+	if (res != VK_SUCCESS)
+	{
+		// Pool exhausted for this frame - skip the bind rather than crash (see pool sizing note).
+		LOG_VULKAN_ERROR(res, "vkAllocateDescriptorSets (frame) failed: ");
+		return VK_NULL_HANDLE;
+	}
+
+	return descriptor_set;
 }
 
 void GSDeviceVK::WaitForFenceCounter(u64 fence_counter)
@@ -1392,6 +1454,15 @@ void GSDeviceVK::ActivateCommandBuffer(u32 index)
 	res = vkResetCommandPool(m_device, resources.command_pool, 0);
 	if (res != VK_SUCCESS)
 		LOG_VULKAN_ERROR(res, "vkResetCommandPool failed: ");
+
+	// Non-push-descriptor path (Mali): the GPU is done with this frame, so recycle its texture
+	// descriptor sets wholesale. Cheaper than per-set frees and matches the command-pool lifecycle.
+	if (resources.descriptor_pool != VK_NULL_HANDLE)
+	{
+		res = vkResetDescriptorPool(m_device, resources.descriptor_pool, 0);
+		if (res != VK_SUCCESS)
+			LOG_VULKAN_ERROR(res, "vkResetDescriptorPool failed: ");
+	}
 
 	// Enable commands to be recorded to the two buffers again.
 	VkCommandBufferBeginInfo begin_info = {
@@ -2710,6 +2781,19 @@ bool GSDeviceVK::CheckFeatures()
 		vkGetPhysicalDeviceFormatProperties(m_physical_device, VK_FORMAT_D32_SFLOAT_S8_UINT, &props);
 		m_features.stencil_buffer =
 			((props.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0);
+		if (!m_features.stencil_buffer)
+		{
+			// V3D: no D32S8, but D24S8 is fully supported. Use it so stencil DATE keeps
+			// working (24-bit depth quantization is an acceptable approximation).
+			vkGetPhysicalDeviceFormatProperties(m_physical_device, VK_FORMAT_D24_UNORM_S8_UINT, &props);
+			if ((props.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0 &&
+				(props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0)
+			{
+				m_features.stencil_buffer = true;
+				m_use_d24s8_depth = true;
+				Console.Warning("VK: D32S8 not supported - using D24_UNORM_S8_UINT depth-stencil (V3D).");
+			}
+		}
 	}
 
 	// Fbfetch is useless if we don't have barriers enabled.
@@ -2720,6 +2804,15 @@ bool GSDeviceVK::CheckFeatures()
 
 	// Use D32F depth instead of D32S8 when we have framebuffer fetch.
 	m_features.stencil_buffer &= !m_features.framebuffer_fetch;
+
+	// V3D: no D32_SFLOAT_S8, so CheckFeatures fell back to D24_UNORM_S8 and set
+	// m_use_d24s8_depth. But when framebuffer-fetch is available (VK_EXT_rasterization_
+	// order_attachment_access on V3D) DATE no longer needs a HW stencil, so prefer
+	// full-precision D32_SFLOAT: a 24-bit Z normalized by 2^-32 lands in the bottom
+	// 1/256 of [0,1] -> only ~16 effective bits on UNORM24 -> Z-fighting. D32_SFLOAT
+	// keeps ~24 bits there thanks to the float exponent.
+	if (m_features.framebuffer_fetch)
+		m_use_d24s8_depth = false;
 
 	// whether we can do point/line expand depends on the range of the device
 	const float f_upscale = static_cast<float>(GSConfig.UpscaleMultiplier);
@@ -2739,9 +2832,24 @@ bool GSDeviceVK::CheckFeatures()
 		m_features.point_expand ? "hardware" : "vertex expanding",
 		m_features.line_expand ? "hardware" : "vertex expanding");
 
+	// V3D can't render R16G16B16A16_UNORM (the ColorClip HDR RT). Disable HW colclip so the
+	// renderer uses the in-shader SW colclip path; the ColorClip RT is then never created.
+	{
+		VkFormatProperties ccprops = {};
+		vkGetPhysicalDeviceFormatProperties(m_physical_device, VK_FORMAT_R16G16B16A16_UNORM, &ccprops);
+		m_features.no_hw_colclip =
+			(ccprops.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) == 0;
+		if (m_features.no_hw_colclip)
+			Console.Warning("VK: ColorClip R16G16B16A16_UNORM not renderable - disabling HW colclip (using SW colclip path).");
+	}
+
 	// Check texture format support before we try to create them.
 	for (u32 fmt = static_cast<u32>(GSTexture::Format::Color); fmt < static_cast<u32>(GSTexture::Format::PrimID); fmt++)
 	{
+		// ColorClip's HDR RT isn't created when HW colclip is disabled (V3D); skip its check.
+		if (static_cast<GSTexture::Format>(fmt) == GSTexture::Format::ColorClip && m_features.no_hw_colclip)
+			continue;
+
 		const VkFormat vkfmt = LookupNativeFormat(static_cast<GSTexture::Format>(fmt));
 		const VkFormatFeatureFlags bits =
 			(static_cast<GSTexture::Format>(fmt) == GSTexture::Format::DepthStencil) ?
@@ -2752,10 +2860,8 @@ bool GSDeviceVK::CheckFeatures()
 		vkGetPhysicalDeviceFormatProperties(m_physical_device, vkfmt, &props);
 		if ((props.optimalTilingFeatures & bits) != bits)
 		{
-			Host::ReportFormattedErrorAsync("VK: Renderer Unavailable",
-				"Required format %u is missing bits, you may need to update your driver. (vk:%u, has:0x%x, needs:0x%x)",
+			Console.Warning("VK: Format %u missing bits (vk:%u, has:0x%x, needs:0x%x) - continuing anyway (V3D workaround).",
 				fmt, static_cast<unsigned>(vkfmt), props.optimalTilingFeatures, bits);
-			return false;
 		}
 	}
 
@@ -2852,9 +2958,15 @@ VkFormat GSDeviceVK::LookupNativeFormat(GSTexture::Format format) const
 		VK_FORMAT_BC7_UNORM_BLOCK, // BC7
 	}};
 
-	return (format != GSTexture::Format::DepthStencil || m_features.stencil_buffer) ?
-		s_format_mapping[static_cast<int>(format)] :
-		VK_FORMAT_D32_SFLOAT;
+	if (format == GSTexture::Format::DepthStencil)
+	{
+		// V3D: no D32S8 support, remapped to D24S8 (see CheckFeatures).
+		if (m_use_d24s8_depth)
+			return VK_FORMAT_D24_UNORM_S8_UINT;
+		if (!m_features.stencil_buffer)
+			return VK_FORMAT_D32_SFLOAT;
+	}
+	return s_format_mapping[static_cast<int>(format)];
 }
 
 GSTexture* GSDeviceVK::CreateSurface(GSTexture::Type type, int width, int height, int levels, GSTexture::Format format)
@@ -3906,7 +4018,8 @@ bool GSDeviceVK::CreatePipelineLayouts()
 	// Convert Pipeline Layout
 	//////////////////////////////////////////////////////////////////////////
 
-	dslb.SetPushFlag();
+	if (m_use_push_descriptors)
+		dslb.SetPushFlag();
 	dslb.AddBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, NUM_UTILITY_SAMPLERS, VK_SHADER_STAGE_FRAGMENT_BIT);
 	if ((m_utility_ds_layout = dslb.Create(dev)) == VK_NULL_HANDLE)
 		return false;
@@ -3935,7 +4048,8 @@ bool GSDeviceVK::CreatePipelineLayouts()
 		return false;
 	Vulkan::SetObjectName(dev, m_tfx_ubo_ds_layout, "TFX UBO descriptor layout");
 
-	dslb.SetPushFlag();
+	if (m_use_push_descriptors)
+		dslb.SetPushFlag();
 	dslb.AddBinding(TFX_TEXTURE_TEXTURE, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT);
 	dslb.AddBinding(TFX_TEXTURE_PALETTE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT);
 	dslb.AddBinding(TFX_TEXTURE_RT,
@@ -4464,7 +4578,8 @@ bool GSDeviceVK::CompileCASPipelines()
 	Vulkan::DescriptorSetLayoutBuilder dslb;
 	Vulkan::PipelineLayoutBuilder plb;
 
-	dslb.SetPushFlag();
+	if (m_use_push_descriptors)
+		dslb.SetPushFlag();
 	dslb.AddBinding(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT);
 	dslb.AddBinding(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT);
 	if ((m_cas_ds_layout = dslb.Create(dev)) == VK_NULL_HANDLE)
@@ -4672,7 +4787,20 @@ bool GSDeviceVK::DoCAS(
 	Vulkan::DescriptorSetUpdateBuilder dsub;
 	dsub.AddImageDescriptorWrite(VK_NULL_HANDLE, 0, sTexVK->GetView(), sTexVK->GetVkLayout());
 	dsub.AddStorageImageDescriptorWrite(VK_NULL_HANDLE, 1, dTexVK->GetView(), dTexVK->GetVkLayout());
-	dsub.PushUpdate(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_cas_pipeline_layout, 0, false);
+	if (m_use_push_descriptors)
+	{
+		dsub.PushUpdate(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_cas_pipeline_layout, 0, false);
+	}
+	else
+	{
+		const VkDescriptorSet ds = AllocateFrameDescriptorSet(m_cas_ds_layout);
+		if (ds != VK_NULL_HANDLE)
+		{
+			dsub.SetDestinationSet(ds);
+			dsub.Update(m_device, false);
+			vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_cas_pipeline_layout, 0, 1, &ds, 0, nullptr);
+		}
+	}
 
 	// the actual meat and potatoes! only four commands.
 	static const int threadGroupWorkRegionDim = 16;
@@ -4809,6 +4937,8 @@ void GSDeviceVK::DestroyResources()
 		}
 		if (resources.command_pool != VK_NULL_HANDLE)
 			vkDestroyCommandPool(m_device, resources.command_pool, nullptr);
+		if (resources.descriptor_pool != VK_NULL_HANDLE)
+			vkDestroyDescriptorPool(m_device, resources.descriptor_pool, nullptr);
 	}
 
 	if (m_timestamp_query_pool != VK_NULL_HANDLE)
@@ -5678,6 +5808,13 @@ bool GSDeviceVK::ApplyTFXState(bool already_execed)
 
 	if (flags & DIRTY_FLAG_TFX_TEXTURES)
 	{
+		// Non-push path allocates a fresh (empty) descriptor set every time, so every binding the
+		// shader may read must be written - not just the dirty ones (push descriptors persist the rest
+		// in command-buffer state; allocated sets do not). Force all texture sub-flags on. All
+		// m_tfx_textures[] slots are always valid (null slots hold m_null_texture), so this is safe.
+		if (!m_use_push_descriptors)
+			flags |= DIRTY_FLAG_TFX_TEXTURES;
+
 		if (flags & DIRTY_FLAG_TFX_TEXTURE_TEX)
 		{
 			dsub.AddCombinedImageSamplerDescriptorWrite(VK_NULL_HANDLE, TFX_TEXTURE_TEXTURE,
@@ -5731,7 +5868,25 @@ bool GSDeviceVK::ApplyTFXState(bool already_execed)
 				m_tfx_textures[TFX_TEXTURE_DEPTH_ROV]->GetVkLayout(), true);
 		}
 
-		dsub.PushUpdate(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_tfx_pipeline_layout, TFX_DESCRIPTOR_SET_TEXTURES);
+		if (m_use_push_descriptors)
+		{
+			dsub.PushUpdate(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_tfx_pipeline_layout, TFX_DESCRIPTOR_SET_TEXTURES);
+		}
+		else
+		{
+			const VkDescriptorSet ds = AllocateFrameDescriptorSet(m_tfx_texture_ds_layout);
+			if (ds != VK_NULL_HANDLE)
+			{
+				dsub.SetDestinationSet(ds);
+				dsub.Update(m_device);
+				vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_tfx_pipeline_layout,
+					TFX_DESCRIPTOR_SET_TEXTURES, 1, &ds, 0, nullptr);
+			}
+			else
+			{
+				dsub.Clear();
+			}
+		}
 	}
 
 	ApplyBaseState(flags, cmdbuf);
@@ -5754,7 +5909,20 @@ bool GSDeviceVK::ApplyUtilityState(bool already_execed)
 		Vulkan::DescriptorSetUpdateBuilder dsub;
 		dsub.AddCombinedImageSamplerDescriptorWrite(
 			VK_NULL_HANDLE, 0, m_utility_texture->GetView(), m_utility_sampler, m_utility_texture->GetVkLayout());
-		dsub.PushUpdate(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_utility_pipeline_layout, 0, false);
+		if (m_use_push_descriptors)
+		{
+			dsub.PushUpdate(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_utility_pipeline_layout, 0, false);
+		}
+		else
+		{
+			const VkDescriptorSet ds = AllocateFrameDescriptorSet(m_utility_ds_layout);
+			if (ds != VK_NULL_HANDLE)
+			{
+				dsub.SetDestinationSet(ds);
+				dsub.Update(m_device, false);
+				vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_utility_pipeline_layout, 0, 1, &ds, 0, nullptr);
+			}
+		}
 	}
 
 
