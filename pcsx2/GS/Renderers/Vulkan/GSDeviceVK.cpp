@@ -2815,17 +2815,18 @@ bool GSDeviceVK::CheckFeatures()
 	// 1/256 of [0,1] -> only ~16 effective bits on UNORM24 -> Z-fighting. D32_SFLOAT
 	// keeps ~24 bits there thanks to the float exponent.
 	// V3D has no D32_SFLOAT_S8, so we pick between two depth paths, each a tradeoff:
-	//   D24_UNORM_S8 + HW-stencil DATE : clean, but 24-bit Z (normalized by 2^-32)
-	//       loses precision -> Z-fighting on a few games (Asterix, GTA Vice City).
-	//   D32_SFLOAT   + fbfetch  DATE  : full Z precision (fixes that Z-fighting), but
-	//       the framebuffer-fetch DATE path STIPPLES bright alpha-tested surfaces on
-	//       V3D -> a dither grid on e.g. GoW2's throne curtains.
-	// Default to the SAFE D24S8 path (set by the fallback above) so every game is
-	// visually correct; re-assert the HW stencil that the framebuffer_fetch mask
-	// (a few lines up) cleared. Opt in to D32F per-game via ARMSX2_DEPTH=d32f for the
-	// Z-fighting titles. TODO: promote this to a real per-game GameIndex/config flag.
-	if (m_use_d24s8_depth)
-		m_features.stencil_buffer = true;
+	//   D32_SFLOAT   + fbfetch  DATE  : full Z precision (fixes Z-fighting on Asterix,
+	//       GTA VC) AND faster on V3D -- no stencil attachment means the many non-DATE
+	//       draws skip the per-fragment stencil test; measured up to ~22% faster
+	//       (GTA VC), never slower. BUT the fbfetch DATE path stipples bright
+	//       alpha-tested surfaces (a dither grid on e.g. GoW2's throne curtains).
+	//   D24_UNORM_S8 + HW-stencil DATE : no stipple, but slower and 24-bit Z can
+	//       Z-fight.
+	// Default to D32_SFLOAT (faster + Z-fighting-correct); opt OUT to D24S8 per-game
+	// via ARMSX2_DEPTH=d24s8 only for the few titles that show the stipple (GoW2).
+	// TODO: promote this to a real per-game GameIndex/config flag.
+	if (m_features.framebuffer_fetch)
+		m_use_d24s8_depth = false;
 
 	if (const char* dov = std::getenv("ARMSX2_DEPTH"))
 	{
