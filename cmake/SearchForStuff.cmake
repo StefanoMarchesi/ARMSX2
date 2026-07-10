@@ -109,7 +109,7 @@ disable_compiler_warnings_for_target(speex)
 
 # Find the Qt components that we need.
 if(ENABLE_QT_UI)
-	find_package(Qt6 6.10.1 COMPONENTS CoreTools Core GuiTools Gui WidgetsTools Widgets LinguistTools REQUIRED)
+	find_package(Qt6 6.8.2 COMPONENTS CoreTools Core GuiTools Gui WidgetsTools Widgets LinguistTools REQUIRED)
 
 	if(NOT WIN32 AND NOT APPLE)
 		if (Qt6_VERSION VERSION_GREATER_EQUAL 6.10.0)
@@ -118,7 +118,12 @@ if(ENABLE_QT_UI)
 	endif()
 
 	# The docking system for the debugger.
-	find_package(KDDockWidgets-qt6 2.3.0 REQUIRED)
+	find_package(KDDockWidgets-qt6 2.2.5 REQUIRED)
+	# The installed KDDockWidgets exposes only .../include/kddockwidgets-qt6, but its
+	# private headers include siblings via "core/..." relative to the kddockwidgets
+	# subdir. Add it so those internal includes resolve.
+	set_property(TARGET KDAB::kddockwidgets APPEND PROPERTY
+		INTERFACE_INCLUDE_DIRECTORIES "${KDDockWidgets-qt6_DIR}/../../../include/kddockwidgets-qt6/kddockwidgets")
 endif()
 
 if(WIN32)

@@ -831,6 +831,7 @@ bool GSDeviceOGL::CheckFeatures()
 					"GS", "GL_ARB_shading_language_420pack is not supported, this is required for the OpenGL renderer.");
 			return false;
 		}
+	}
 
 	if (!GLAD_GL_VERSION_4_3 && !GLAD_GL_ARB_copy_image && !GLAD_GL_EXT_copy_image && !GLAD_GL_NV_copy_image)
 	{
@@ -1648,6 +1649,7 @@ std::string GSDeviceOGL::GenGlslHeader(const std::string_view entry, GLenum type
             header = "#version 320 es\n";
         else if (GLAD_GL_ES_VERSION_3_1)
             header = "#version 310 es\n";
+    }
 
 	if (m_features.vs_expand && GLAD_GL_VERSION_4_3)
 	{
@@ -3279,7 +3281,7 @@ void GSDeviceOGL::RenderHW(GSHWDrawConfig& config)
 		}
 		SetupOM(config.alpha_second_pass.depth);
 		SendHWDraw(config, rt_feedbackloop_pass2 ? draw_rt_clone : nullptr, draw_rt, ds_feedbackloop_pass2 ? draw_ds_clone : nullptr, draw_ds,
-			one_barrier, config.alpha_second_pass.require_full_barrier);
+			config.alpha_second_pass.require_one_barrier, config.alpha_second_pass.require_full_barrier);
 	}
 
 	if (colclip_rt)

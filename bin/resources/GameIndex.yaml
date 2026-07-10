@@ -18929,6 +18929,9 @@ SLES-51834:
 SLES-51838:
   name: "Astérix & Obélix XXL"
   region: "PAL-M5"
+  clampModes:
+    eeClampMode: 3
+    vuClampMode: 3
 SLES-51839:
   name: "Dragon Ball Z - Budokai 2"
   region: "PAL-M5"

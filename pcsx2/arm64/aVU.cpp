@@ -6719,7 +6719,20 @@ static u8* CompileBlock(u32 startPC, u32 numPairs, VU1BlockEntry* out_block)
 		//             change. Hazard pairs go back to the BL-into-vu1Exec
 		//             fallback path until the Futurama divergence is root-
 		//             caused.
-		static constexpr bool kAllowReadAfterWriteNative = false;
+		// 2026-07-09: RE-ENABLED. The 2026-05-17 revert bundled THREE changes
+		//             (this defer path + emitVu1CallNeonFree cache-skip +
+		//             inline-FMAC-stall drain) and "couldn't attribute which
+		//             half" broke Futurama. The other two were since isolated
+		//             and independently cleared (emitVu1CallNeonFree verified
+		//             scalar-only via objdump; inline FMAC-stall folding
+		//             re-landed behind a toggle). This defer path was ported
+		//             verbatim into the microVU rewrite and never re-tested in
+		//             isolation. write_collision (discard) and CLIP hazards
+		//             already stay on interp, so only pure vf_read_after_write
+		//             goes native — validate the Futurama main-menu repro under
+		//             VU1_SHADOW_VERIFY (MTVU off); the harness now covers these
+		//             pairs automatically since they move fallback->native.
+		static constexpr bool kAllowReadAfterWriteNative = true;
 		const bool vf_hazard = ir_op.vf_write_collision ||
 			(!kAllowReadAfterWriteNative && ir_op.vf_read_after_write);
 		const bool vi_hazard = ir_op.clip_write_collision || ir_op.clip_read_after_write;

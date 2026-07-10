@@ -240,6 +240,7 @@ namespace Vulkan
 		void PushUpdate(VkCommandBuffer cmdbuf, VkPipelineBindPoint bind_point, VkPipelineLayout layout, u32 set,
 			bool clear = true);
 
+		void SetDestinationSet(VkDescriptorSet set);
 		void AddImageDescriptorWrite(VkDescriptorSet set, u32 binding, VkImageView view,
 			VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, bool storage_image = false);
 		void AddSamplerDescriptorWrite(VkDescriptorSet set, u32 binding, VkSampler sampler);

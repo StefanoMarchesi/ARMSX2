@@ -732,6 +732,12 @@ void Vulkan::DescriptorSetUpdateBuilder::PushUpdate(
 		Clear();
 }
 
+void Vulkan::DescriptorSetUpdateBuilder::SetDestinationSet(VkDescriptorSet set)
+{
+	for (u32 i = 0; i < m_num_writes; i++)
+		m_writes[i].dstSet = set;
+}
+
 void Vulkan::DescriptorSetUpdateBuilder::AddImageDescriptorWrite(VkDescriptorSet set, u32 binding, VkImageView view,
 	VkImageLayout layout /*= VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL*/, bool storage_image /*= false*/)
 {

@@ -102,6 +102,7 @@ set(pcsx2Sources
 	R5900.cpp
 	R5900OpcodeImpl.cpp
 	R5900OpcodeTables.cpp
+	VU1Fingerprint.cpp
 	SaveState.cpp
 	ShiftJisToUnicode.cpp
 	Sif.cpp
@@ -1054,6 +1055,38 @@ set(pcsx2arm64Sources
 	arm64/Vif_Dynarec.cpp
 	arm64/Vif_UnpackNEON.cpp
 	arm64/RecStubs.cpp
+	arm64/aDMAC.cpp
+	arm64/aR3000A.cpp
+	arm64/aR3000Atables.cpp
+	arm64/aR5900.cpp
+	arm64/aR5900Arith.cpp
+	arm64/aR5900Backprop.cpp
+	arm64/aR5900Branch.cpp
+	arm64/aR5900COP0.cpp
+	arm64/aR5900COP2.cpp
+	arm64/aR5900FPU.cpp
+	arm64/aR5900LoadStore.cpp
+	arm64/aR5900Misc.cpp
+	arm64/aR5900MMI.cpp
+	arm64/aR5900MultDiv.cpp
+	arm64/aR5900Trap.cpp
+	arm64/aVTLB.cpp
+	arm64/aVU0.cpp
+	arm64/aVU.cpp
+	arm64/mac/AsmHelpers.cpp
+	arm64/mac/RecStubs.cpp
+	arm64/mac/Vif_Dynarec.cpp
+	arm64/mac/Vif_UnpackNEON.cpp
+	arm64/mac/aR3000A.cpp
+	arm64/mac/aR5900.cpp
+	arm64/mac/aR5900Arith.cpp
+	arm64/mac/aR5900Branch.cpp
+	arm64/mac/aR5900FPU.cpp
+	arm64/mac/aR5900LoadStore.cpp
+	arm64/mac/aR5900MMI.cpp
+	arm64/mac/aR5900MultDiv.cpp
+	arm64/mac/aVU.cpp
+	x86/BaseblockEx.cpp
 	)
 
 set(pcsx2arm64Headers
