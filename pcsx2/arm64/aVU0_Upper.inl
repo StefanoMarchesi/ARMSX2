@@ -73,6 +73,32 @@ static void vu0_fmac_writeback(VURegs* VU, VECTOR* dst, u32 xyzw,
 	VU_STAT_UPDATE(VU);
 }
 
+// Macro-mode (COP2) combined variant: writeback + SYNCMSFLAGS VI-mirror in ONE
+// call. The COP2 macro rec used to emit a second BL (vu0_macro_sync_flags_helper)
+// after every FMAC op to mirror macflag/statusflag into VI[REG_MAC/STATUS_FLAG]
+// (what CFC2 reads). Folding it here saves a call per macro FMAC op with zero
+// emitted-code growth (the per-block code-buffer budget is tight — see the
+// emitVU0MacroEnter note in aR5900COP2.cpp). Bit layout: aR5900COP2.cpp
+// vu0_macro_sync_flags_helper.
+static void vu0_fmac_writeback_macro(VURegs* VU, VECTOR* dst, u32 xyzw,
+                                     float rx, float ry, float rz, float rw)
+{
+	vu0_fmac_writeback(VU, dst, xyzw, rx, ry, rz, rw);
+	VU->VI[REG_STATUS_FLAG].UL = (VU->VI[REG_STATUS_FLAG].UL & 0xFC0) |
+	                             (VU->statusflag & 0xF) |
+	                             ((VU->statusflag & 0xF) << 6);
+	VU->VI[REG_MAC_FLAG].UL = VU->macflag;
+}
+
+// Recompile-time handshake with the COP2 macro rec (aR5900COP2.cpp):
+// fold_sync is set around vu_rec_fn() when compiling a macro FMAC op;
+// emitFmacWriteback consumes it by emitting the combined helper and raising
+// fold_synced, so the macro rec knows to skip its separate sync BL. Ops that
+// don't route through emitFmacWriteback (OPMULA/OPMSUB C helpers) leave
+// fold_synced false and keep the separate sync.
+bool g_vu0_macro_fold_sync = false;
+bool g_vu0_macro_fold_synced = false;
+
 // Emit the call to vu0_fmac_writeback.
 // Result must be in v5.4S. dst_off = byte offset of destination from VU0_BASE_REG.
 static void emitFmacWriteback(int64_t dst_off, u32 xyzw)
@@ -86,7 +112,13 @@ static void emitFmacWriteback(int64_t dst_off, u32 xyzw)
 	armAsm->Mov(x0, VU0_BASE_REG);
 	armAsm->Add(x1, VU0_BASE_REG, dst_off);
 	armAsm->Mov(w2, xyzw);
-	armEmitCall(reinterpret_cast<const void*>(vu0_fmac_writeback));
+	if (g_vu0_macro_fold_sync)
+	{
+		armEmitCall(reinterpret_cast<const void*>(vu0_fmac_writeback_macro));
+		g_vu0_macro_fold_synced = true;
+	}
+	else
+		armEmitCall(reinterpret_cast<const void*>(vu0_fmac_writeback));
 }
 
 // Writeback for ops that DO NOT update MAC/Status flags (MAX, MINI, ABS).

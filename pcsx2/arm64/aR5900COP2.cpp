@@ -108,6 +108,14 @@ extern void recVU0_RNEXT();  extern void recVU0_RXOR();
 extern void recVU0_DIV();    extern void recVU0_SQRT();   extern void recVU0_RSQRT();
 }
 
+// Fold handshake with emitFmacWriteback (aVU0_Upper.inl, compiled at global
+// scope in aVU0.cpp): when fold_sync is set, the FMAC writeback BL targets the
+// combined writeback+SYNCMSFLAGS helper and raises fold_synced — the separate
+// emitVU0MacroSyncFlags BL is then skipped. One call per macro FMAC op instead
+// of two, with zero emitted-code growth.
+extern bool g_vu0_macro_fold_sync;
+extern bool g_vu0_macro_fold_synced;
+
 namespace R5900 {
 namespace Dynarec {
 namespace OpcodeImpl {
@@ -518,6 +526,7 @@ namespace OpcodeImpl {
     armEmitCall(reinterpret_cast<const void*>(vu0_macro_sync_flags_helper));
 }
 
+
 // Sync VU0.clipflag into VI[REG_CLIP_FLAG]. Matches SYNCCLIPFLAG in VUops.cpp
 // (called by VCLIPw after _vuCLIP). Native vu0_CLIP updates VU0.clipflag;
 // the VI mirror is what CFC2 and the FCAND/FCEQ/FCOR/FCGET lower ops read.
@@ -695,8 +704,12 @@ namespace OpcodeImpl {
         } else { \
             VU0.code = cpuRegs.code; \
             emitVU0MacroEnter(0x10); \
+            g_vu0_macro_fold_sync = true; \
+            g_vu0_macro_fold_synced = false; \
             vu_rec_fn(); \
-            emitVU0MacroSyncFlags(); \
+            g_vu0_macro_fold_sync = false; \
+            if (!g_vu0_macro_fold_synced) \
+                emitVU0MacroSyncFlags(); \
             emitVU0MacroExit(); \
         } \
     }
@@ -713,8 +726,12 @@ namespace OpcodeImpl {
         } else { \
             VU0.code = cpuRegs.code; \
             emitVU0MacroEnter(0x11); \
+            g_vu0_macro_fold_sync = true; \
+            g_vu0_macro_fold_synced = false; \
             vu_rec_fn(); \
-            emitVU0MacroSyncFlags(); \
+            g_vu0_macro_fold_sync = false; \
+            if (!g_vu0_macro_fold_synced) \
+                emitVU0MacroSyncFlags(); \
             emitVU0MacroExit(); \
         } \
     }
