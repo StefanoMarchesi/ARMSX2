@@ -182,6 +182,7 @@ protected:
 	void UpdateScissor();
 
 	void UpdateVertexKick();
+	void UpdateLimit24DepthMode();
 
 	void GrowVertexBuffer();
 	bool IsAutoFlushDraw(u32 prim, int& tex_layer);
@@ -296,6 +297,9 @@ public:
 	bool m_are_quads_shuffle = false;
 	bool m_nativeres = false;
 	bool m_mipmap = false;
+	// Cached (GSIsHardwareRenderer() ? UserHacks_Limit24BitDepth : Disabled) so VertexKick
+	// doesn't pay a function call + two config loads per vertex. See UpdateLimit24DepthMode().
+	u8 m_limit24_depth_mode = 0;
 	bool m_texflush_flag = false;
 	bool m_isPackedUV_HackFlag = false;
 	bool m_channel_shuffle = false;

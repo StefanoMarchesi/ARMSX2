@@ -101,6 +101,7 @@ GSState::GSState()
 	// Let's keep it disabled to ease debug.
 	m_nativeres = GSConfig.UpscaleMultiplier == 1.0f;
 	m_mipmap = GSConfig.Mipmap;
+	UpdateLimit24DepthMode();
 
 	s_n = 0;
 	s_transfer_n = 0;
@@ -790,9 +791,15 @@ void GSState::ResetPCRTC()
 	PCRTCDisplays.SetRects(1, m_regs->DISP[1].DISPLAY, m_regs->DISP[1].DISPFB);
 }
 
+void GSState::UpdateLimit24DepthMode()
+{
+	m_limit24_depth_mode = GSIsHardwareRenderer() ? static_cast<u8>(GSConfig.UserHacks_Limit24BitDepth) : 0;
+}
+
 void GSState::UpdateSettings(const Pcsx2Config::GSOptions& old_config)
 {
 	m_mipmap = GSConfig.Mipmap;
+	UpdateLimit24DepthMode();
 
 	if (
 		GSConfig.AutoFlushSW != old_config.AutoFlushSW ||
@@ -5950,11 +5957,11 @@ __forceinline void GSState::VertexKick(u32 skip)
 	u32 next = m_vertex->next;
 	u32 xy_tail = m_vertex->xy_tail;
 
-	if (GSIsHardwareRenderer() && GSLocalMemory::m_psm[m_context->ZBUF.PSM].bpp == 32)
+	if (m_limit24_depth_mode != 0 && GSLocalMemory::m_psm[m_context->ZBUF.PSM].bpp == 32)
 	{
-		if (GSConfig.UserHacks_Limit24BitDepth == GSLimit24BitDepth::PrioritizeUpper)
+		if (m_limit24_depth_mode == static_cast<u8>(GSLimit24BitDepth::PrioritizeUpper))
 			m_v.XYZ.Z = ((m_v.XYZ.Z >> 8) & ~0xFF) | (m_v.XYZ.Z & 0xFF);
-		else if (GSConfig.UserHacks_Limit24BitDepth == GSLimit24BitDepth::PrioritizeLower)
+		else
 			m_v.XYZ.Z &= 0x00FFFFFF;
 	}
 
