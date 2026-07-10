@@ -17,6 +17,9 @@
 
 #include "common/Console.h"
 #include "common/BitUtils.h"
+
+#include <cstdlib>
+#include <cstring>
 #include "common/Error.h"
 #include "common/HostSys.h"
 #include "common/Path.h"
@@ -2811,8 +2814,24 @@ bool GSDeviceVK::CheckFeatures()
 	// full-precision D32_SFLOAT: a 24-bit Z normalized by 2^-32 lands in the bottom
 	// 1/256 of [0,1] -> only ~16 effective bits on UNORM24 -> Z-fighting. D32_SFLOAT
 	// keeps ~24 bits there thanks to the float exponent.
-	if (m_features.framebuffer_fetch)
-		m_use_d24s8_depth = false;
+	// V3D has no D32_SFLOAT_S8, so we pick between two depth paths, each a tradeoff:
+	//   D24_UNORM_S8 + HW-stencil DATE : clean, but 24-bit Z (normalized by 2^-32)
+	//       loses precision -> Z-fighting on a few games (Asterix, GTA Vice City).
+	//   D32_SFLOAT   + fbfetch  DATE  : full Z precision (fixes that Z-fighting), but
+	//       the framebuffer-fetch DATE path STIPPLES bright alpha-tested surfaces on
+	//       V3D -> a dither grid on e.g. GoW2's throne curtains.
+	// Default to the SAFE D24S8 path (set by the fallback above) so every game is
+	// visually correct; re-assert the HW stencil that the framebuffer_fetch mask
+	// (a few lines up) cleared. Opt in to D32F per-game via ARMSX2_DEPTH=d32f for the
+	// Z-fighting titles. TODO: promote this to a real per-game GameIndex/config flag.
+	if (m_use_d24s8_depth)
+		m_features.stencil_buffer = true;
+
+	if (const char* dov = std::getenv("ARMSX2_DEPTH"))
+	{
+		if (std::strcmp(dov, "d24s8") == 0) { m_use_d24s8_depth = true; m_features.stencil_buffer = true; }
+		else if (std::strcmp(dov, "d32f") == 0) { m_use_d24s8_depth = false; m_features.stencil_buffer = false; }
+	}
 
 	// whether we can do point/line expand depends on the range of the device
 	const float f_upscale = static_cast<float>(GSConfig.UpscaleMultiplier);
@@ -2839,9 +2858,22 @@ bool GSDeviceVK::CheckFeatures()
 		vkGetPhysicalDeviceFormatProperties(m_physical_device, VK_FORMAT_R16G16B16A16_UNORM, &ccprops);
 		m_features.no_hw_colclip =
 			(ccprops.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) == 0;
+		// A/B override for the GoW2 curtain-stipple bisect. ARMSX2_COLCLIP=hw forces the
+		// HW colclip RT path; =sw forces the in-shader SW colclip path.
+		if (const char* cov = std::getenv("ARMSX2_COLCLIP"))
+		{
+			if (std::strcmp(cov, "hw") == 0) m_features.no_hw_colclip = false;
+			else if (std::strcmp(cov, "sw") == 0) m_features.no_hw_colclip = true;
+		}
 		if (m_features.no_hw_colclip)
 			Console.Warning("VK: ColorClip R16G16B16A16_UNORM not renderable - disabling HW colclip (using SW colclip path).");
 	}
+
+	// Diagnostic: final resolved GS feature state (GoW2 stipple bisect).
+	Console.WriteLn("VK[ARMSX2 DIAG]: depth=%s stencil_buffer=%d framebuffer_fetch=%d no_hw_colclip=%d texture_barrier=%d",
+		m_use_d24s8_depth ? "D24S8" : "D32F", static_cast<int>(m_features.stencil_buffer),
+		static_cast<int>(m_features.framebuffer_fetch), static_cast<int>(m_features.no_hw_colclip),
+		static_cast<int>(m_features.texture_barrier));
 
 	// Check texture format support before we try to create them.
 	for (u32 fmt = static_cast<u32>(GSTexture::Format::Color); fmt < static_cast<u32>(GSTexture::Format::PrimID); fmt++)
