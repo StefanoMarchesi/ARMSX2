@@ -102,6 +102,7 @@ set(pcsx2Sources
 	R5900.cpp
 	R5900OpcodeImpl.cpp
 	R5900OpcodeTables.cpp
+	VU1Fingerprint.cpp
 	SaveState.cpp
 	ShiftJisToUnicode.cpp
 	Sif.cpp

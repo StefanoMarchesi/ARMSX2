@@ -7076,6 +7076,13 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptio
 		}
 
 		const bool free_colclip = !has_colclip_texture && (features.framebuffer_fetch || no_prim_overlap || blend_non_recursive);
+		// V3D-class GPUs can't render the colclip HDR RT (R16G16B16A16_UNORM lacks COLOR_ATTACHMENT);
+		// force the in-shader SW colclip path (colclip) instead of the HW HDR-RT path (colclip_hw),
+		// but only where the RT value is safely obtainable: via barriers, via the one-barrier
+		// RT-clone copy (no prim overlap), or when the blend never reads the RT (non-recursive).
+		// Remaining cases are approximated with clamped HW blending (see branch below).
+		const bool force_sw_colclip =
+			features.no_hw_colclip && (features.feedback_loops() || no_prim_overlap || blend_non_recursive);
 		if (color_dest_blend || color_dest_blend2 || blend_zero_to_one_range)
 		{
 			// No overflow, disable colclip.
@@ -7094,7 +7101,7 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptio
 			blend_mix          = false;
 			m_conf.colclip_mode = (has_colclip_texture && !NextDrawColClip()) ? GSHWDrawConfig::ColClipMode::ResolveOnly : GSHWDrawConfig::ColClipMode::NoModify;
 		}
-		else if (accumulation_blend)
+		else if (accumulation_blend && !features.no_hw_colclip)
 		{
 			// A fast algo that requires 2 passes
 			GL_INS("HW: COLCLIP ACCU HW mode ENABLED");
@@ -7103,11 +7110,27 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptio
 
 			m_conf.colclip_mode = has_colclip_texture ? (NextDrawColClip() ? GSHWDrawConfig::ColClipMode::NoModify : GSHWDrawConfig::ColClipMode::ResolveOnly) : (NextDrawColClip() ? GSHWDrawConfig::ColClipMode::ConvertOnly : GSHWDrawConfig::ColClipMode::ConvertAndResolve);
 		}
-		else if (sw_blending)
+		else if (sw_blending || force_sw_colclip)
 		{
-			// A slow algo that could requires several passes (barely used)
+			// A slow algo that could requires several passes (barely used).
+			// force_sw_colclip: device has no HW colclip HDR RT (V3D), so take this path where safe.
 			GL_INS("HW: COLCLIP SW mode ENABLED");
 			m_conf.ps.colclip = 1;
+			sw_blending = true;
+			// The forced path can arrive here with accumulation blend / blend mix still set
+			// (their colclip_hw branch is disabled on V3D); SW colclip replaces them.
+			// No-op for the unforced path (already false when sw_blending is set).
+			accumulation_blend = false;
+			blend_mix = false;
+			m_conf.colclip_mode = (has_colclip_texture && !NextDrawColClip()) ? GSHWDrawConfig::ColClipMode::ResolveOnly : GSHWDrawConfig::ColClipMode::NoModify;
+		}
+		else if (features.no_hw_colclip)
+		{
+			// No HW colclip RT, and the SW path would need an RT self-read we can't do
+			// (overlapping recursive blend without barriers): approximate with clamped
+			// HW blending instead of producing garbage.
+			GL_INS("HW: COLCLIP approximated (clamped) - no HW colclip RT and no barriers");
+			sw_blending = false;
 			m_conf.colclip_mode = (has_colclip_texture && !NextDrawColClip()) ? GSHWDrawConfig::ColClipMode::ResolveOnly : GSHWDrawConfig::ColClipMode::NoModify;
 		}
 		else

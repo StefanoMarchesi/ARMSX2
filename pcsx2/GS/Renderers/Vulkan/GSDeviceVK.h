@@ -290,6 +290,10 @@ private:
 	// MediaTek-SoC detection now lives in the base GSDevice (SetMediaTekSoC/IsMediaTekSoC),
 	// so both backends and GS.cpp's Android GameDB overrides can read it.
 
+	// V3D doesn't support D32_SFLOAT_S8_UINT but does support D24_UNORM_S8_UINT;
+	// set in CheckFeatures so stencil (DATE) keeps working there.
+	bool m_use_d24s8_depth = false;
+
 	VkQueue m_graphics_queue = VK_NULL_HANDLE;
 	VkQueue m_present_queue = VK_NULL_HANDLE;
 	u32 m_graphics_queue_family_index = 0;
