@@ -8,6 +8,8 @@
 #include "R5900OpcodeTables.h"
 #include "arm64/arm64Emitter.h"
 
+#include <cstdlib>
+
 using namespace R5900;
 
 // Per-instruction interp stub toggle. Set to 1 = interp, 0 = native.
@@ -52,10 +54,15 @@ using namespace R5900;
 #define ISTUB_BGEZALL  0
 #define ISTUB_BLTZALL  0
 #define ISTUB_J        0
-#define ISTUB_JAL      1  // GT4 regresses (wobbly wheels, reflections, loading spinner)
-                          // — target-bit + sign-extend + _deleteEEreg fixes applied
-                          // to the native body below but are necessary-not-sufficient.
-                          // See armsx2_arm64_truth_is_x86jit memory file.
+#define ISTUB_JAL      0  // Native by default. The interp stub forced a full event
+                          // test at EVERY JAL (armBranchCallInterpreter mirrors x86
+                          // recBranchCall), split blocks and killed linking — measured
+                          // 3-5% on Mafia/SotC. The historical GT4 regression (wobbly
+                          // wheels, reflections, loading spinner) survived a body that
+                          // fully mirrors x86 recJAL, so the suspect is the game's
+                          // sensitivity to event-test timing, not the JAL codegen.
+                          // Runtime kill-switch: ARMSX2_JAL_INTERP=1 restores the
+                          // interp stub without a rebuild (GT4 A/B debugging).
 #define ISTUB_JR       0
 #define ISTUB_JALR     0
 #define ISTUB_SYSCALL  0
@@ -802,6 +809,17 @@ void recJAL() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::JAL); }
 #else
 void recJAL()
 {
+	// Runtime kill-switch for A/B against the interp stub (see ISTUB_JAL note).
+	static const bool interp_forced = []() {
+		const char* v = std::getenv("ARMSX2_JAL_INTERP");
+		return v && v[0] == '1';
+	}();
+	if (interp_forced)
+	{
+		armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::JAL);
+		return;
+	}
+
 	u32 target = (_Target_ << 2) | (pc & 0xf0000000);
 
 	// Match x86's _deleteEEreg(31, 0): drop any host cache slot and clear the
