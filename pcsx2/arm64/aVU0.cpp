@@ -2400,13 +2400,25 @@ static u8* CompileBlock(u32 startPC, u32 numPairs, VU0BlockEntry* out_block)
 				armEmitCall(reinterpret_cast<const void*>(_vuClearFMAC));
 			}
 
-			// 10. Upper stalls add
-			armAsm->Mov(x0, VU0_BASE_REG);
-			armMoveAddressToReg(x1, &uregs_data[i]);
-			armEmitCall(reinterpret_cast<const void*>(_vuAddUpperStalls));
+			// 10. Upper stalls add. _vuAddUpperStalls only handles FMAC;
+			// avoid emitting a BL for every non-FMAC upper instruction.
+			if (uregs.pipe == VUPIPE_FMAC)
+			{
+				armAsm->Mov(x0, VU0_BASE_REG);
+				armMoveAddressToReg(x1, &uregs_data[i]);
+				armEmitCall(reinterpret_cast<const void*>(_vuAddUpperStalls));
+			}
 
-			// 11. Lower stalls add
-			if (!ibit)
+			// 11. Lower stalls add. Mirror _vuAddLowerStalls' switch and its
+			// inner gates at JIT compile time, so NONE/BRANCH/XGKICK and empty
+			// FDIV/EFU/IALU updates emit no call. These predicates use the same
+			// immutable _VURegsNum metadata consumed by the helper.
+			const bool lower_adds_pipeline = !ibit &&
+				(lregs.pipe == VUPIPE_FMAC ||
+				 (lregs.pipe == VUPIPE_FDIV && (lregs.VIwrite & (1u << REG_Q))) ||
+				 (lregs.pipe == VUPIPE_EFU && (lregs.VIwrite & (1u << REG_P))) ||
+				 (lregs.pipe == VUPIPE_IALU && lregs.cycles != 0));
+			if (lower_adds_pipeline)
 			{
 				armAsm->Mov(x0, VU0_BASE_REG);
 				armMoveAddressToReg(x1, &lregs_data[i]);
