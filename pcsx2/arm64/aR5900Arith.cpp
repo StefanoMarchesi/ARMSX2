@@ -19,6 +19,8 @@
 //          DSRA32, DSLLV/DSRLV/DSRAV
 
 #include "Common.h"
+#include <cstdlib>
+#include <cstdio>
 #include "R5900OpcodeTables.h"
 #include "arm64/arm64Emitter.h"
 
@@ -1974,6 +1976,50 @@ void recDSRAV()
 	armAsm->Asr(rd, rt, rs);
 }
 #endif
+
+// Task #31: block-scope regalloc classifier - true iff `fn` is one of this
+// file's native cache-aware (armGprAlloc-only) recompilers. recompileNextInstruction
+// keeps the Tier-1 GPR cache alive to the next op only when that op is one of
+// these. Over-inclusion is safe: armCallInterpreter flushes the cache, so an
+// ISTUB (interp) variant of any of these still cannot corrupt state.
+bool armArithIsCacheAware(void (*fn)())
+{
+	// Runtime bisect support (task #31 debugging): ARMSX2_REGALLOC_OPS is a
+	// comma-separated union of index ranges ("0-26,30-39"); survival is limited
+	// to classifier indices inside any range. Unset = all.
+	static u64 s_mask = ~0ull;
+	static bool s_init = false;
+	if (!s_init)
+	{
+		s_init = true;
+		if (const char* v = std::getenv("ARMSX2_REGALLOC_OPS"))
+		{
+			s_mask = 0;
+			int lo, hi, n;
+			while (std::sscanf(v, "%d-%d%n", &lo, &hi, &n) == 2)
+			{
+				for (int i = lo; i <= hi && i < 64; i++)
+					if (i >= 0) s_mask |= (1ull << i);
+				v += n;
+				if (*v == ',') v++; else break;
+			}
+		}
+	}
+	static void (*const kFns[])() = {
+		recADDU, recSUBU, recADDIU, recDADDU, recDSUBU, recDADDIU,
+		recAND, recOR, recXOR, recNOR, recANDI, recORI, recXORI,
+		recSLT, recSLTU, recSLTI, recSLTIU, recADD, recADDI, recSUB,
+		recDADD, recDADDI, recDSUB, recLUI, recMFHI, recMFLO, recMTHI,
+		recMTLO, recMFHI1, recMFLO1, recMTHI1, recMTLO1, recMOVZ, recMOVN,
+		recMFSA, recMTSA, recMTSAB, recMTSAH, recSLL, recSRL, recSRA,
+		recSLLV, recSRLV, recSRAV, recDSLL, recDSRL, recDSRA, recDSLL32,
+		recDSRL32, recDSRA32, recDSLLV, recDSRLV, recDSRAV,
+	};
+	for (int i = 0; i < static_cast<int>(sizeof(kFns) / sizeof(kFns[0])); i++)
+		if (kFns[i] == fn)
+			return (s_mask >> i) & 1;
+	return false;
+}
 
 } // namespace OpcodeImpl
 } // namespace Dynarec

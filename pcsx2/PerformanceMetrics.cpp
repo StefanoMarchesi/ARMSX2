@@ -3,9 +3,11 @@
 
 #include <chrono>
 #include <vector>
+#include <cstdlib>
 
 #include "common/Timer.h"
 #include "common/Threading.h"
+#include "common/Console.h"
 
 #include "PerformanceMetrics.h"
 
@@ -155,6 +157,18 @@ void PerformanceMetrics::Update(bool gs_register_write, bool fb_blit, bool is_sk
 	s_average_frame_time = std::exchange(s_average_frame_time_accumulator, 0.0f) / static_cast<float>(s_unskipped_frames_since_last_update);
 	s_maximum_frame_time = std::exchange(s_maximum_frame_time_accumulator, 0.0f);
 	s_fps = static_cast<float>(s_frames_since_last_update) / time;
+
+	// Throughput benchmark log (env ARMSX2_FRAMELOG=1). Emits the cumulative frame
+	// count + this interval's fps every UPDATE_INTERVAL. Averaging fps over a fixed
+	// WALL-CLOCK window (or (frame_end-frame_start)/(t_end-t_start)) gives true
+	// throughput -- immune to where an uncapped scripted scene happens to be at the
+	// screenshot instant (the OSD's instantaneous frametime is not).
+	{
+		static const bool s_framelog = (std::getenv("ARMSX2_FRAMELOG") != nullptr);
+		if (s_framelog)
+			Console.WriteLn("FRAMELOG frame=%llu fps=%.3f",
+				static_cast<unsigned long long>(s_frame_number), s_fps);
+	}
 	s_average_gpu_time = s_accumulated_gpu_time / static_cast<float>(s_unskipped_frames_since_last_update);
 	s_gpu_usage = s_accumulated_gpu_time / (time * 10.0f);
 	s_accumulated_gpu_time = 0.0f;

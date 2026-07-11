@@ -20,6 +20,8 @@
 #include "arm64/AsmHelpers.h"
 #include "x86/BaseblockEx.h"
 
+#include <cstdlib>
+
 #include "arm64/TraceBlocks.h"
 
 // EEINST struct + EEINST_USED/LIVE bits + g_pCurInstInfo extern declaration.
@@ -390,6 +392,24 @@ void armFlushConstReg(int reg)
 // before loading source operands.
 void armDelConstReg(int reg)
 {
+	// Task #31: `reg` is about to receive a new runtime value — and several
+	// cache-aware Arith ops (MOVZ/MOVN, the zero-result fast-paths) write it
+	// DIRECTLY to memory via a raw armAsm->Str(GPR_OFFSET(reg)), bypassing the
+	// cache. Under block-scope regalloc a slot for `reg` can survive dirty from
+	// a prior op, leaving the cache (old value) and memory (new value) desynced
+	// -> stale reads / a later flush clobbering memory -> corrupted GPR -> bad
+	// guest PC. Invalidate here so memory is authoritative before the write.
+	//
+	// ORDER MATTERS: the cache slot's dirty value is always OLDER than a set
+	// const (armGprAlloc(for_write) clears the const at write time, so if both
+	// coexist the const was set later). Invalidate FIRST — with a set const,
+	// armGprInvalidate skips the stale store entirely — THEN flush the const so
+	// the newest value is what lands in memory. The previous order (const flush
+	// first, invalidate second) let the stale dirty value overwrite the const.
+	// armDelConstReg is always called BEFORE the op's write, so this never
+	// drops a slot the current op still needs. No-op when the cache is empty —
+	// which it always is in legacy mode and for cache-blind ops.
+	armGprInvalidate(reg);
 	armFlushConstReg(reg);
 	GPR_DEL_CONST(reg);
 }
@@ -405,6 +425,30 @@ void armDelConstReg(int reg)
 
 ArmGprCacheSlot g_armGprCache[32];
 u16 g_armGprCachePoolUsed;
+
+// Task #31 — block-scope GPR cache toggle. When ON, the Tier-1 cache is kept
+// alive across consecutive cache-aware (Arith) ops instead of being dropped
+// after every op. Correctness rests on a single invariant: the cache is
+// dropped IMMEDIATELY (while its pool regs still hold this op's freshly
+// computed values) unless the NEXT op is also cache-aware — see the peek at
+// the end of recompileNextInstruction. So the cache only ever survives across
+// Arith->Arith transitions, where no intervening cache-blind codegen can
+// clobber the pool. As a safety net, armCallInterpreter* also flush (a C call
+// clobbers the caller-saved pool x7,x8,x11-x15), covering any ISTUB (interp)
+// Arith variant that would otherwise be mis-classified as cache-aware.
+// Default OFF (legacy per-op flush) — runtime opt-in via ARMSX2_BLOCK_REGALLOC=1
+// so it can be A/B'd and shipped dark until validated on regression-sensitive
+// titles (GT4/ESPN).
+bool g_arm_block_regalloc = []() {
+	const char* v = std::getenv("ARMSX2_BLOCK_REGALLOC");
+	return v && v[0] == '1';
+}();
+
+// Defined in aR5900Arith.cpp — true iff `fn` is one of that file's native
+// cache-aware (armGprAlloc-only) recompilers.
+namespace R5900 { namespace Dynarec { namespace OpcodeImpl {
+	bool armArithIsCacheAware(void (*fn)());
+}}}
 
 // Monotonic per-block clock for LRU stamps. Reset at block entry along with
 // the slot table; bumped on every armGprAlloc hit/miss so eviction can pick
@@ -901,6 +945,12 @@ void armFlushCode()
 
 void armCallInterpreter(void (*func)())
 {
+    // Task #31 safety net: a C call clobbers the caller-saved GPR pool
+    // (x7,x8,x11-x15). Commit + drop any live Tier-1 slots first. No-op in
+    // legacy mode / when empty. Also covers any ISTUB (interp) Arith variant
+    // that the block-scope classifier over-includes as "cache-aware".
+    if (g_arm_block_regalloc)
+        armGprInvalidateAll();
     armFlushPC();
     armFlushCode();
     armFlushConstRegs();
@@ -933,6 +983,9 @@ void armCallInterpreter(void (*func)())
 //   4) Sets g_branch = 2
 void armBranchCallInterpreter(void (*func)())
 {
+	// Task #31 safety net: flush the GPR pool before the C call clobbers it.
+	if (g_arm_block_regalloc)
+		armGprInvalidateAll();
 	// cpuRegs.cycle = nextEventCycle + RCYCLE  (writeback the in-flight delta)
 	armAsm->Ldr(a64::x1, a64::MemOperand(RCPUSTATE, NEXT_EVENT_CYCLE_OFFSET));
 	armAsm->Add(a64::x0, a64::x1, RCYCLE);
@@ -1660,15 +1713,49 @@ void recompileNextInstruction(bool delayslot, bool swapped_delay_slot)
 			}
 		}
 #endif
+	}
 
-		// Phase D: op-local GPR cache discipline.
-		// Migrated ops (ALU only as of Phase D) use armGprAlloc to bind MIPS
-		// GPRs to host pool regs within their codegen. Commit any dirty slots
-		// to memory and drop the cache before moving on to the next opcode —
-		// non-migrated ops still read/write memory directly via armLoadGPR /
-		// armStoreGPR, so the cache must not survive across the boundary.
-		// No-op when nothing was cached (the common case).
+	// Phase D / Task #31: op-local GPR cache discipline. Runs for EVERY compiled
+	// instruction — INCLUDING the NOP fast-path above. That is load-bearing under
+	// block-scope regalloc: a NOP is SLL $0,$0,0, which the cache-aware classifier
+	// (recSLL) lets the cache survive INTO. If the NOP short-circuited this
+	// epilogue the live cache would be orphaned (no peek to decide the next
+	// transition) and then read stale by a cache-blind successor -> guest bad-PC.
+	// Deciding here for the NOP too keeps the invariant "the cache survives only
+	// toward an op that reuses it via armGprAlloc"; the NOP emits no code and
+	// touches no pool regs, so flushing here still sees this-op-fresh values.
+	// Migrated ops (ALU only as of Phase D) use armGprAlloc; non-migrated ops
+	// read/write memory directly via armLoadGPR / armStoreGPR, so in legacy mode
+	// the cache must not survive the boundary. No-op when nothing was cached.
+	if (!g_arm_block_regalloc)
+	{
 		armGprInvalidateAll();
+	}
+	else
+	{
+		// Keep the cache alive ONLY if the next op is cache-aware (it will reuse
+		// the slots via armGprAlloc). Otherwise drop it NOW — while the pool regs
+		// (x7,x8,x11-x15) still hold this op's freshly computed values; a
+		// cache-blind next op would reuse those regs as scratch and clobber them
+		// before any later flush could commit them. pc already points at the next
+		// instruction (incremented at entry).
+		//
+		// NEVER keep across a DELAY SLOT: after the DS compiles, control returns
+		// to the BRANCH emitter — not to the instruction at `pc` — and it emits
+		// the block's exit tails (emitEELinkableExit / CSEL PC stores). A dirty
+		// cache surviving here would leave the taken-path exit jumping to the
+		// next block with values never committed to cpuRegs (the recRecompile
+		// block-exit flush only covers the not-taken/fall-through tail emitted
+		// later) -> stale GPRs in the successor -> corrupted guest PC.
+		bool keep = false;
+		if (!delayslot && !swapped_delay_slot && pc < s_nEndBlock)
+		{
+			const R5900::OPCODE& next = R5900::GetInstruction(*(const u32*)PSM(pc));
+			keep = next.recompile &&
+				R5900::Dynarec::OpcodeImpl::armArithIsCacheAware(next.recompile);
+		}
+		if (!keep)
+			armGprInvalidateAll();
 	}
 
 	if (delayslot)
@@ -2131,6 +2218,13 @@ StartRecomp:
 	{
 		recompileNextInstruction(false, false);
 	}
+
+	// Task #31: commit any Tier-1 slots still live from the last op (e.g. a
+	// fall-through block ending on an Arith op) before the dispatcher/iBranchTest
+	// exit — their values live only in caller-saved pool regs otherwise. No-op
+	// in legacy mode (cache already dropped after every op).
+	if (g_arm_block_regalloc)
+		armGprInvalidateAll();
 
 	pxAssert((pc - startpc) >> 2 <= 0xffff);
 	s_pCurBlockEx->size = (pc - startpc) >> 2;
