@@ -650,6 +650,9 @@ layout(location = 0) in VSOutput
 	#elif !PS_NO_COLOR
 		layout(location = 0) out vec4 o_col0;
 	#endif
+	#if PS_MRT && !PS_NO_COLOR
+		layout(location = 1) out vec4 o_mrt1;
+	#endif
 #elif PS_RETURN_COLOR_ROV
 	vec4 o_col0;
 #endif
@@ -1968,6 +1971,12 @@ void main()
 		o_col0 = mix(o_col0, sample_from_rt(), discard_channels);
 
 		imageStore(RtImageRov, ivec2(gl_FragCoord.xy), o_col0);
+	#endif
+
+	// Both attachments stay resident in the tile buffer. Pipeline write masks
+	// select exactly one attachment per draw, preserving the original draw order.
+	#if PS_MRT && !PS_NO_COLOR
+		o_mrt1 = o_col0;
 	#endif
 
 	// Writing back depth

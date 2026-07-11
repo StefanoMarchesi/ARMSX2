@@ -91,7 +91,7 @@ public:
 		VkAttachmentStoreOp depth_store_op = VK_ATTACHMENT_STORE_OP_STORE,
 		VkAttachmentLoadOp stencil_load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 		VkAttachmentStoreOp stencil_store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE, bool color_feedback_loop = false,
-		bool depth_sampling = false);
+		bool depth_sampling = false, bool mrt = false);
 
 	// Gets a non-clearing version of the specified render pass. Slow, don't call in hot path.
 	VkRenderPass GetRenderPassForRestarting(VkRenderPass pass);
@@ -186,6 +186,7 @@ private:
 			u32 stencil_store_op : 1;
 			u32 color_feedback_loop : 1;
 			u32 depth_sampling : 1;
+			u32 mrt : 1;
 		};
 
 		u32 key;
@@ -354,6 +355,8 @@ public:
 				u32 ds : 1;
 				u32 line_width : 1;
 				u32 feedback_loop_flags : 3;
+				u32 mrt : 1;
+				u32 mrt_index : 1;
 			};
 
 			u32 key;
@@ -477,6 +480,7 @@ private:
 	VkRenderPass m_swap_chain_render_pass = VK_NULL_HANDLE;
 
 	VkRenderPass m_tfx_render_pass[2][2][2][3][2][2][3][3] = {}; // [rt][ds][colclip][date][fbl][dsp][rt_op][ds_op]
+	VkRenderPass m_tfx_mrt_render_pass[2] = {}; // [ds], LOAD/STORE only, two color attachments.
 
 	VkDescriptorSetLayout m_cas_ds_layout = VK_NULL_HANDLE;
 	VkPipelineLayout m_cas_pipeline_layout = VK_NULL_HANDLE;
@@ -559,6 +563,7 @@ public:
 	{
 		return m_tfx_render_pass[rt][ds][colclip][stencil][fbl][dsp][rt_op][ds_op];
 	}
+	__fi VkRenderPass GetTFXMRTRenderPass(bool ds) const { return m_tfx_mrt_render_pass[ds]; }
 	__fi VkSampler GetPointSampler() const { return m_point_sampler; }
 	__fi VkSampler GetLinearSampler() const { return m_linear_sampler; }
 
@@ -635,6 +640,8 @@ public:
 
 	void OMSetRenderTargets(GSTexture* rt, GSTexture* ds, const GSVector4i& scissor,
 		FeedbackLoopFlag feedback_loop = FeedbackLoopFlag_None, const GSVector2i& viewport_size = {});
+	bool OMSetRenderTargetsMRT(GSTextureVK* active_rt, GSTextureVK* other_rt, GSTextureVK* ds,
+		const GSVector4i& scissor, u8 active_index);
 
 	void SetVSConstantBuffer(const GSHWDrawConfig::VSConstantBuffer& cb);
 	void SetPSConstantBuffer(const GSHWDrawConfig::PSConstantBuffer& cb);
@@ -754,6 +761,10 @@ private:
 
 	GSTextureVK* m_current_render_target = nullptr;
 	GSTextureVK* m_current_depth_target = nullptr;
+	std::array<GSTextureVK*, 2> m_mrt_render_targets{};
+	GSTextureVK* m_mrt_depth_target = nullptr;
+	VkFramebuffer m_mrt_framebuffer = VK_NULL_HANDLE;
+	bool m_current_framebuffer_is_mrt = false;
 	VkFramebuffer m_current_framebuffer = VK_NULL_HANDLE;
 	VkRenderPass m_current_render_pass = VK_NULL_HANDLE;
 	GSVector4i m_current_render_pass_area = GSVector4i::zero();

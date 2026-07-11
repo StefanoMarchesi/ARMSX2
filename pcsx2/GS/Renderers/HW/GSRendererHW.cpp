@@ -8,6 +8,7 @@
 #include "GS/GSUtil.h"
 #include "Host.h"
 #include "common/Console.h"
+#include <cstdlib>
 #include "common/BitUtils.h"
 #include "common/StringUtil.h"
 #include <bit>
@@ -2765,6 +2766,10 @@ void GSRendererHW::Draw()
 	m_cached_ctx.TEST = context->TEST;
 	m_cached_ctx.FRAME = context->FRAME;
 	m_cached_ctx.ZBUF = context->ZBUF;
+	if (static const bool gsdiag = (std::getenv("ARMSX2_GSDIAG") != nullptr); gsdiag)
+		Console.WriteLn("GSDIAG fbp=%x fbw=%u fpsm=%u zbp=%x zpsm=%u zmsk=%u",
+			m_cached_ctx.FRAME.Block(), m_cached_ctx.FRAME.FBW, m_cached_ctx.FRAME.PSM,
+			m_cached_ctx.ZBUF.Block(), m_cached_ctx.ZBUF.PSM, m_cached_ctx.ZBUF.ZMSK);
 
 	if (IsBadFrame())
 	{
@@ -9272,6 +9277,34 @@ __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Ta
 	m_conf.ps.scanmsk = env.SCANMSK.MSK;
 	m_conf.rt = rt ? rt->m_texture : nullptr;
 	m_conf.ds = ds ? (m_using_temp_z ? g_texture_cache->GetTemporaryZ() : ds->m_texture) : nullptr;
+
+	// ARMSX2 experimental MRT path for DRIV3R. The two dominant PSMCT16S
+	// framebuffers alternate per draw while sharing the same PSMZ24 depth
+	// buffer. Expose the already-existing twin target to the Vulkan backend;
+	// all correctness gating (feedback, dual-source, multi-pass, clears) stays
+	// in GSDeviceVK. Default OFF and deliberately restricted to the diagnosed
+	// register tuple so other games/backends remain byte-for-byte on the old path.
+	static const bool s_armsx2_mrt = []() {
+		const char* value = std::getenv("ARMSX2_MRT");
+		return value && value[0] == '1';
+	}();
+	if (s_armsx2_mrt && rt && ds && !m_using_temp_z &&
+		m_cached_ctx.FRAME.FBW == 8 && m_cached_ctx.FRAME.PSM == PSMCT16S &&
+		m_cached_ctx.ZBUF.Block() == 0x800 && m_cached_ctx.ZBUF.PSM == PSMZ24 &&
+		(m_cached_ctx.FRAME.Block() == 0x1c00 || m_cached_ctx.FRAME.Block() == 0x2400) &&
+		rt->m_TEX0.TBP0 == m_cached_ctx.FRAME.Block())
+	{
+		const u32 other_fbp = (m_cached_ctx.FRAME.Block() == 0x1c00) ? 0x2400 : 0x1c00;
+		GSTextureCache::Target* other =
+			g_texture_cache->GetExactTarget(other_fbp, 8, GSTextureCache::RenderTarget, other_fbp + 1);
+		if (other && other != rt && other->m_TEX0.PSM == PSMCT16S &&
+			other->m_texture->GetSize() == rt->m_texture->GetSize() &&
+			m_conf.ds && m_conf.ds->GetSize() == rt->m_texture->GetSize())
+		{
+			m_conf.mrt_rt = other->m_texture;
+			m_conf.mrt_index = (m_cached_ctx.FRAME.Block() == 0x2400) ? 1 : 0;
+		}
+	}
 
 	pxAssert(!ds || !rt || (m_conf.ds->GetSize().x == m_conf.rt->GetSize().x && m_conf.ds->GetSize().y == m_conf.rt->GetSize().y));
 
