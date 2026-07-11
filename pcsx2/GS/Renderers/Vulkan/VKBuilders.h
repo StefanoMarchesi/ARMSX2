@@ -277,7 +277,10 @@ namespace Vulkan
 	{
 		enum : u32
 		{
-			MAX_ATTACHMENTS = 2,
+			// Two color attachments plus a shared depth attachment are used by
+			// the experimental ARMSX2 MRT path. Existing framebuffers still use
+			// only the first one or two entries.
+			MAX_ATTACHMENTS = 3,
 		};
 
 	public:

@@ -1123,7 +1123,7 @@ bool GSDeviceVK::CreateGlobalDescriptorPool()
 VkRenderPass GSDeviceVK::GetRenderPass(VkFormat color_format, VkFormat depth_format, VkAttachmentLoadOp color_load_op,
 	VkAttachmentStoreOp color_store_op, VkAttachmentLoadOp depth_load_op, VkAttachmentStoreOp depth_store_op,
 	VkAttachmentLoadOp stencil_load_op, VkAttachmentStoreOp stencil_store_op, bool color_feedback_loop,
-	bool depth_sampling)
+	bool depth_sampling, bool mrt)
 {
 	RenderPassCacheKey key = {};
 	key.color_format = color_format;
@@ -1136,6 +1136,7 @@ VkRenderPass GSDeviceVK::GetRenderPass(VkFormat color_format, VkFormat depth_for
 	key.stencil_store_op = stencil_store_op;
 	key.color_feedback_loop = color_feedback_loop;
 	key.depth_sampling = depth_sampling;
+	key.mrt = mrt;
 
 	// Mali driver bug (ported from PPSSPP): a packed depth/stencil attachment whose
 	// depth vs stencil load-ops MISMATCH corrupts on ARM Mali. PCSX2's GS uses one
@@ -1743,7 +1744,7 @@ void GSDeviceVK::DisableDebugUtils()
 
 VkRenderPass GSDeviceVK::CreateCachedRenderPass(RenderPassCacheKey key)
 {
-	VkAttachmentReference color_reference;
+	std::array<VkAttachmentReference, 2> color_reference;
 	VkAttachmentReference* color_reference_ptr = nullptr;
 	VkAttachmentReference depth_reference;
 	VkAttachmentReference* depth_reference_ptr = nullptr;
@@ -1751,7 +1752,7 @@ VkRenderPass GSDeviceVK::CreateCachedRenderPass(RenderPassCacheKey key)
 	u32 num_subpass_inputs = 0;
 	std::array<VkSubpassDependency, 2> subpass_dependency;
 	u32 num_subpass_dependencies = 0;
-	std::array<VkAttachmentDescription, 2> attachments;
+	std::array<VkAttachmentDescription, 3> attachments;
 	u32 num_attachments = 0;
 	if (key.color_format != VK_FORMAT_UNDEFINED)
 	{
@@ -1762,9 +1763,9 @@ VkRenderPass GSDeviceVK::CreateCachedRenderPass(RenderPassCacheKey key)
 		attachments[num_attachments] = {0, static_cast<VkFormat>(key.color_format), VK_SAMPLE_COUNT_1_BIT,
 			static_cast<VkAttachmentLoadOp>(key.color_load_op), static_cast<VkAttachmentStoreOp>(key.color_store_op),
 			VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, layout, layout};
-		color_reference.attachment = num_attachments;
-		color_reference.layout = layout;
-		color_reference_ptr = &color_reference;
+		color_reference[0].attachment = num_attachments;
+		color_reference[0].layout = layout;
+		color_reference_ptr = color_reference.data();
 
 		if (key.color_feedback_loop)
 		{
@@ -1794,6 +1795,15 @@ VkRenderPass GSDeviceVK::CreateCachedRenderPass(RenderPassCacheKey key)
 		}
 
 		num_attachments++;
+
+		if (key.mrt)
+		{
+			pxAssert(!key.color_feedback_loop);
+			attachments[num_attachments] = attachments[0];
+			color_reference[1].attachment = num_attachments;
+			color_reference[1].layout = layout;
+			num_attachments++;
+		}
 	}
 	if (key.depth_format != VK_FORMAT_UNDEFINED)
 	{
@@ -1845,7 +1855,7 @@ VkRenderPass GSDeviceVK::CreateCachedRenderPass(RenderPassCacheKey key)
 			VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT :
 			0;
 	const VkSubpassDescription subpass = {subpass_flags, VK_PIPELINE_BIND_POINT_GRAPHICS, num_subpass_inputs,
-		num_subpass_inputs ? input_reference.data() : nullptr, color_reference_ptr ? 1u : 0u,
+		num_subpass_inputs ? input_reference.data() : nullptr, color_reference_ptr ? (key.mrt ? 2u : 1u) : 0u,
 		color_reference_ptr ? color_reference_ptr : nullptr, nullptr, depth_reference_ptr, 0, nullptr};
 	const VkRenderPassCreateInfo pass_info = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, nullptr, 0u, num_attachments,
 		attachments.data(), 1u, &subpass, num_subpass_dependencies, num_subpass_dependencies ? subpass_dependency.data() : nullptr};
@@ -3967,6 +3977,18 @@ void GSDeviceVK::OMSetRenderTargets(
 	GSTextureVK* vkRt = static_cast<GSTextureVK*>(rt);
 	GSTextureVK* vkDs = static_cast<GSTextureVK*>(ds);
 
+	if (m_current_framebuffer_is_mrt)
+	{
+		static const bool s_diag = (std::getenv("ARMSX2_MRT_DIAG") != nullptr);
+		static u64 s_normal_breaks = 0;
+		if (s_diag && ((++s_normal_breaks % 1024) == 0))
+			Console.WriteLn("MRTDIAG normal_breaks=%llu",
+				static_cast<unsigned long long>(s_normal_breaks));
+		EndRenderPass();
+		m_current_framebuffer_is_mrt = false;
+		m_current_framebuffer = VK_NULL_HANDLE;
+	}
+
 	if (m_current_render_target != vkRt || m_current_depth_target != vkDs ||
 		m_current_framebuffer_feedback_loop != feedback_loop ||
 		m_current_framebuffer == VK_NULL_HANDLE)
@@ -4140,6 +4162,96 @@ void GSDeviceVK::OMSetRenderTargets(
 
 	SetViewport(vp);
 	SetScissor(scissor);
+}
+
+bool GSDeviceVK::OMSetRenderTargetsMRT(GSTextureVK* active_rt, GSTextureVK* other_rt, GSTextureVK* ds,
+	const GSVector4i& scissor, u8 active_index)
+{
+	static const bool s_diag = (std::getenv("ARMSX2_MRT_DIAG") != nullptr);
+	static u64 s_draws = 0;
+	static u64 s_passes = 0;
+	static u64 s_switches = 0;
+	static u64 s_new_framebuffers = 0;
+	static u64 s_rebinds = 0;
+	const bool switched_attachment = m_current_framebuffer_is_mrt && m_current_render_target != active_rt;
+	if (!active_rt || !other_rt || active_rt == other_rt || active_index > 1 ||
+		active_rt->GetSize() != other_rt->GetSize() || active_rt->GetVkFormat() != other_rt->GetVkFormat() ||
+		(ds && ds->GetSize() != active_rt->GetSize()))
+	{
+		return false;
+	}
+
+	std::array<GSTextureVK*, 2> targets;
+	targets[active_index] = active_rt;
+	targets[active_index ^ 1] = other_rt;
+	const bool same_cached_framebuffer = m_mrt_framebuffer != VK_NULL_HANDLE &&
+		m_mrt_render_targets == targets && m_mrt_depth_target == ds;
+
+	if (!same_cached_framebuffer)
+	{
+		EndRenderPass();
+		s_passes++;
+		s_new_framebuffers++;
+		if (m_mrt_framebuffer != VK_NULL_HANDLE)
+			DeferFramebufferDestruction(m_mrt_framebuffer);
+
+		Vulkan::FramebufferBuilder fbb;
+		fbb.AddAttachment(targets[0]->GetView());
+		fbb.AddAttachment(targets[1]->GetView());
+		if (ds)
+			fbb.AddAttachment(ds->GetView());
+		fbb.SetSize(active_rt->GetWidth(), active_rt->GetHeight(), 1);
+		fbb.SetRenderPass(GetTFXMRTRenderPass(ds != nullptr));
+		m_mrt_framebuffer = fbb.Create(m_device);
+		if (m_mrt_framebuffer == VK_NULL_HANDLE)
+		{
+			m_mrt_render_targets = {};
+			m_mrt_depth_target = nullptr;
+			return false;
+		}
+
+		m_mrt_render_targets = targets;
+		m_mrt_depth_target = ds;
+	}
+	else if (!m_current_framebuffer_is_mrt || m_current_framebuffer != m_mrt_framebuffer)
+	{
+		EndRenderPass();
+		s_passes++;
+		s_rebinds++;
+	}
+
+	if (!InRenderPass())
+	{
+		targets[0]->TransitionToLayout(GSTextureVK::Layout::ColorAttachment);
+		targets[1]->TransitionToLayout(GSTextureVK::Layout::ColorAttachment);
+		if (ds)
+			ds->TransitionToLayout(GSTextureVK::Layout::DepthStencilAttachment);
+	}
+
+	targets[0]->SetState(GSTexture::State::Dirty);
+	targets[1]->SetState(GSTexture::State::Dirty);
+	if (ds)
+		ds->SetState(GSTexture::State::Dirty);
+
+	m_current_framebuffer = m_mrt_framebuffer;
+	m_current_framebuffer_is_mrt = true;
+	m_current_render_target = active_rt;
+	m_current_depth_target = ds;
+	m_current_framebuffer_feedback_loop = FeedbackLoopFlag_None;
+	if (switched_attachment)
+		s_switches++;
+	s_draws++;
+	if (s_diag && (s_draws % 1024) == 0)
+		Console.WriteLn("MRTDIAG draws=%llu passes=%llu switches=%llu newfb=%llu rebind=%llu",
+			static_cast<unsigned long long>(s_draws), static_cast<unsigned long long>(s_passes),
+			static_cast<unsigned long long>(s_switches), static_cast<unsigned long long>(s_new_framebuffers),
+			static_cast<unsigned long long>(s_rebinds));
+
+	const GSVector2i size = active_rt->GetSize();
+	const VkViewport vp{0.0f, 0.0f, static_cast<float>(size.x), static_cast<float>(size.y), 0.0f, 1.0f};
+	SetViewport(vp);
+	SetScissor(scissor);
+	return true;
 }
 
 VkSampler GSDeviceVK::GetSampler(GSHWDrawConfig::SamplerSelector ss)
@@ -4470,6 +4582,19 @@ bool GSDeviceVK::CreateRenderPasses()
 				}
 			}
 		}
+	}
+
+	// Experimental DRIV3R fast path: both color targets are loaded/stored once
+	// and share the ordinary depth attachment for the lifetime of the pass.
+	for (u32 ds = 0; ds < 2; ds++)
+	{
+		m_tfx_mrt_render_pass[ds] = GetRenderPass(rt_format, ds ? depth_format : VK_FORMAT_UNDEFINED,
+			VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE,
+			ds ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			ds ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, false, false, true);
+		if (m_tfx_mrt_render_pass[ds] == VK_NULL_HANDLE)
+			return false;
 	}
 
 	GET(m_utility_color_render_pass_load, rt_format, VK_FORMAT_UNDEFINED, false, false, VK_ATTACHMENT_LOAD_OP_LOAD,
@@ -5158,6 +5283,12 @@ bool GSDeviceVK::DoCAS(
 
 void GSDeviceVK::DestroyResources()
 {
+	if (m_mrt_framebuffer != VK_NULL_HANDLE)
+	{
+		vkDestroyFramebuffer(m_device, m_mrt_framebuffer, nullptr);
+		m_mrt_framebuffer = VK_NULL_HANDLE;
+	}
+
 	if (m_tfx_ubo_descriptor_set != VK_NULL_HANDLE)
 		FreePersistentDescriptorSet(m_tfx_ubo_descriptor_set);
 
@@ -5392,6 +5523,7 @@ VkShaderModule GSDeviceVK::GetTFXFragmentShader(const GSHWDrawConfig::PSSelector
 	AddMacro(ss, "PS_ANISOTROPIC_FILTERING", sel.sw_aniso);
 	AddMacro(ss, "PS_ROV_COLOR", sel.rov_color);
 	AddMacro(ss, "PS_ROV_DEPTH", static_cast<u32>(sel.rov_depth));
+	AddMacro(ss, "PS_MRT", sel.mrt);
 	ss << m_tfx_source;
 
 	VkShaderModule mod = g_vulkan_shader_cache->GetFragmentShader(ss.str());
@@ -5436,12 +5568,11 @@ VkPipeline GSDeviceVK::CreateTFXPipeline(const PipelineSelector& p)
 	}
 	else
 	{
-		gpb.SetRenderPass(
+		gpb.SetRenderPass(p.mrt ? GetTFXMRTRenderPass(p.ds) :
 			GetTFXRenderPass(p.rt, p.ds, p.ps.colclip_hw, p.dss.date,
 				p.IsRTFeedbackLoop(), p.IsTestingAndSamplingDepth(),
 				p.rt ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-				p.ds ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE),
-			0);
+				p.ds ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE), 0);
 	}
 	gpb.SetPrimitiveTopology(topology_lookup[p.topology]);
 	gpb.SetRasterizationState(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_CLOCKWISE);
@@ -5505,7 +5636,7 @@ VkPipeline GSDeviceVK::CreateTFXPipeline(const PipelineSelector& p)
 
 		gpb.SetBlendAttachment(0, true, vk_blend_factors[pbs.src_factor], vk_blend_factors[pbs.dst_factor],
 			vk_blend_ops[pbs.op], vk_blend_factors[pbs.src_factor_alpha], vk_blend_factors[pbs.dst_factor_alpha],
-			VK_BLEND_OP_ADD, p.cms.wrgba);
+			VK_BLEND_OP_ADD, (p.mrt && p.mrt_index == 1) ? 0 : p.cms.wrgba);
 	}
 	else if (m_broken_colormask_with_depth && (p.cms.wrgba & 0x7u) == 0 &&
 			 (p.dss.ztst != ZTST_ALWAYS || p.dss.zwe))
@@ -5527,7 +5658,33 @@ VkPipeline GSDeviceVK::CreateTFXPipeline(const PipelineSelector& p)
 	else
 	{
 		gpb.SetBlendAttachment(0, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
-			VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, p.cms.wrgba);
+			VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
+			(p.mrt && p.mrt_index == 1) ? 0 : p.cms.wrgba);
+	}
+
+	if (p.mrt)
+	{
+		const u8 mask = (p.mrt_index == 1) ? p.cms.wrgba : 0;
+		if (pbs.enable)
+		{
+			static constexpr std::array<VkBlendFactor, 16> factors = {{
+				VK_BLEND_FACTOR_SRC_COLOR, VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR, VK_BLEND_FACTOR_DST_COLOR,
+				VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR, VK_BLEND_FACTOR_SRC1_COLOR,
+				VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR, VK_BLEND_FACTOR_SRC_ALPHA,
+				VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_DST_ALPHA,
+				VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA, VK_BLEND_FACTOR_SRC1_ALPHA,
+				VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA, VK_BLEND_FACTOR_CONSTANT_COLOR,
+				VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO}};
+			static constexpr std::array<VkBlendOp, 3> ops =
+				{{VK_BLEND_OP_ADD, VK_BLEND_OP_SUBTRACT, VK_BLEND_OP_REVERSE_SUBTRACT}};
+			gpb.SetBlendAttachment(1, true, factors[pbs.src_factor], factors[pbs.dst_factor], ops[pbs.op],
+				factors[pbs.src_factor_alpha], factors[pbs.dst_factor_alpha], VK_BLEND_OP_ADD, mask);
+		}
+		else
+		{
+			gpb.SetBlendAttachment(1, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
+				VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, mask);
+		}
 	}
 
 	// Tests have shown that it's faster to just enable rast order on the entire pass, rather than alternating
@@ -5673,6 +5830,10 @@ void GSDeviceVK::ExecuteCommandBufferAndRestartRenderPass(bool wait_for_completi
 	GSTexture* const current_rt = m_current_render_target;
 	GSTexture* const current_ds = m_current_depth_target;
 	const FeedbackLoopFlag current_feedback_loop = m_current_framebuffer_feedback_loop;
+	const bool current_mrt = m_current_framebuffer_is_mrt;
+	GSTextureVK* const current_mrt_other = current_mrt ?
+		((m_mrt_render_targets[0] == current_rt) ? m_mrt_render_targets[1] : m_mrt_render_targets[0]) : nullptr;
+	const u8 current_mrt_index = (current_mrt && m_mrt_render_targets[1] == current_rt) ? 1 : 0;
 
 	EndRenderPass();
 	ExecuteCommandBuffer(GetWaitType(wait_for_completion, GSConfig.HWSpinCPUForReadbacks));
@@ -5680,7 +5841,11 @@ void GSDeviceVK::ExecuteCommandBufferAndRestartRenderPass(bool wait_for_completi
 	if (render_pass != VK_NULL_HANDLE)
 	{
 		// rebind framebuffer
-		OMSetRenderTargets(current_rt, current_ds, scissor, current_feedback_loop);
+		if (!current_mrt || !OMSetRenderTargetsMRT(static_cast<GSTextureVK*>(current_rt), current_mrt_other,
+			static_cast<GSTextureVK*>(current_ds), scissor, current_mrt_index))
+		{
+			OMSetRenderTargets(current_rt, current_ds, scissor, current_feedback_loop);
+		}
 
 		// restart render pass
 		BeginRenderPass(GetRenderPassForRestarting(render_pass), render_pass_area);
@@ -5985,6 +6150,22 @@ void GSDeviceVK::UnbindTexture(GSTextureVK* tex)
 	{
 		m_utility_texture = m_null_texture.get();
 		m_dirty_flags |= DIRTY_FLAG_UTILITY_TEXTURE;
+	}
+	if (m_mrt_render_targets[0] == tex || m_mrt_render_targets[1] == tex || m_mrt_depth_target == tex)
+	{
+		static const bool s_diag = (std::getenv("ARMSX2_MRT_DIAG") != nullptr);
+		static u64 s_unbind_breaks = 0;
+		if (s_diag && ((++s_unbind_breaks % 1024) == 0))
+			Console.WriteLn("MRTDIAG unbind_breaks=%llu",
+				static_cast<unsigned long long>(s_unbind_breaks));
+		EndRenderPass();
+		if (m_mrt_framebuffer != VK_NULL_HANDLE)
+			DeferFramebufferDestruction(m_mrt_framebuffer);
+		m_mrt_framebuffer = VK_NULL_HANDLE;
+		m_mrt_render_targets = {};
+		m_mrt_depth_target = nullptr;
+		m_current_framebuffer_is_mrt = false;
+		m_current_framebuffer = VK_NULL_HANDLE;
 	}
 	if (m_current_render_target == tex || m_current_depth_target == tex)
 	{
@@ -6763,16 +6944,25 @@ void GSDeviceVK::RenderHW(GSHWDrawConfig& config)
 	
 	PSSetROVs(draw_rt_rov, draw_ds_rov, config.ps.HasColorOutput(), config.ps.HasDepthROVWrite());
 
-	OMSetRenderTargets(draw_rt, draw_ds, config.scissor, static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), rtsize);
+	if (!pipe.mrt || !OMSetRenderTargetsMRT(draw_rt, static_cast<GSTextureVK*>(config.mrt_rt), draw_ds,
+		config.scissor, pipe.mrt_index))
+	{
+		pipe.mrt = false;
+		pipe.mrt_index = 0;
+		pipe.ps.mrt = false;
+		OMSetRenderTargets(draw_rt, draw_ds, config.scissor,
+			static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), rtsize);
+	}
 
 	// Begin render pass if new target or out of the area.
 	if (!InRenderPass())
 	{
-		const VkAttachmentLoadOp rt_op = GetLoadOpForTexture(draw_rt);
-		const VkAttachmentLoadOp ds_op = GetLoadOpForTexture(draw_ds);
-		const VkRenderPass rp = GetTFXRenderPass(pipe.rt, pipe.ds, pipe.ps.colclip_hw,
-			config.destination_alpha == GSHWDrawConfig::DestinationAlphaMode::Stencil, pipe.IsRTFeedbackLoop(),
-			pipe.IsTestingAndSamplingDepth(), rt_op, ds_op);
+		const VkAttachmentLoadOp rt_op = pipe.mrt ? VK_ATTACHMENT_LOAD_OP_LOAD : GetLoadOpForTexture(draw_rt);
+		const VkAttachmentLoadOp ds_op = pipe.mrt ? VK_ATTACHMENT_LOAD_OP_LOAD : GetLoadOpForTexture(draw_ds);
+		const VkRenderPass rp = pipe.mrt ? GetTFXMRTRenderPass(pipe.ds) :
+			GetTFXRenderPass(pipe.rt, pipe.ds, pipe.ps.colclip_hw,
+				config.destination_alpha == GSHWDrawConfig::DestinationAlphaMode::Stencil, pipe.IsRTFeedbackLoop(),
+				pipe.IsTestingAndSamplingDepth(), rt_op, ds_op);
 		const bool is_clearing_rt = (rt_op == VK_ATTACHMENT_LOAD_OP_CLEAR || ds_op == VK_ATTACHMENT_LOAD_OP_CLEAR);
 
 		// Only draw to the active area of the colclip hw target. Except when depth is cleared, we need to use the full
@@ -6963,6 +7153,25 @@ void GSDeviceVK::UpdateHWPipelineSelector(GSHWDrawConfig& config, PipelineSelect
 	{
 		pipe.feedback_loop_flags |= (config.tex && config.tex == config.ds) ? FeedbackLoopFlag_ReadDepth : FeedbackLoopFlag_None;
 	}
+
+	// Keep the first prototype deliberately conservative. Any operation which
+	// reads an attached image, needs dual-source output, uses ROV/DATE/colclip,
+	// or emits additional passes falls back to the legacy single-target path and
+	// therefore becomes a natural MRT render-pass boundary.
+	GSTextureVK* const mrt_rt = static_cast<GSTextureVK*>(config.mrt_rt);
+	const bool use_mrt = mrt_rt && config.rt && config.ds && config.mrt_index < 2 &&
+		config.tex != config.mrt_rt && config.ps.no_color1 &&
+		!config.ps.HasColorROV() && !config.ps.HasDepthROV() &&
+		pipe.feedback_loop_flags == FeedbackLoopFlag_None &&
+		config.destination_alpha == GSHWDrawConfig::DestinationAlphaMode::Off &&
+		config.colclip_mode == GSHWDrawConfig::ColClipMode::NoModify &&
+		!config.alpha_second_pass.enable && !config.blend_multi_pass.enable &&
+		static_cast<GSTextureVK*>(config.rt)->GetState() == GSTexture::State::Dirty &&
+		mrt_rt->GetState() == GSTexture::State::Dirty &&
+		static_cast<GSTextureVK*>(config.ds)->GetState() == GSTexture::State::Dirty;
+	pipe.mrt = use_mrt;
+	pipe.mrt_index = use_mrt ? config.mrt_index : 0;
+	pipe.ps.mrt = use_mrt;
 
 	// enable point size in the vertex shader if we're rendering points regardless of upscaling.
 	pipe.vs.point_size |= (config.topology == GSHWDrawConfig::Topology::Point);
