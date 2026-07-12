@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+#include <atomic>
+
 // ARM64 microVU recompiler — recompiler shell (Phase 7, task 7.2c).
 //
 // This is the ARM64 counterpart to pcsx2/x86/microVU.cpp. It holds the

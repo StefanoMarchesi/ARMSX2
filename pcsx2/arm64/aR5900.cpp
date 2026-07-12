@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+#include <atomic>
+
 // ARM64 EE (R5900) recompiler — skeleton (Phase 1).
 //
 // ARM64 counterpart to pcsx2/x86/ix86-32/iR5900.cpp. At this stage every entry
@@ -4611,6 +4613,9 @@ u8* recEndThunk()
 
 static void recRecompile(u32 startpc)
 {
+	extern std::atomic<unsigned> g_hitch_ee_compiles;
+	g_hitch_ee_compiles.fetch_add(1, std::memory_order_relaxed);
+
 	const u32 hw_startpc = recHWAddr(startpc);
 
 	// Reset the whole cache if the emit cursor has run within one block's worth of the

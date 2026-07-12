@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+#include <atomic>
 #include "GS/GSGL.h"
 #include "GS/GSPerfMon.h"
 #include "GS/Renderers/Vulkan/GSDeviceVK.h"
@@ -335,6 +336,11 @@ bool GSTextureVK::Update(const GSVector4i& r, const void* data, int pitch, int l
 		return false;
 
 	g_perfmon.Put(GSPerfMon::TextureUploads, 1);
+
+	{
+		extern std::atomic<unsigned long long> g_hitch_tex_bytes;
+		g_hitch_tex_bytes.fetch_add(static_cast<unsigned long long>(pitch) * static_cast<unsigned>(r.height()), std::memory_order_relaxed);
+	}
 
 	const u32 width = r.width();
 	const u32 height = r.height();
@@ -887,6 +893,11 @@ void GSDownloadTextureVK::CopyFromTexture(
 	const GSVector4i& drc, GSTexture* stex, const GSVector4i& src, u32 src_level, bool use_transfer_pitch)
 {
 	GSTextureVK* const vkTex = static_cast<GSTextureVK*>(stex);
+
+	{
+		extern std::atomic<unsigned> g_hitch_readbacks;
+		g_hitch_readbacks.fetch_add(1, std::memory_order_relaxed);
+	}
 
 	pxAssert(vkTex->GetFormat() == m_format);
 	pxAssert(drc.width() == src.width() && drc.height() == src.height());

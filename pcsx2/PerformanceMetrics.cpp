@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <vector>
 
 #include "common/Timer.h"
@@ -14,6 +16,14 @@
 #include "MTGS.h"
 #include "MTVU.h"
 #include "VMManager.h"
+
+// Opt-in counters for work which commonly causes visible hitches. They are
+// updated from the GS/JIT threads and drained by the metrics thread.
+std::atomic<unsigned> g_hitch_pipelines{0};
+std::atomic<unsigned long long> g_hitch_tex_bytes{0};
+std::atomic<unsigned> g_hitch_vu1_compiles{0};
+std::atomic<unsigned> g_hitch_ee_compiles{0};
+std::atomic<unsigned> g_hitch_readbacks{0};
 
 static const float UPDATE_INTERVAL = 0.5f;
 
@@ -159,6 +169,18 @@ void PerformanceMetrics::Update(bool gs_register_write, bool fb_blit, bool is_sk
 	s_average_frame_time = std::exchange(s_average_frame_time_accumulator, 0.0f) / static_cast<float>(s_unskipped_frames_since_last_update);
 	s_maximum_frame_time = std::exchange(s_maximum_frame_time_accumulator, 0.0f);
 	s_fps = static_cast<float>(s_frames_since_last_update) / time;
+
+	static const bool s_hitchlog = (std::getenv("ARMSX2_HITCHLOG") != nullptr);
+	if (s_hitchlog)
+	{
+		Console.WriteLn("HITCHLOG frame=%llu pipe=%u texKB=%llu vu1c=%u eec=%u rb=%u",
+			static_cast<unsigned long long>(s_frame_number),
+			g_hitch_pipelines.exchange(0, std::memory_order_relaxed),
+			g_hitch_tex_bytes.exchange(0, std::memory_order_relaxed) / 1024ull,
+			g_hitch_vu1_compiles.exchange(0, std::memory_order_relaxed),
+			g_hitch_ee_compiles.exchange(0, std::memory_order_relaxed),
+			g_hitch_readbacks.exchange(0, std::memory_order_relaxed));
+	}
 	s_average_gpu_time = s_accumulated_gpu_time / static_cast<float>(s_unskipped_frames_since_last_update);
 	s_average_gpu_vs_invocations = static_cast<double>(s_accumulated_gpu_vs_invocations) / static_cast<double>(s_unskipped_frames_since_last_update);
 	s_average_gpu_ps_invocations = static_cast<double>(s_accumulated_gpu_ps_invocations) / static_cast<double>(s_unskipped_frames_since_last_update);

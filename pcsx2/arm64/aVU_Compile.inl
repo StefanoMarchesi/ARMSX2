@@ -384,6 +384,12 @@ static void mvuPreloadRegisters(microVU& mVU, u32 endCount)
 
 void* mVUcompile(microVU& mVU, u32 startPC, uptr pState)
 {
+	if (mVU.index == 1)
+	{
+		extern std::atomic<unsigned> g_hitch_vu1_compiles;
+		g_hitch_vu1_compiles.fetch_add(1, std::memory_order_relaxed);
+	}
+
 	microFlagCycles mFC;
 	u8* thisPtr = armGetCurrentCodePointer();
 	const u32 endCount = (((microRegInfo*)pState)->blockType) ? 1 : (mVU.microMemSize / 8);
