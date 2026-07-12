@@ -70,6 +70,15 @@ static bool IsArmsx2MRTSWBlendEnabled()
 	return enabled;
 }
 
+static bool IsArmsx2MRTAlpha2Enabled()
+{
+	static const bool enabled = []() {
+		const char* value = std::getenv("ARMSX2_MRT_ALPHA2");
+		return value && value[0] == '1';
+	}();
+	return enabled;
+}
+
 static VkAttachmentLoadOp GetLoadOpForTexture(GSTextureVK* tex)
 {
 	if (!tex)
@@ -6754,6 +6763,11 @@ void GSDeviceVK::RenderHW(GSHWDrawConfig& config)
 		}
 
 		pipe.ps = config.alpha_second_pass.ps;
+		// The second alpha-test draw targets the same active MRT attachment and
+		// depth buffer. Preserve the backend-only selector bits which are not part
+		// of the high-level AlphaPass snapshot.
+		pipe.ps.mrt = pipe.mrt;
+		pipe.ps.mrt_index = pipe.mrt_index;
 		pipe.cms = config.alpha_second_pass.colormask;
 		pipe.dss = config.alpha_second_pass.depth;
 		pipe.bs = config.blend;
@@ -6857,13 +6871,14 @@ void GSDeviceVK::UpdateHWPipelineSelector(GSHWDrawConfig& config, PipelineSelect
 	GSTextureVK* const mrt_rt = static_cast<GSTextureVK*>(config.mrt_rt);
 	const bool supported_mrt_feedback = pipe.feedback_loop_flags == FeedbackLoopFlag_None ||
 		(IsArmsx2MRTSWBlendEnabled() && pipe.feedback_loop_flags == FeedbackLoopFlag_ReadAndWriteRT);
+	const bool supported_alpha_second = !config.alpha_second_pass.enable || IsArmsx2MRTAlpha2Enabled();
 	const bool use_mrt = mrt_rt && config.rt && config.ds && config.mrt_index < 2 &&
 		config.tex != config.mrt_rt && config.ps.no_color1 &&
 		!config.ps.HasColorROV() && !config.ps.HasDepthROV() &&
 		supported_mrt_feedback &&
 		config.destination_alpha == GSHWDrawConfig::DestinationAlphaMode::Off &&
 		config.colclip_mode == GSHWDrawConfig::ColClipMode::NoModify &&
-		!config.alpha_second_pass.enable && !config.blend_multi_pass.enable &&
+		supported_alpha_second && !config.blend_multi_pass.enable &&
 		static_cast<GSTextureVK*>(config.rt)->GetState() == GSTexture::State::Dirty &&
 		mrt_rt->GetState() == GSTexture::State::Dirty &&
 		static_cast<GSTextureVK*>(config.ds)->GetState() == GSTexture::State::Dirty;
