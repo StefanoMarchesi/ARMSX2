@@ -5274,6 +5274,10 @@ static void deleteAllVariants()
 
 static u8* CompileBlock(u32 startPC, u32 numPairs, VU1BlockEntry* out_block)
 {
+	{
+		extern std::atomic<unsigned> g_hitch_vu1_compiles;
+		g_hitch_vu1_compiles.fetch_add(1, std::memory_order_relaxed);
+	}
 	// VF cache: clear the compile-time tracker before any pair emit. The
 	// previous block compile leaked state into the tracker; without reset
 	// here, the first FMAC of the new block would emit `Mov scratch, vN`

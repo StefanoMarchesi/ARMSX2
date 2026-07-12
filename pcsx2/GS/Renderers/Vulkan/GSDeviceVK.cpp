@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+#include <atomic>
 #include "GS/GS.h"
 #include "GS/GSGL.h"
 #include "GS/GSPerfMon.h"
@@ -5228,6 +5229,10 @@ VkShaderModule GSDeviceVK::GetTFXFragmentShader(const GSHWDrawConfig::PSSelector
 
 VkPipeline GSDeviceVK::CreateTFXPipeline(const PipelineSelector& p)
 {
+	{
+		extern std::atomic<unsigned> g_hitch_pipelines;
+		g_hitch_pipelines.fetch_add(1, std::memory_order_relaxed);
+	}
 	static constexpr std::array<VkPrimitiveTopology, 3> topology_lookup = {{
 		VK_PRIMITIVE_TOPOLOGY_POINT_LIST, // Point
 		VK_PRIMITIVE_TOPOLOGY_LINE_LIST, // Line

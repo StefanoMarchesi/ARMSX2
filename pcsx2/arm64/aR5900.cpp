@@ -4,6 +4,7 @@
 // ARM64 EE Recompiler — Main file
 // Provides block compilation, dispatchers, and execution loop.
 
+#include <atomic>
 #include "Common.h"
 #include "CDVD/CDVD.h"
 #include "Elfheader.h"
@@ -1823,6 +1824,11 @@ u8* recEndThunk()
 
 static void recRecompile(const u32 startpc)
 {
+	{
+		extern std::atomic<unsigned> g_hitch_ee_compiles;
+		g_hitch_ee_compiles.fetch_add(1, std::memory_order_relaxed);
+	}
+
 	pxAssert(startpc);
 
 	// Check if we need to reset the code buffer
