@@ -692,8 +692,18 @@ layout(set = 1, binding = 1) uniform texture2D Palette;
 			vec4 sample_from_rt() { return subpassLoad(RtSampler); }
 			float sample_from_depth() { return subpassLoad(DepthSampler).r; }
 		#elif (PS_FEEDBACK_LOOP_IS_NEEDED_RT && !PS_ROV_COLOR)
-			layout(input_attachment_index = 0, set = 1, binding = 2) uniform subpassInput RtSampler;
-			vec4 sample_from_rt() { return subpassLoad(RtSampler); }
+			#if PS_MRT
+				layout(input_attachment_index = 0, set = 1, binding = 2) uniform subpassInput RtSampler0;
+				layout(input_attachment_index = 1, set = 1, binding = 7) uniform subpassInput RtSampler1;
+				#if PS_MRT_INDEX == 0
+					vec4 sample_from_rt() { return subpassLoad(RtSampler0); }
+				#else
+					vec4 sample_from_rt() { return subpassLoad(RtSampler1); }
+				#endif
+			#else
+				layout(input_attachment_index = 0, set = 1, binding = 2) uniform subpassInput RtSampler;
+				vec4 sample_from_rt() { return subpassLoad(RtSampler); }
+			#endif
 		#elif (PS_FEEDBACK_LOOP_IS_NEEDED_DEPTH && !PS_ROV_DEPTH)
 			layout(input_attachment_index = 0, set = 1, binding = 4) uniform subpassInput DepthSampler;
 			float sample_from_depth() { return subpassLoad(DepthSampler).r; }
