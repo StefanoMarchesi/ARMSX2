@@ -2700,11 +2700,29 @@ REC_VU1_LOWER_INTERP(XGKICK)
 // the full rationale.
 void recVU1_XGKICK()
 {
-	armAsm->Mov(x0, VU1_BASE_REG);
 	if (CHECK_XGKICKHACK)
+	{
+		armAsm->Mov(x0, VU1_BASE_REG);
 		emitVu1Call(reinterpret_cast<const void*>(vu1_XGKICK_hack_capture));
-	else
-		emitVu1Call(reinterpret_cast<const void*>(vu1_XGKICK));
+		return;
+	}
+	// XGKICK-preserve fast path (ARMSX2_VU1_XGKICK_PRESERVE=1): the capture
+	// helper only computes s_vu1_pending_xgkick_addr = (VI[Is] & 0x3ff) * 16.
+	// Inline those ~4 instructions so the BL — and emitVu1Call's full
+	// VF/VI/broadcast tracker wipe plus the refill storm on every following
+	// pair — disappears entirely. Gated off under IbitHack, where the helper
+	// must decode Is from VU->code live at runtime (same gating as recVU1_LQ).
+	if (g_vu1_xgkick_preserve && !EmuConfig.Gamefixes.IbitHack)
+	{
+		const u32 is = W_Is(&VU1);
+		viCacheLoadInto(is, w4); // w4 = VI[Is] (Mov w4, wzr for vi0)
+		armAsm->Ubfiz(w4, w4, 4, 10); // (w4 & 0x3ff) << 4
+		armMoveAddressToReg(x5, &s_vu1_pending_xgkick_addr);
+		armAsm->Str(w4, MemOperand(x5));
+		return;
+	}
+	armAsm->Mov(x0, VU1_BASE_REG);
+	emitVu1Call(reinterpret_cast<const void*>(vu1_XGKICK));
 }
 #endif
 

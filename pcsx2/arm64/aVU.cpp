@@ -11,6 +11,8 @@
 // VF/VI hazard pairs fall back to vu1Exec for correctness.
 
 #include "Common.h"
+
+#include <cstdlib>
 #include "DebugTools/Debug.h"
 #include "GS.h"
 #include "Gif_Unit.h"
@@ -4110,6 +4112,50 @@ void emitVu1Call(const void* fn)
 	armEmitCall(fn);
 }
 
+// XGKICK-preserve (ARMSX2_VU1_XGKICK_PRESERVE=1, default OFF): keep every JIT
+// cache tracker ALIVE across the XGKICK helper calls instead of paying
+// emitVu1Call's full VF/VI/broadcast wipe + the refill storm (up to 8 Ldr q +
+// 7 Ldrh + broadcast reload) on the pairs that follow every kick. SotC-class
+// transform+kick kernels pay that wipe per kick.
+static const bool g_vu1_xgkick_preserve = []() {
+	const char* v = std::getenv("ARMSX2_VU1_XGKICK_PRESERVE");
+	return v && v[0] == '1';
+}();
+
+// BL to a C helper while keeping every JIT cache tracker alive. Instead of
+// invalidating, physically spill the JIT's live caller-saved state around the
+// call: q1 (broadcast cache), q16 (ACC), q17-q24 (VF cache slots), x9-x15
+// (VI cache pool). Unlike emitVu1CallNeonFree this makes NO assumption about
+// the callee's codegen (see the 2026-05-17 NEON-free revert note elsewhere in this file):
+// the full set the JIT cares about is preserved by construction — including
+// ACC/v16, which the plain emitVu1Call fire sites never protected (latent
+// hazard, sound only while compilers allocate NEON scratch from v0-v7).
+// ONLY correct for helpers that neither read nor write VF/VI via VURegs
+// memory: vu1_XGKICK_fire_deferred qualifies (it reads
+// s_vu1_pending_xgkick_addr + VU1.Mem + gifUnit state only).
+void emitVu1CallPreserveCaches(const void* fn)
+{
+	armAsm->Stp(q1, q16, MemOperand(sp, -224, PreIndex));
+	armAsm->Stp(q17, q18, MemOperand(sp, 32));
+	armAsm->Stp(q19, q20, MemOperand(sp, 64));
+	armAsm->Stp(q21, q22, MemOperand(sp, 96));
+	armAsm->Stp(q23, q24, MemOperand(sp, 128));
+	armAsm->Stp(x9, x10, MemOperand(sp, 160));
+	armAsm->Stp(x11, x12, MemOperand(sp, 176));
+	armAsm->Stp(x13, x14, MemOperand(sp, 192));
+	armAsm->Str(x15, MemOperand(sp, 208));
+	armEmitCall(fn);
+	armAsm->Ldr(x15, MemOperand(sp, 208));
+	armAsm->Ldp(x13, x14, MemOperand(sp, 192));
+	armAsm->Ldp(x11, x12, MemOperand(sp, 176));
+	armAsm->Ldp(x9, x10, MemOperand(sp, 160));
+	armAsm->Ldp(q23, q24, MemOperand(sp, 128));
+	armAsm->Ldp(q21, q22, MemOperand(sp, 96));
+	armAsm->Ldp(q19, q20, MemOperand(sp, 64));
+	armAsm->Ldp(q17, q18, MemOperand(sp, 32));
+	armAsm->Ldp(q1, q16, MemOperand(sp, 224, PostIndex));
+}
+
 // Specialized BL for helpers that are provably NEON-free leaf functions —
 // i.e., the compiler emitted only x/w GPR instructions, no v/q/d/s ops,
 // no nested BL, no callee-saved spills. For these the BL preserves:
@@ -7378,7 +7424,10 @@ static u8* CompileBlock(u32 startPC, u32 numPairs, VU1BlockEntry* out_block)
 			if (!xgkickhack && pending_xgkick_fire && ir_op.isKick)
 			{
 				armAsm->Mov(x0, VU1_BASE_REG);
-				emitVu1Call(reinterpret_cast<const void*>(vu1_XGKICK_fire_deferred));
+				if (g_vu1_xgkick_preserve)
+					emitVu1CallPreserveCaches(reinterpret_cast<const void*>(vu1_XGKICK_fire_deferred));
+				else
+					emitVu1Call(reinterpret_cast<const void*>(vu1_XGKICK_fire_deferred));
 				pending_xgkick_fire = false;
 			}
 			// Execute lower instruction (stalls already tested above).
@@ -7628,7 +7677,10 @@ static u8* CompileBlock(u32 startPC, u32 numPairs, VU1BlockEntry* out_block)
 			if (pending_xgkick_fire)
 			{
 				armAsm->Mov(x0, VU1_BASE_REG);
-				emitVu1Call(reinterpret_cast<const void*>(vu1_XGKICK_fire_deferred));
+				if (g_vu1_xgkick_preserve)
+					emitVu1CallPreserveCaches(reinterpret_cast<const void*>(vu1_XGKICK_fire_deferred));
+				else
+					emitVu1Call(reinterpret_cast<const void*>(vu1_XGKICK_fire_deferred));
 				pending_xgkick_fire = false;
 			}
 			// Re-arm for the next pair if this one captured an XGKICK.
@@ -7790,7 +7842,10 @@ static u8* CompileBlock(u32 startPC, u32 numPairs, VU1BlockEntry* out_block)
 	if (!xgkickhack && pending_xgkick_fire)
 	{
 		armAsm->Mov(x0, VU1_BASE_REG);
-		emitVu1Call(reinterpret_cast<const void*>(vu1_XGKICK_fire_deferred));
+		if (g_vu1_xgkick_preserve)
+			emitVu1CallPreserveCaches(reinterpret_cast<const void*>(vu1_XGKICK_fire_deferred));
+		else
+			emitVu1Call(reinterpret_cast<const void*>(vu1_XGKICK_fire_deferred));
 	}
 
 	// Step 6b block-end clamp. Elision of per-pair VIBackupCycles decrement
