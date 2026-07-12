@@ -7494,6 +7494,36 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptio
 		                       !GSDevice::IsDualSourceBlendFactor(m_conf.blend.dst_factor);
 	}
 
+	// Experimental first stage for widening the DRIV3R MRT path. Convert only
+	// draws which ended up requiring a secondary color output to the existing
+	// framebuffer-fetch software blend path. This validates the blend semantics
+	// independently before MRT render passes gain feedback-loop attachments.
+	// RGB_ONLY_DSB has separate alpha-test semantics and is deliberately excluded.
+	static const bool s_armsx2_mrt_swblend = []() {
+		const char* value = std::getenv("ARMSX2_MRT_SWBLEND");
+		return value && value[0] == '1';
+	}();
+	if (s_armsx2_mrt_swblend && m_conf.mrt_rt && features.framebuffer_fetch && !m_conf.ps.no_color1 &&
+		m_conf.ps.afail != PS_AFAIL::RGB_ONLY_DSB)
+	{
+		sw_blending = true;
+		m_conf.ps.blend_a = m_optimized_blend.A;
+		m_conf.ps.blend_b = m_optimized_blend.B;
+		m_conf.ps.blend_c = m_optimized_blend.C;
+		m_conf.ps.blend_d = m_optimized_blend.D;
+		if (m_conf.ps.blend_c == ALPHA_C_FIX)
+			m_conf.cb_ps.TA_MaxDepth_Af.a = m_optimized_blend.FIX / 128.0f;
+
+		m_conf.blend = {};
+		m_conf.blend_multi_pass = {};
+		m_conf.ps.blend_hw = false;
+		m_conf.ps.blend_mix = false;
+		m_conf.ps.no_color1 = true;
+		m_conf.ps.round_inv = false;
+		m_conf.ps.a_masked = false;
+		m_conf.ps.dither_adjust = false;
+	}
+
 	// Notify the shader that it needs to invert rounding
 	if (m_conf.blend.op == GSDevice::OP_REV_SUBTRACT)
 		m_conf.ps.round_inv = 1;
