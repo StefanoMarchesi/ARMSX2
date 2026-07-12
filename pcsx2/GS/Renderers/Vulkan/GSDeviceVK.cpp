@@ -6809,6 +6809,54 @@ void GSDeviceVK::UpdateHWPipelineSelector(GSHWDrawConfig& config, PipelineSelect
 		static_cast<GSTextureVK*>(config.rt)->GetState() == GSTexture::State::Dirty &&
 		mrt_rt->GetState() == GSTexture::State::Dirty &&
 		static_cast<GSTextureVK*>(config.ds)->GetState() == GSTexture::State::Dirty;
+	if (static const bool s_diag = (std::getenv("ARMSX2_MRT_DIAG") != nullptr);
+		s_diag && mrt_rt && config.rt && config.ds && config.mrt_index < 2)
+	{
+		struct GateCounters
+		{
+			u64 total = 0;
+			u64 eligible = 0;
+			u64 tex_other = 0;
+			u64 dual_source = 0;
+			u64 color_rov = 0;
+			u64 depth_rov = 0;
+			u64 feedback = 0;
+			u64 date = 0;
+			u64 colclip = 0;
+			u64 alpha_second = 0;
+			u64 blend_multi = 0;
+			u64 rt_state = 0;
+			u64 other_state = 0;
+			u64 ds_state = 0;
+		};
+		static GateCounters s_gate;
+		s_gate.total++;
+		s_gate.eligible += use_mrt;
+		s_gate.tex_other += (config.tex == config.mrt_rt);
+		s_gate.dual_source += !config.ps.no_color1;
+		s_gate.color_rov += config.ps.HasColorROV();
+		s_gate.depth_rov += config.ps.HasDepthROV();
+		s_gate.feedback += (pipe.feedback_loop_flags != FeedbackLoopFlag_None);
+		s_gate.date += (config.destination_alpha != GSHWDrawConfig::DestinationAlphaMode::Off);
+		s_gate.colclip += (config.colclip_mode != GSHWDrawConfig::ColClipMode::NoModify);
+		s_gate.alpha_second += config.alpha_second_pass.enable;
+		s_gate.blend_multi += config.blend_multi_pass.enable;
+		s_gate.rt_state += (static_cast<GSTextureVK*>(config.rt)->GetState() != GSTexture::State::Dirty);
+		s_gate.other_state += (mrt_rt->GetState() != GSTexture::State::Dirty);
+		s_gate.ds_state += (static_cast<GSTextureVK*>(config.ds)->GetState() != GSTexture::State::Dirty);
+		if ((s_gate.total % 4096) == 0)
+		{
+			Console.WriteLn("MRTGATE total=%llu eligible=%llu tex_other=%llu dual=%llu crov=%llu drov=%llu "
+				"feedback=%llu date=%llu colclip=%llu alpha2=%llu blendmulti=%llu rtstate=%llu otherstate=%llu dsstate=%llu",
+				static_cast<unsigned long long>(s_gate.total), static_cast<unsigned long long>(s_gate.eligible),
+				static_cast<unsigned long long>(s_gate.tex_other), static_cast<unsigned long long>(s_gate.dual_source),
+				static_cast<unsigned long long>(s_gate.color_rov), static_cast<unsigned long long>(s_gate.depth_rov),
+				static_cast<unsigned long long>(s_gate.feedback), static_cast<unsigned long long>(s_gate.date),
+				static_cast<unsigned long long>(s_gate.colclip), static_cast<unsigned long long>(s_gate.alpha_second),
+				static_cast<unsigned long long>(s_gate.blend_multi), static_cast<unsigned long long>(s_gate.rt_state),
+				static_cast<unsigned long long>(s_gate.other_state), static_cast<unsigned long long>(s_gate.ds_state));
+		}
+	}
 	pipe.mrt = use_mrt;
 	pipe.mrt_index = use_mrt ? config.mrt_index : 0;
 	pipe.ps.mrt = use_mrt;
