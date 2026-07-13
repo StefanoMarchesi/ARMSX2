@@ -1232,7 +1232,7 @@ struct alignas(16) GSHWDrawConfig
 	GSTexture* rt;        ///< Render target
 	GSTexture* ds;        ///< Depth stencil
 	GSTexture* mrt_rt;    ///< Optional second render target kept in the same Vulkan render pass.
-	u8 mrt_index;         ///< Active MRT attachment (0 = rt at FBP 0x1c00, 1 = rt at FBP 0x2400).
+	u8 mrt_index;         ///< Active attachment within the optional MRT pair.
 	GSTexture* tex;       ///< Source texture
 	GSTexture* pal;       ///< Palette texture
 	const GSVertex* verts;///< Vertices to draw

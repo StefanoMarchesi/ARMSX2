@@ -338,6 +338,22 @@ private:
 
 	GIFRegALPHA m_optimized_blend = {}; // Save for ROV setup
 
+	struct MRTAutoPattern
+	{
+		u32 fbp[2] = {};
+		u32 fbw = 0;
+		u32 fpsm = 0;
+		u32 zbp = 0;
+		u32 zpsm = 0;
+		s32 width = 0;
+		s32 height = 0;
+		u32 alternations = 0;
+		u8 target_count = 0;
+		u8 last_index = 0;
+		bool active = false;
+	};
+	MRTAutoPattern m_mrt_auto_pattern;
+
 	GSHWDrawConfig m_conf = {};
 	HWCachedCtx m_cached_ctx;
 
