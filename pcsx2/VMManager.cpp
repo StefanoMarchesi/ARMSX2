@@ -62,6 +62,7 @@
 #include "fmt/format.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <mutex>
 #include <sstream>
 #include <common/RedtapeWilCom.h>
@@ -1676,6 +1677,22 @@ VMBootResult VMManager::Initialize(const VMBootParameters& boot_params, Error* e
 	{
 		if (!DoLoadState(state_to_load.c_str(), error))
 		{
+			Shutdown(false);
+			return VMBootResult::StartupFailure;
+		}
+	}
+
+	// Headless benchmark hook: replay PCSX2's native frame-locked input
+	// recording when explicitly requested. InputRecording::play() loads the
+	// recording's companion save state, so benchmark input is tied to emulated
+	// frames instead of host wall-clock timing. Unset by default.
+	if (const char* recording_path = std::getenv("ARMSX2_INPUT_RECORDING");
+		recording_path && recording_path[0] != '\0')
+	{
+		Console.WriteLn("ARMSX2: replaying input recording '%s'", recording_path);
+		if (!g_InputRecording.play(recording_path))
+		{
+			Error::SetStringFmt(error, "Failed to replay input recording '{}'.", recording_path);
 			Shutdown(false);
 			return VMBootResult::StartupFailure;
 		}

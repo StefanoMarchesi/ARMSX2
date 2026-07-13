@@ -158,6 +158,17 @@ void PerformanceMetrics::Update(bool gs_register_write, bool fb_blit, bool is_sk
 	s_gs_framebuffer_blits_since_last_update += static_cast<u32>(fb_blit);
 	s_frame_number++;
 
+	// Fine-grained frame gate for deterministic headless benchmarks. Unlike
+	// FRAMELOG, this is driven by frame count rather than the 500 ms metrics
+	// interval, so an external harness can time the exact same frame range.
+	// The environment value is the logging stride; unset/zero keeps it off.
+	static const u64 s_framegate_interval = []() {
+		const char* value = std::getenv("ARMSX2_FRAMEGATE");
+		return value ? std::strtoull(value, nullptr, 10) : 0ull;
+	}();
+	if (s_framegate_interval != 0 && (s_frame_number % s_framegate_interval) == 0)
+		Console.WriteLn("FRAMEGATE frame=%llu", static_cast<unsigned long long>(s_frame_number));
+
 	const Common::Timer::Value now_ticks = Common::Timer::GetCurrentValue();
 	const Common::Timer::Value ticks_diff = now_ticks - s_last_update_time.GetStartValue();
 	const float time = Common::Timer::ConvertValueToSeconds(ticks_diff);
