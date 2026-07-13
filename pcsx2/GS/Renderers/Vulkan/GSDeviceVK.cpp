@@ -5859,6 +5859,10 @@ bool GSDeviceVK::InRenderPass()
 
 void GSDeviceVK::BeginRenderPass(VkRenderPass rp, const GSVector4i& rect)
 {
+	{
+		extern std::atomic<unsigned> g_hitch_renderpasses;
+		g_hitch_renderpasses.fetch_add(1, std::memory_order_relaxed);
+	}
 	if (m_current_render_pass != VK_NULL_HANDLE)
 		EndRenderPass();
 

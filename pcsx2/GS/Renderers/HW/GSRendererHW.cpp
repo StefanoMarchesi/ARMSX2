@@ -1507,6 +1507,115 @@ void GSRendererHW::MergeSprite(GSTextureCache::Source* tex)
 			}
 		}
 	}
+
+	// ARMSX2: merge only mathematically equivalent adjacent sprites. Unlike the
+	// upscaling hack above, this path does not infer paving: endpoints, payload,
+	// and the fixed-point XY/UV slope must match exactly. It is opt-in while the
+	// broader sprite fast path is validated on real games.
+	static const u32 s_armsx2_sprite_fastpath = []() {
+		const char* value = std::getenv("ARMSX2_SPRITE_FASTPATH");
+		return value ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0u;
+	}();
+	if (s_armsx2_sprite_fastpath < 1 || m_vt.m_primclass != GS_SPRITE_CLASS ||
+		m_vertex->next < 4 || (PRIM->TME && !PRIM->FST))
+	{
+		return;
+	}
+
+	auto same_payload = [](const GSVertex& lhs, const GSVertex& rhs) {
+		GSVertex l = lhs;
+		GSVertex r = rhs;
+		l.XYZ.X = l.XYZ.Y = l.UV = 0;
+		r.XYZ.X = r.XYZ.Y = r.UV = 0;
+		return std::memcmp(&l, &r, sizeof(GSVertex)) == 0;
+	};
+
+	auto same_slope = [](s32 dp0, s32 dt0, s32 dp1, s32 dt1) {
+		return dp0 > 0 && dp1 > 0 &&
+			(static_cast<s64>(dp0) * static_cast<s64>(dt1) == static_cast<s64>(dp1) * static_cast<s64>(dt0));
+	};
+
+	auto can_merge = [&](const GSVertex& a0, const GSVertex& a1, const GSVertex& b0, const GSVertex& b1, bool horizontal) {
+		if (!same_payload(a0, a1) || !same_payload(a0, b0) || !same_payload(a0, b1))
+			return false;
+
+		if (horizontal)
+		{
+			if (a1.XYZ.X != b0.XYZ.X || a0.XYZ.Y != b0.XYZ.Y || a1.XYZ.Y != b1.XYZ.Y)
+				return false;
+			if (PRIM->TME && (a1.U != b0.U || a0.V != b0.V || a1.V != b1.V))
+				return false;
+			return !PRIM->TME || same_slope(a1.XYZ.X - a0.XYZ.X, a1.U - a0.U,
+				b1.XYZ.X - b0.XYZ.X, b1.U - b0.U);
+		}
+
+		if (a1.XYZ.Y != b0.XYZ.Y || a0.XYZ.X != b0.XYZ.X || a1.XYZ.X != b1.XYZ.X)
+			return false;
+		if (PRIM->TME && (a1.V != b0.V || a0.U != b0.U || a1.U != b1.U))
+			return false;
+		return !PRIM->TME || same_slope(a1.XYZ.Y - a0.XYZ.Y, a1.V - a0.V,
+			b1.XYZ.Y - b0.XYZ.Y, b1.V - b0.V);
+	};
+
+	GSVertex* const vertices = &m_vertex->buff[0];
+	u32 count = m_vertex->next;
+	u32 merged = 0;
+	bool changed;
+	do
+	{
+		changed = false;
+		u32 out = 0;
+		for (u32 in = 0; in < count; in += 2)
+		{
+			if (out >= 2)
+			{
+				GSVertex& a0 = vertices[out - 2];
+				GSVertex& a1 = vertices[out - 1];
+				const GSVertex& b0 = vertices[in];
+				const GSVertex& b1 = vertices[in + 1];
+				const bool horizontal = can_merge(a0, a1, b0, b1, true);
+				const bool vertical = !horizontal && can_merge(a0, a1, b0, b1, false);
+				if (horizontal || vertical)
+				{
+					if (horizontal)
+					{
+						a1.XYZ.X = b1.XYZ.X;
+						a1.U = b1.U;
+					}
+					else
+					{
+						a1.XYZ.Y = b1.XYZ.Y;
+						a1.V = b1.V;
+					}
+					merged++;
+					changed = true;
+					continue;
+				}
+			}
+
+			if (out != in)
+			{
+				vertices[out] = vertices[in];
+				vertices[out + 1] = vertices[in + 1];
+			}
+			out += 2;
+		}
+		count = out;
+	} while (changed && count >= 4);
+
+	if (merged != 0)
+	{
+		m_vertex->head = m_vertex->tail = m_vertex->next = count;
+		m_index->tail = count;
+		for (u32 i = 0; i < count; i++)
+			m_index->buff[i] = static_cast<u16>(i);
+
+		static const bool s_diag = (std::getenv("ARMSX2_SPRITE_FASTPATH_DIAG") != nullptr);
+		static u64 s_merged_total = 0;
+		s_merged_total += merged;
+		if (s_diag && ((s_merged_total & 0xfff) < merged))
+			Console.WriteLn("SPRFAST stage=1 merged=%llu", static_cast<unsigned long long>(s_merged_total));
+	}
 }
 
 float GSRendererHW::GetTextureScaleFactor()
