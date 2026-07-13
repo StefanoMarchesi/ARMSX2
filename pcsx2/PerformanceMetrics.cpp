@@ -24,6 +24,7 @@ std::atomic<unsigned long long> g_hitch_tex_bytes{0};
 std::atomic<unsigned> g_hitch_vu1_compiles{0};
 std::atomic<unsigned> g_hitch_ee_compiles{0};
 std::atomic<unsigned> g_hitch_readbacks{0};
+std::atomic<unsigned> g_hitch_renderpasses{0};
 
 static const float UPDATE_INTERVAL = 0.5f;
 
@@ -184,13 +185,14 @@ void PerformanceMetrics::Update(bool gs_register_write, bool fb_blit, bool is_sk
 	static const bool s_hitchlog = (std::getenv("ARMSX2_HITCHLOG") != nullptr);
 	if (s_hitchlog)
 	{
-		Console.WriteLn("HITCHLOG frame=%llu pipe=%u texKB=%llu vu1c=%u eec=%u rb=%u",
+		Console.WriteLn("HITCHLOG frame=%llu pipe=%u texKB=%llu vu1c=%u eec=%u rb=%u rp=%u",
 			static_cast<unsigned long long>(s_frame_number),
 			g_hitch_pipelines.exchange(0, std::memory_order_relaxed),
 			g_hitch_tex_bytes.exchange(0, std::memory_order_relaxed) / 1024ull,
 			g_hitch_vu1_compiles.exchange(0, std::memory_order_relaxed),
 			g_hitch_ee_compiles.exchange(0, std::memory_order_relaxed),
-			g_hitch_readbacks.exchange(0, std::memory_order_relaxed));
+			g_hitch_readbacks.exchange(0, std::memory_order_relaxed),
+			g_hitch_renderpasses.exchange(0, std::memory_order_relaxed));
 	}
 	s_average_gpu_time = s_accumulated_gpu_time / static_cast<float>(s_unskipped_frames_since_last_update);
 	s_average_gpu_vs_invocations = static_cast<double>(s_accumulated_gpu_vs_invocations) / static_cast<double>(s_unskipped_frames_since_last_update);
