@@ -456,6 +456,13 @@ namespace R5900 { namespace Dynarec { namespace OpcodeImpl {
 // the least-recently-used slot.
 static u32 g_armGprUseClock;
 
+// Pool slots returned by armGprAlloc/armGprAllocTmp during the instruction
+// currently being emitted. They must not be selected as eviction victims:
+// emitters keep the returned XRegister objects and can allocate another
+// operand before finally emitting the host instruction. Reusing one of those
+// host codes would silently alias two guest operands.
+static u16 g_armGprCachePoolPinned;
+
 // MIPS GPRs we want to keep resident under pressure: r1 (at), r2/r3 (v0/v1),
 // r4-r7 (a0-a3), r24/r25 (t8/t9). These are the busiest regs in
 // compiler-generated code; without a bias the linear-low-first eviction
@@ -466,10 +473,10 @@ static constexpr u32 kArmGprHighPrioMask = (0xFEu) | (1u << 24) | (1u << 25);
 static constexpr u32 kArmGprHighPrioBonus = 1u << 24;
 
 // Returns true if the cached value of MIPS GPR `g` is dead at g_pCurInstInfo
-// (the LIVE bit on the state coming INTO the current emit point is clear,
+// (the LIVE bit on the state after the current guest instruction is clear,
 // meaning the next event for this reg is either nothing or a write that
-// discards the cached value). Eviction can drop these slots without
-// flushing dirty contents — a free win.
+// discards the cached value). This is useful for victim priority, but cannot
+// by itself protect operands still needed by the in-flight emitter.
 //
 // Conservative when no analysis is available: returns false so the LRU
 // fallback path drives the choice. False if `g` is out of range.
@@ -507,9 +514,21 @@ static int armGprPoolIndex(u8 host_code)
 	return -1;
 }
 
+static void armGprPinPoolSlot(u8 host_code)
+{
+	const int idx = armGprPoolIndex(host_code);
+	pxAssertMsg(idx >= 0, "armGprPinPoolSlot: register is not in the cache pool");
+	g_armGprCachePoolPinned |= static_cast<u16>(1u << idx);
+}
+
 // Acquire a free pool slot, or evict a victim. Eviction policy:
 //
-//   1. Dead-reg first: if any cached slot's MIPS reg is provably dead at
+//   1. Never evict an operand allocated by the instruction currently being
+//      emitted. Liveness describes the state after the current instruction,
+//      so an operand can legitimately be marked dead while its XRegister is
+//      still needed by the emitter.
+//
+//   2. Dead-reg first: if any unpinned cached slot's MIPS reg is provably dead at
 //      the current emit point (backprop says LIVE-clear coming in — the
 //      next event is either a write that discards the value or block
 //      end), prefer that slot. Picking the dead reg avoids penalising a
@@ -521,20 +540,14 @@ static int armGprPoolIndex(u8 host_code)
 //      moment" note, so we mirror that caution. The win here is the
 //      eviction *choice*, not avoiding the spill.
 //
-//   2. Operand protection: skip slots whose last_use stamp falls within
-//      kProtectRecent ticks of g_armGprUseClock. Those were allocated as
-//      operands of the in-flight op, and reusing their host code for a
-//      different MIPS reg would alias the XRegister returned earlier in
-//      the same op.
-//
-//   3. LRU + priority among the remaining slots. Score = last_use +
+//   3. LRU + priority among the remaining unpinned slots. Score = last_use +
 //      kArmGprHighPrioBonus for hot ABI regs (kArmGprHighPrioMask). Lowest
 //      score loses.
 //
-//   4. If every slot is protected (would only happen if the in-flight op
-//      asks for more operands than the pool can hold), fall back to LRU
-//      ignoring the protection band — a correctness fault either way, but
-//      LRU at least picks the oldest slot.
+//   There is deliberately no fallback which evicts a pinned slot. If an
+//   emitter ever needs more simultaneous operands than the seven-register
+//   pool can hold, failing at compile time is safer than generating corrupt
+//   guest code.
 static u8 armGprAcquirePoolSlot()
 {
 	for (int i = 0; i < kArmGprCachePoolSize; i++)
@@ -547,7 +560,7 @@ static u8 armGprAcquirePoolSlot()
 		}
 	}
 
-	// 1. Dead-reg first. Pick the LRU dead slot.
+	// 1 + 2. Dead-reg first. Pick the LRU unpinned dead slot.
 	int victim = -1;
 	{
 		u32 oldest = UINT32_MAX;
@@ -555,7 +568,9 @@ static u8 armGprAcquirePoolSlot()
 		{
 			const ArmGprCacheSlot& slot = g_armGprCache[g];
 			if (slot.host_code == 0xff) continue;
-			if (armGprPoolIndex(slot.host_code) < 0) continue;
+			const int idx = armGprPoolIndex(slot.host_code);
+			if (idx < 0) continue;
+			if (g_armGprCachePoolPinned & static_cast<u16>(1u << idx)) continue;
 			if (!armGprIsDeadAt(g)) continue;
 			if (slot.last_use < oldest)
 			{
@@ -565,22 +580,17 @@ static u8 armGprAcquirePoolSlot()
 		}
 	}
 
-	// 2 + 3. LRU + priority among live slots not currently held as
-	// operands of the in-flight op. kProtectRecent of 4 covers the
-	// typical 1-3 reg reads + 1 reg write of an EE op with headroom.
+	// 3. LRU + priority among the remaining unpinned slots.
 	if (victim < 0)
 	{
-		constexpr u32 kProtectRecent = 4;
-		const u32 protect_floor = (g_armGprUseClock > kProtectRecent)
-			? (g_armGprUseClock - kProtectRecent) : 0;
-
 		u64 best_score = ~0ull;
 		for (int g = 1; g < 32; g++)
 		{
 			const ArmGprCacheSlot& slot = g_armGprCache[g];
 			if (slot.host_code == 0xff) continue;
-			if (armGprPoolIndex(slot.host_code) < 0) continue;
-			if (slot.last_use >= protect_floor) continue;
+			const int idx = armGprPoolIndex(slot.host_code);
+			if (idx < 0) continue;
+			if (g_armGprCachePoolPinned & static_cast<u16>(1u << idx)) continue;
 			const u64 bonus = (kArmGprHighPrioMask & (1u << g)) ? kArmGprHighPrioBonus : 0u;
 			const u64 score = static_cast<u64>(slot.last_use) + bonus;
 			if (score < best_score)
@@ -591,26 +601,9 @@ static u8 armGprAcquirePoolSlot()
 		}
 	}
 
-	// 4. Every slot is protected — fall back to plain LRU.
 	if (victim < 0)
 	{
-		u32 oldest = UINT32_MAX;
-		for (int g = 1; g < 32; g++)
-		{
-			const ArmGprCacheSlot& slot = g_armGprCache[g];
-			if (slot.host_code == 0xff) continue;
-			if (armGprPoolIndex(slot.host_code) < 0) continue;
-			if (slot.last_use < oldest)
-			{
-				oldest = slot.last_use;
-				victim = g;
-			}
-		}
-	}
-
-	if (victim < 0)
-	{
-		pxFailRel("armGprAcquirePoolSlot: no slots free and nothing to evict");
+		pxFailRel("armGprAcquirePoolSlot: all cache slots are pinned by the current instruction");
 		return 0xff;
 	}
 
@@ -638,6 +631,7 @@ void armGprCacheReset()
 		g_armGprCache[i].last_use = 0;
 	}
 	g_armGprCachePoolUsed = 0;
+	g_armGprCachePoolPinned = 0;
 	g_armGprUseClock = 0;
 }
 
@@ -654,6 +648,7 @@ a64::XRegister armGprAlloc(int gpr, bool for_write)
 
 	if (slot.host_code != 0xff)
 	{
+		armGprPinPoolSlot(slot.host_code);
 		slot.last_use = ++g_armGprUseClock;
 		// Coherence with the const tracker.  If GPR_SET_CONST(gpr) was called
 		// after this slot was populated (e.g. LUI/ALU-const-path setting a new
@@ -720,12 +715,14 @@ a64::XRegister armGprAlloc(int gpr, bool for_write)
 	slot.dirty = for_write;
 	slot.sxw = false;
 	slot.last_use = ++g_armGprUseClock;
+	armGprPinPoolSlot(host);
 	return reg;
 }
 
 a64::XRegister armGprAllocTmp()
 {
 	const u8 host = armGprAcquirePoolSlot();
+	armGprPinPoolSlot(host);
 	return a64::XRegister(host);
 }
 
@@ -733,7 +730,9 @@ void armGprReleaseTmp(const a64::Register& reg)
 {
 	const int idx = armGprPoolIndex(static_cast<u8>(reg.GetCode()));
 	pxAssertMsg(idx >= 0, "armGprReleaseTmp: register is not in the cache pool");
-	g_armGprCachePoolUsed &= ~static_cast<u16>(1u << idx);
+	const u16 bit = static_cast<u16>(1u << idx);
+	g_armGprCachePoolPinned &= ~bit;
+	g_armGprCachePoolUsed &= ~bit;
 }
 
 void armGprFlush(int gpr)
@@ -762,7 +761,11 @@ void armGprInvalidate(int gpr)
 	}
 	const int idx = armGprPoolIndex(slot.host_code);
 	if (idx >= 0)
-		g_armGprCachePoolUsed &= ~static_cast<u16>(1u << idx);
+	{
+		const u16 bit = static_cast<u16>(1u << idx);
+		g_armGprCachePoolPinned &= ~bit;
+		g_armGprCachePoolUsed &= ~bit;
+	}
 	slot.host_code = 0xff;
 	slot.dirty = false;
 	slot.sxw = false;
@@ -788,6 +791,7 @@ void armGprInvalidateAll()
 	// Pool should be empty now; reset explicitly in case any tmps leaked.
 	// (Phase C: tmp leaks are a bug — Phase D ops MUST release every tmp.)
 	g_armGprCachePoolUsed = 0;
+	g_armGprCachePoolPinned = 0;
 }
 
 // ============================================================================
@@ -1571,6 +1575,10 @@ void recompileNextInstruction(bool delayslot, bool swapped_delay_slot)
 	}
 
 	g_pCurInstInfo++;
+	// Begin a new emitter lifetime. armGprAlloc() pins every host register it
+	// returns until this instruction has finished emitting, so pool pressure
+	// can never alias two still-live operands.
+	g_armGprCachePoolPinned = 0;
 
 	// Branch-in-delay-slot guard (matches x86 iR5900.cpp:1743-1803 — FlatOut
 	// PR #1783). MIPS UB when a branch sits inside another branch's delay slot;
@@ -2788,4 +2796,3 @@ R5900cpu recCpu = {
 	recCancelInstruction,
 	recClear,
 };
-
