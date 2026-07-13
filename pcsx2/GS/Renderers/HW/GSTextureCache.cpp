@@ -29,6 +29,7 @@
 std::unique_ptr<GSTextureCache> g_texture_cache;
 
 static u8* s_unswizzle_buffer;
+static u8* s_pack16_buffer;   // destinazione della conversione a 16 bit
 
 /// List of candidates for purging when the hash cache gets too large.
 static std::vector<std::pair<GSTextureCache::HashCacheMap::iterator, s32>> s_hash_cache_purge_list;
@@ -54,6 +55,8 @@ GSTextureCache::GSTextureCache()
 	// Test: onimusha 3 PAL 60Hz
 	s_unswizzle_buffer = (u8*)_aligned_malloc(9 * 1024 * 1024, VECTOR_ALIGNMENT);
 	pxAssertRel(s_unswizzle_buffer, "Failed to allocate unswizzle buffer");
+	s_pack16_buffer = (u8*)_aligned_malloc(5 * 1024 * 1024, VECTOR_ALIGNMENT);
+	pxAssertRel(s_pack16_buffer, "Failed to allocate 16-bit pack buffer");
 
 	m_surface_offset_cache.reserve(S_SURFACE_OFFSET_CACHE_MAX_SIZE);
 }
@@ -6019,6 +6022,46 @@ void GSTextureCache::IncAge()
 }
 
 //Fixme: Several issues in here. Not handling depth stencil, pitch conversion doesnt work.
+
+// ARMSX2_TEX16: 0 = off, 1 = RGB5A1, 2 = RGBA4. Vedi il commento in GSTexture.h.
+int Armsx2Tex16Mode()
+{
+	static const int mode = []() {
+		const char* v = std::getenv("ARMSX2_TEX16");
+		return v ? std::atoi(v) : 0;
+	}();
+	return mode;
+}
+
+// Converte il buffer RGBA8 appena prodotto dall'espansione della CLUT nel formato a 16 bit.
+// Sorgente e destinazione possono avere pitch diversi; la conversione e' per riga.
+static void Armsx2PackTo16(const u8* src, u32 src_pitch, u8* dst, u32 dst_pitch, int w, int h, int mode)
+{
+	for (int y = 0; y < h; y++)
+	{
+		const u8* sp = src + static_cast<size_t>(y) * src_pitch;
+		u16* dp = reinterpret_cast<u16*>(dst + static_cast<size_t>(y) * dst_pitch);
+		if (mode == 2)
+		{
+			// RGBA4: 4 bit per canale -- conserva le sfumature di alpha.
+			for (int x = 0; x < w; x++, sp += 4)
+			{
+				dp[x] = static_cast<u16>(((sp[0] >> 4) << 12) | ((sp[1] >> 4) << 8) |
+										 ((sp[2] >> 4) << 4) | (sp[3] >> 4));
+			}
+		}
+		else
+		{
+			// A1R5G5B5: 5 bit di colore, alpha on/off (soglia a meta scala).
+			for (int x = 0; x < w; x++, sp += 4)
+			{
+				dp[x] = static_cast<u16>(((sp[3] >= 128) ? 0x8000u : 0u) | ((sp[0] >> 3) << 10) |
+										 ((sp[1] >> 3) << 5) | (sp[2] >> 3));
+			}
+		}
+	}
+}
+
 GSTextureCache::Source* GSTextureCache::CreateSource(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, const GIFRegCLAMP& CLAMP, Target* dst, int x_offset, int y_offset, const GSVector2i* lod, const GSVector4i* src_range, GSTexture* gpu_clut, SourceRegion region, bool force_temp)
 {
 	const GSLocalMemory::psm_t& psm = GSLocalMemory::m_psm[TEX0.PSM];
@@ -6070,7 +6113,7 @@ GSTextureCache::Source* GSTextureCache::CreateSource(const GIFRegTEX0& TEX0, con
 			GSTexture* sTex = dst->m_texture;
 			GSTexture* dTex = outside_target ?
 				g_gs_device->CreateRenderTarget(w, h, GSTexture::Format::Color, true, PreferReusedLabelledTexture()) :
-				g_gs_device->CreateTexture(w, h, tlevels, GSTexture::Format::Color, PreferReusedLabelledTexture());
+				g_gs_device->CreateTexture(w, h, tlevels, Armsx2Tex16Mode() ? GSTexture::Format::Color16 : GSTexture::Format::Color, PreferReusedLabelledTexture());
 			if (!dTex) [[unlikely]]
 			{
 				Console.Error("Failed to allocate %dx%d texture for offset source", w, h);
@@ -6594,7 +6637,7 @@ GSTextureCache::Source* GSTextureCache::CreateSource(const GIFRegTEX0& TEX0, con
 		}
 		else
 		{
-			src->m_texture = g_gs_device->CreateTexture(tw, th, tlevels, GSTexture::Format::Color);
+			src->m_texture = g_gs_device->CreateTexture(tw, th, tlevels, Armsx2Tex16Mode() ? GSTexture::Format::Color16 : GSTexture::Format::Color);
 			if (!src->m_texture) [[unlikely]]
 			{
 				Console.Error("Failed to allocate %dx%d source texture", tw, th);
@@ -7053,7 +7096,10 @@ GSTextureCache::HashCacheEntry* GSTextureCache::LookupHashCache(const GIFRegTEX0
 	const int tw = region.HasX() ? region.GetWidth() : (1 << TEX0.TW);
 	const int th = region.HasY() ? region.GetHeight() : (1 << TEX0.TH);
 	const int tlevels = lod ? (GSConfig.HWMipmap ? std::min(lod->y - lod->x + 1, GSDevice::GetMipmapLevelsForSize(tw, th)) : -1) : 1;
-	GSTexture* tex = g_gs_device->CreateTexture(tw, th, tlevels, paltex ? GSTexture::Format::UNorm8 : GSTexture::Format::Color);
+	// Con ARMSX2_TEX16 la texture nasce a 16 bit: meta' dei byte che la GPU deve leggere.
+	const GSTexture::Format src_format = paltex ? GSTexture::Format::UNorm8 :
+		(Armsx2Tex16Mode() ? GSTexture::Format::Color16 : GSTexture::Format::Color);
+	GSTexture* tex = g_gs_device->CreateTexture(tw, th, tlevels, src_format);
 	if (!tex)
 	{
 		// out of video memory if we hit here
@@ -9045,8 +9091,12 @@ void GSTextureCache::PreloadTexture(const GIFRegTEX0& TEX0, const GIFRegTEXA& TE
 
 	// If we can stream it directly to GPU memory, do so, otherwise go through a temp buffer.
 	const GSVector4i unoffset_rect(0, 0, tw, th);
+	// Il percorso "scrivi direttamente nella texture" presuppone che il formato in GPU sia
+	// lo stesso prodotto dall'espansione (RGBA8): con Color16 va saltato, i pixel vanno
+	// convertiti prima.
+	const bool pack16 = (tex->GetFormat() == GSTexture::Format::Color16);
 	GSTexture::GSMap map;
-	if (rect.eq(block_rect) && !alpha_minmax && tex->Map(map, &unoffset_rect, level))
+	if (!pack16 && rect.eq(block_rect) && !alpha_minmax && tex->Map(map, &unoffset_rect, level))
 	{
 		rtx(mem, off, block_rect, map.bits, map.pitch, TEXA);
 		tex->Unmap();
@@ -9068,7 +9118,18 @@ void GSTextureCache::PreloadTexture(const GIFRegTEX0& TEX0, const GIFRegTEXA& TE
 		if (alpha_minmax)
 			*alpha_minmax = GSGetRGBA8AlphaMinMax(ptr, unoffset_rect.width(), unoffset_rect.height(), pitch);
 
-		tex->Update(unoffset_rect, ptr, pitch, level);
+		if (pack16)
+		{
+			const int w = unoffset_rect.width();
+			const int h = unoffset_rect.height();
+			const u32 dst_pitch = VectorAlign(static_cast<u32>(w) * sizeof(u16));
+			Armsx2PackTo16(ptr, pitch, s_pack16_buffer, dst_pitch, w, h, Armsx2Tex16Mode());
+			tex->Update(unoffset_rect, s_pack16_buffer, dst_pitch, level);
+		}
+		else
+		{
+			tex->Update(unoffset_rect, ptr, pitch, level);
+		}
 	}
 }
 

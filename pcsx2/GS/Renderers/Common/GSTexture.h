@@ -43,7 +43,9 @@ public:
 		BC2,          ///< BC2, aka DXT2/3 compressed texture for replacements
 		BC3,          ///< BC3, aka DXT4/5 compressed texture for replacements
 		BC7,          ///< BC7, aka BPTC compressed texture for replacements
-		Last = BC7,
+		Color16,      ///< 16-bit colour (RGB5A1 or RGBA4). Halves the bytes the texture unit must
+		              ///< pull from RAM, which is what the Pi's GPU actually waits on.
+		Last = Color16,
 	};
 
 	enum class State : u8

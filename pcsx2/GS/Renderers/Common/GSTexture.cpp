@@ -82,6 +82,7 @@ const char* GSTexture::GetFormatName(Format format)
 		case Format::BC2:          return "BC2";
 		case Format::BC3:          return "BC3";
 		case Format::BC7:          return "BC7";
+		case Format::Color16:      return "Color16";
 	}
 }
 
@@ -112,6 +113,7 @@ u32 GSTexture::GetCompressedBytesPerBlock(Format format)
 			pxFailRel("Invalid texture format");
 		case Format::Invalid:      return 1;  // Invalid
 		case Format::Color:        return 4;  // Color/RGBA8
+		case Format::Color16:      return 2;  // Color16 -- meta dei byte da leggere
 		case Format::ColorHQ:      return 4;  // ColorHQ/RGB10A2
 		case Format::ColorHDR:     return 8;  // ColorHDR/RGBA16F
 		case Format::ColorClip:    return 8;  // ColorClip/RGBA16

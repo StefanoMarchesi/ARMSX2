@@ -3007,6 +3007,16 @@ void GSDeviceVK::Draw(const GSHWDrawConfig& config)
 
 VkFormat GSDeviceVK::LookupNativeFormat(GSTexture::Format format) const
 {
+	// Il formato a 16 bit e' scelto dall'utente: RGB5A1 privilegia il colore, RGBA4 l'alpha.
+	if (format == GSTexture::Format::Color16)
+	{
+		static const int mode = []() {
+			const char* v = std::getenv("ARMSX2_TEX16");
+			return v ? std::atoi(v) : 0;
+		}();
+		return (mode == 2) ? VK_FORMAT_R4G4B4A4_UNORM_PACK16 : VK_FORMAT_A1R5G5B5_UNORM_PACK16;
+	}
+
 	static constexpr std::array<VkFormat, static_cast<int>(GSTexture::Format::Last) + 1> s_format_mapping = {{
 		VK_FORMAT_UNDEFINED, // Invalid
 		VK_FORMAT_R8G8B8A8_UNORM, // Color
@@ -3023,6 +3033,7 @@ VkFormat GSDeviceVK::LookupNativeFormat(GSTexture::Format format) const
 		VK_FORMAT_BC2_UNORM_BLOCK, // BC2
 		VK_FORMAT_BC3_UNORM_BLOCK, // BC3
 		VK_FORMAT_BC7_UNORM_BLOCK, // BC7
+		VK_FORMAT_A1R5G5B5_UNORM_PACK16, // Color16 (rimappato a runtime se si sceglie RGBA4)
 	}};
 
 	if (format == GSTexture::Format::DepthStencil)
