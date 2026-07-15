@@ -14,7 +14,7 @@
 //#define INTERP_EE        // Master
 //#define INTERP_BRANCH    // BEQ, BNE, J, JAL, JR, JALR, SYSCALL, BREAK, etc.
 //#define INTERP_MOVE      // LUI, MFHI/LO, MTHI/LO, MOVZ, MOVN, MFSA, MTSA, etc.
-//#define INTERP_COP0      // MFC0, MTC0, BC0x, TLB*, ERET, EI, DI
+#define INTERP_COP0       // Diagnostic: validate COP0/TLB setup against the modern core.
 //#define INTERP_COP1      // MFC1, MTC1, CFC1, CTC1, BC1x, FPU arith/cmp/cvt
 //#define INTERP_COP2      // QMFC2/QMTC2 (native 128b), CFC2/CTC2, BC2x, all VU0 macro math ops
 //#define INTERP_ALU       // ADDU, SUBU, ADDIU, DADDU, DSUBU, DADDIU, AND/OR/XOR/NOR, SLT/U, etc.
