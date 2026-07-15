@@ -1,253 +1,379 @@
-// SPDX-FileCopyrightText: 2026 isztld <https://isztld.com/>
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
-// SPDX-License-Identifier: GPL-3.0+
-
-// ARM64 EE (R5900) recompiler — multiply/divide codegen (Phase 3.5).
+// SPDX-License-Identifier: GPL-3.0
 //
-// Generates ARM64 for the R5900 multiply and divide opcodes:
-//   MULT/MULTU    — 32×32→64-bit multiply (HI/LO; also Rd=LO when rd!=0)
-//   DIV/DIVU      — 32-bit divide (quotient in LO, remainder in HI)
-//   MULT1/MULTU1  — second-pipeline multiply (HI1/LO1; MMI group)
-//   DIV1/DIVU1    — second-pipeline divide  (HI1/LO1; MMI group)
+// ARM64 EE Recompiler — Multiply / Divide Instructions
+// MULT/MULTU, MULT1/MULTU1, MADD/MADDU, MADD1/MADDU1, DIV/DIVU, DIV1/DIVU1
 //
-// Semantics are matched 1:1 against the interpreter (R5900OpcodeImpl.cpp /
-// MMI.cpp). Note the R5900 has NO DMULT/DMULTU/DDIV/DDIVU — those are not EE
-// instructions (they trap as reserved), so they are intentionally absent.
+// All ops update HI:LO. The MULT/MADD family also conditionally update Rd
+// with the (sign-extended) low 32 bits of the new LO. The /1 variants
+// operate on the upper 64-bit half of HI/LO (HI.SD[1] / LO.SD[1]).
+
+#include "Common.h"
+#include "R5900OpcodeTables.h"
+#include "arm64/arm64Emitter.h"
+
+using namespace R5900;
+
+// Per-instruction interp stub toggle. Set to 1 = interp, 0 = native.
+#if defined(INTERP_MULTDIV) || defined(INTERP_EE)
+#define ISTUB_MULT     1
+#define ISTUB_MULTU    1
+#define ISTUB_MULT1    1
+#define ISTUB_MULTU1   1
+#define ISTUB_MADD     1
+#define ISTUB_MADDU    1
+#define ISTUB_MADD1    1
+#define ISTUB_MADDU1   1
+#define ISTUB_DIV      1
+#define ISTUB_DIVU     1
+#define ISTUB_DIV1     1
+#define ISTUB_DIVU1    1
+#else
+#define ISTUB_MULT     0
+#define ISTUB_MULTU    0
+#define ISTUB_MULT1    0
+#define ISTUB_MULTU1   0
+#define ISTUB_MADD     0
+#define ISTUB_MADDU    0
+#define ISTUB_MADD1    0
+#define ISTUB_MADDU1   0
+#define ISTUB_DIV      0
+#define ISTUB_DIVU     0
+#define ISTUB_DIV1     0
+#define ISTUB_DIVU1    0
+#endif
+
+namespace R5900 {
+namespace Dynarec {
+namespace OpcodeImpl {
+
+// ============================================================================
+//  Helpers
+// ============================================================================
 //
-// No register allocator yet — every source GPR is read from cpuRegs in memory
-// (via RESTATEPTR = &cpuRegs) and the HI/LO results are written straight back.
-// Because the source GPRs are never modified, we freely reload them instead of
-// keeping more than two values live.
+// After a 32×32 multiply (signed or unsigned) the 64-bit result lives in an
+// X register. The PS2 wants:
+//   LO[hilo_off]   = sign_extend((s32)(result & 0xFFFFFFFF))
+//   HI[hilo_off]   = sign_extend((s32)(result >> 32))
+//   if (rd != 0)   GPR[rd].UD[0] = LO[hilo_off]   (low 64 bits of GPR)
 //
-// Register discipline (see arm64-port/CONVENTIONS.md + AsmHelpers): only x17
-// (RSCRATCHADDR) is removed from VIXL's scratch list in armStartBlock, so it is
-// the safe manual scratch. x16 (RXVIXLSCRATCH) doubles as VIXL's macro temp —
-// it must never hold a live value across a macro that materialises an immediate.
-// This code avoids that entirely: the only immediates used are encodable
-// (cmp #0, mov #1, mov #-1), so no temp is ever allocated.
+// hilo_off is 0 for the normal pipe and 8 for the /1 (pipeline 1) variants.
 
-#include "aR5900.h"
-
-#include "R5900.h"
-
-#include <cstddef>
-
-namespace a64 = vixl::aarch64;
-
-// Two scratch registers. RSCRATCH (x17) is the safe manual scratch; RSCRATCH2
-// (x16) is used only as a plain operand register for reg-reg ALU ops here.
-static const a64::Register RSCRATCH = RSCRATCHADDR;
-static const a64::Register RSCRATCHW = RSCRATCHADDR.W();
-static const a64::Register RSCRATCH2 = RXVIXLSCRATCH;
-static const a64::Register RSCRATCH2W = RXVIXLSCRATCH.W();
-
-// HI/LO live at GPR indices 32/33 (each GPR_reg is 128 bits). The "pipeline 1"
-// results (MULT1/DIV1 family) target the upper doubleword, i.e. +8 bytes.
-static constexpr u32 EE_HI_OFFSET = 32u * 16u;       // HI.UD[0]  (512)
-static constexpr u32 EE_LO_OFFSET = 33u * 16u;       // LO.UD[0]  (528)
-static constexpr u32 EE_HI1_OFFSET = EE_HI_OFFSET + 8u; // HI.UD[1] (520)
-static constexpr u32 EE_LO1_OFFSET = EE_LO_OFFSET + 8u; // LO.UD[1] (536)
-
-// ------------------------------------------------------------------------
-// Shared 32×32→64 multiply.
-//   LO = (s32)(product & 0xffffffff)   (sign-extended to 64, even for MULTU)
-//   HI = (s32)(product >> 32)          (sign-extended to 64)
-//   if rd != 0: GPR[rd].UD[0] = LO     (R5900 3-operand form)
-// ------------------------------------------------------------------------
-static void emitMult(bool sign, u32 rd, u32 rs, u32 rt, u32 lo_off, u32 hi_off)
+static void emitMultWritebackHILO(const a64::Register& xres, s64 hilo_off, int rd_for_writeback)
 {
-	armAsm->Ldr(RSCRATCHW, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-	armAsm->Ldr(RSCRATCH2W, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt)));
+	// xres holds the full 64-bit multiply (or accumulator) result.
+	// We need both halves sign-extended into separate X registers.
+	// xlo gets LO (sign-extended low 32). xres is then reused to hold HI
+	// (sign-extended high 32 via ASR).
+	const a64::Register xlo = RSCRATCHGPR2;
+	const a64::Register wres = a64::WRegister(xres.GetCode());
 
-	// Full 64-bit product in RSCRATCH (signed or unsigned widening multiply).
-	if (sign)
-		armAsm->Smull(RSCRATCH, RSCRATCHW, RSCRATCH2W);
-	else
-		armAsm->Umull(RSCRATCH, RSCRATCHW, RSCRATCH2W);
+	armAsm->Sxtw(xlo, wres);            // xlo = (s64)(s32)(xres & 0xFFFFFFFF)
+	armAsm->Asr(xres, xres, 32);        // xres = (s64)(s32)(xres >> 32)
+	armAsm->Str(xlo, a64::MemOperand(RCPUSTATE, LO_OFFSET + hilo_off));
+	armAsm->Str(xres, a64::MemOperand(RCPUSTATE, HI_OFFSET + hilo_off));
 
-	// LO = sign-extended low 32 bits of the product.
-	armAsm->Sxtw(RSCRATCH2, RSCRATCHW);
-	armAsm->Str(RSCRATCH2, a64::MemOperand(RESTATEPTR, lo_off));
-	if (rd != 0)
-		armAsm->Str(RSCRATCH2, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd)));
-
-	// HI = sign-extended high 32 bits. asr #32 leaves bits 63:32 in 31:0 and
-	// sign-extends from bit 63 (== bit 31 of the high word), matching (s32).
-	armAsm->Asr(RSCRATCH, RSCRATCH, 32);
-	armAsm->Str(RSCRATCH, a64::MemOperand(RESTATEPTR, hi_off));
+	if (rd_for_writeback != 0)
+		armStoreGPR64(xlo, rd_for_writeback);
 }
 
-// ------------------------------------------------------------------------
-// Shared signed 32-bit divide.
-//   LO = rs / rt, HI = rs % rt (both sign-extended to 64).
-// ARM SDIV reproduces the EE's overflow quirk for free: 0x80000000 / -1 yields
-// 0x80000000, and the remainder works out to 0. Only the divide-by-zero case
-// needs a fixup: LO = (rs < 0) ? 1 : -1, HI = rs (HI already equals rs there,
-// since SDIV yields 0 so remainder = rs - 0 = rs).
-// ------------------------------------------------------------------------
-static void emitDivS(u32 rs, u32 rt, u32 lo_off, u32 hi_off)
+// Build the 64-bit MADD accumulator from the LOW 32 bits of HI/LO at hilo_off
+// into the destination X register. Reads only LO_low32 and HI_low32 — matches
+// interpreter semantics: temp = ((u64)HI.UL[off] << 32) | LO.UL[off].
+static void emitLoadMaddAccumulator(const a64::Register& xacc, s64 hilo_off)
 {
+	const a64::Register wacc = a64::WRegister(xacc.GetCode());
+	const a64::Register xtmp = RSCRATCHGPR2;
+	const a64::Register wtmp = a64::WRegister(xtmp.GetCode());
+
+	armAsm->Ldr(wacc, a64::MemOperand(RCPUSTATE, LO_OFFSET + hilo_off));   // xacc = zero-ext LO_low32
+	armAsm->Ldr(wtmp, a64::MemOperand(RCPUSTATE, HI_OFFSET + hilo_off));   // xtmp = zero-ext HI_low32
+	armAsm->Bfi(xacc, xtmp, 32, 32);                                       // xacc[63:32] = xtmp[31:0]
+}
+
+// ============================================================================
+//  MULT — HI:LO = (s64)(s32)Rs * (s32)Rt;  if (rd) Rd = LO
+// ============================================================================
+
+#if ISTUB_MULT
+void recMULT() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MULT); }
+#else
+void recMULT()
+{
+	armDelConstReg(_Rd_);
+
+	armLoadGPR32(RWSCRATCH, _Rs_);
+	armLoadGPR32(RWSCRATCH2, _Rt_);
+	armAsm->Smull(RSCRATCHGPR, RWSCRATCH, RWSCRATCH2);
+	emitMultWritebackHILO(RSCRATCHGPR, 0, _Rd_);
+}
+#endif
+
+// ============================================================================
+//  MULTU — HI:LO = (u64)(u32)Rs * (u32)Rt; HI/LO sign-extended; if (rd) Rd = LO
+// ============================================================================
+
+#if ISTUB_MULTU
+void recMULTU() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MULTU); }
+#else
+void recMULTU()
+{
+	armDelConstReg(_Rd_);
+
+	armLoadGPR32(RWSCRATCH, _Rs_);
+	armLoadGPR32(RWSCRATCH2, _Rt_);
+	armAsm->Umull(RSCRATCHGPR, RWSCRATCH, RWSCRATCH2);
+	emitMultWritebackHILO(RSCRATCHGPR, 0, _Rd_);
+}
+#endif
+
+// ============================================================================
+//  MULT1 — same as MULT but writes HI.SD[1] / LO.SD[1] (pipeline 1)
+// ============================================================================
+
+#if ISTUB_MULT1
+void recMULT1() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MULT1); }
+#else
+void recMULT1()
+{
+	armDelConstReg(_Rd_);
+
+	armLoadGPR32(RWSCRATCH, _Rs_);
+	armLoadGPR32(RWSCRATCH2, _Rt_);
+	armAsm->Smull(RSCRATCHGPR, RWSCRATCH, RWSCRATCH2);
+	emitMultWritebackHILO(RSCRATCHGPR, 8, _Rd_);
+}
+#endif
+
+// ============================================================================
+//  MULTU1 — same as MULTU but writes HI.SD[1] / LO.SD[1] (pipeline 1)
+// ============================================================================
+
+#if ISTUB_MULTU1
+void recMULTU1() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MULTU1); }
+#else
+void recMULTU1()
+{
+	armDelConstReg(_Rd_);
+
+	armLoadGPR32(RWSCRATCH, _Rs_);
+	armLoadGPR32(RWSCRATCH2, _Rt_);
+	armAsm->Umull(RSCRATCHGPR, RWSCRATCH, RWSCRATCH2);
+	emitMultWritebackHILO(RSCRATCHGPR, 8, _Rd_);
+}
+#endif
+
+// ============================================================================
+//  MADD — temp = ((u64)HI.UL[0]<<32 | LO.UL[0]) + (s64)(s32)Rs * (s32)Rt
+//         HI:LO = sign-extended halves of temp; if (rd) Rd = LO
+//  Note: only the LOW 32 bits of HI/LO feed the accumulator (matches interp).
+// ============================================================================
+
+#if ISTUB_MADD
+void recMADD() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MADD); }
+#else
+void recMADD()
+{
+	armDelConstReg(_Rd_);
+
+	emitLoadMaddAccumulator(RSCRATCHGPR, 0);                       // x4 = acc (x5 scratch dead after this)
+	armLoadGPR32(RWSCRATCH2, _Rs_);                                // w5 = rs
+	armLoadGPR32(RWSCRATCH3, _Rt_);                                // w6 = rt
+	armAsm->Smaddl(RSCRATCHGPR, RWSCRATCH2, RWSCRATCH3, RSCRATCHGPR); // x4 = w5*w6 + x4
+	emitMultWritebackHILO(RSCRATCHGPR, 0, _Rd_);
+}
+#endif
+
+// ============================================================================
+//  MADDU — same as MADD but unsigned multiply
+// ============================================================================
+
+#if ISTUB_MADDU
+void recMADDU() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MADDU); }
+#else
+void recMADDU()
+{
+	armDelConstReg(_Rd_);
+
+	emitLoadMaddAccumulator(RSCRATCHGPR, 0);
+	armLoadGPR32(RWSCRATCH2, _Rs_);
+	armLoadGPR32(RWSCRATCH3, _Rt_);
+	armAsm->Umaddl(RSCRATCHGPR, RWSCRATCH2, RWSCRATCH3, RSCRATCHGPR);
+	emitMultWritebackHILO(RSCRATCHGPR, 0, _Rd_);
+}
+#endif
+
+// ============================================================================
+//  MADD1 — same as MADD but writes pipeline 1 (HI.SD[1] / LO.SD[1])
+//  Reads accumulator from HI.UL[2] / LO.UL[2] (the LOW 32 bits of the upper
+//  64-bit half), exactly mirroring the interpreter.
+// ============================================================================
+
+#if ISTUB_MADD1
+void recMADD1() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MADD1); }
+#else
+void recMADD1()
+{
+	armDelConstReg(_Rd_);
+
+	emitLoadMaddAccumulator(RSCRATCHGPR, 8);
+	armLoadGPR32(RWSCRATCH2, _Rs_);
+	armLoadGPR32(RWSCRATCH3, _Rt_);
+	armAsm->Smaddl(RSCRATCHGPR, RWSCRATCH2, RWSCRATCH3, RSCRATCHGPR);
+	emitMultWritebackHILO(RSCRATCHGPR, 8, _Rd_);
+}
+#endif
+
+// ============================================================================
+//  MADDU1 — same as MADDU but writes pipeline 1 (HI.SD[1] / LO.SD[1])
+// ============================================================================
+
+#if ISTUB_MADDU1
+void recMADDU1() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MADDU1); }
+#else
+void recMADDU1()
+{
+	armDelConstReg(_Rd_);
+
+	emitLoadMaddAccumulator(RSCRATCHGPR, 8);
+	armLoadGPR32(RWSCRATCH2, _Rs_);
+	armLoadGPR32(RWSCRATCH3, _Rt_);
+	armAsm->Umaddl(RSCRATCHGPR, RWSCRATCH2, RWSCRATCH3, RSCRATCHGPR);
+	emitMultWritebackHILO(RSCRATCHGPR, 8, _Rd_);
+}
+#endif
+
+// ============================================================================
+//  Divide helpers
+// ============================================================================
+//
+// For DIV/DIVU we need to handle divide-by-zero (ARM64 SDIV/UDIV produce 0
+// silently — but the PS2 wants specific values for HI/LO). The INT_MIN/-1
+// case for SDIV is also defined by ARM (returns INT_MIN), and the resulting
+// MSUB remainder works out to 0 — exactly what the interpreter wants — so
+// no special branch is needed for it.
+
+// emitSignedDivBody: w_rs and w_rt hold the operands (must be RWSCRATCH /
+// RWSCRATCH2). On entry both registers must already be loaded. Stores the
+// final HI/LO at the requested offset.
+static void emitSignedDivBody(s64 hilo_off)
+{
+	a64::Label divzero;
 	a64::Label done;
 
-	armAsm->Ldr(RSCRATCHW, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));  // dividend
-	armAsm->Ldr(RSCRATCH2W, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt))); // divisor
+	armAsm->Cbz(RWSCRATCH2, &divzero);
 
-	armAsm->Sdiv(RSCRATCHW, RSCRATCHW, RSCRATCH2W);  // RSCRATCHW = quotient
-	armAsm->Mul(RSCRATCH2W, RSCRATCHW, RSCRATCH2W);  // RSCRATCH2W = quotient * divisor
+	// Normal path: quotient = rs / rt, remainder = rs - quot * rt
+	armAsm->Sdiv(RWSCRATCH3, RWSCRATCH, RWSCRATCH2);                    // w6 = rs / rt
+	armAsm->Msub(RWSCRATCH, RWSCRATCH3, RWSCRATCH2, RWSCRATCH);         // w4 = rs - w6*rt (remainder)
+	armAsm->Sxtw(RSCRATCHGPR3, RWSCRATCH3);                             // x6 = sign-ext quotient
+	armAsm->Sxtw(RSCRATCHGPR, RWSCRATCH);                               // x4 = sign-ext remainder
+	armAsm->Str(RSCRATCHGPR3, a64::MemOperand(RCPUSTATE, LO_OFFSET + hilo_off));
+	armAsm->Str(RSCRATCHGPR, a64::MemOperand(RCPUSTATE, HI_OFFSET + hilo_off));
+	armAsm->B(&done);
 
-	// LO = sign-extended quotient (free up RSCRATCH afterwards).
-	armAsm->Sxtw(RSCRATCH, RSCRATCHW);
-	armAsm->Str(RSCRATCH, a64::MemOperand(RESTATEPTR, lo_off));
+	armAsm->Bind(&divzero);
+	// LO = (rs < 0) ? 1 : -1   (sign-extended to 64)
+	// HI = sign_extend(rs)
+	armAsm->Mov(RWSCRATCH3, 1);                                         // w6 = 1
+	armAsm->Mov(RWARG1, -1);                                            // w0 = -1
+	armAsm->Cmp(RWSCRATCH, 0);                                          // compare rs with 0
+	armAsm->Csel(RWSCRATCH3, RWSCRATCH3, RWARG1, a64::lt);              // w6 = lt ? 1 : -1
+	armAsm->Sxtw(RSCRATCHGPR3, RWSCRATCH3);
+	armAsm->Sxtw(RSCRATCHGPR, RWSCRATCH);                               // sign-ext rs
+	armAsm->Str(RSCRATCHGPR3, a64::MemOperand(RCPUSTATE, LO_OFFSET + hilo_off));
+	armAsm->Str(RSCRATCHGPR, a64::MemOperand(RCPUSTATE, HI_OFFSET + hilo_off));
 
-	// HI = sign-extended remainder = dividend - quotient*divisor.
-	armAsm->Ldr(RSCRATCHW, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-	armAsm->Sub(RSCRATCH2W, RSCRATCHW, RSCRATCH2W);
-	armAsm->Sxtw(RSCRATCH2, RSCRATCH2W);
-	armAsm->Str(RSCRATCH2, a64::MemOperand(RESTATEPTR, hi_off));
-
-	// Divide-by-zero fixup for LO (HI is already correct: == dividend).
-	armAsm->Ldr(RSCRATCH2W, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt)));
-	armAsm->Cmp(RSCRATCH2W, 0);
-	armAsm->B(a64::ne, &done);
-	armAsm->Ldr(RSCRATCHW, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs))); // dividend
-	armAsm->Cmp(RSCRATCHW, 0);
-	armAsm->Mov(RSCRATCH2W, 1);
-	armAsm->Csneg(RSCRATCH2W, RSCRATCH2W, RSCRATCH2W, a64::lt); // (dividend<0) ? 1 : -1
-	armAsm->Sxtw(RSCRATCH2, RSCRATCH2W);
-	armAsm->Str(RSCRATCH2, a64::MemOperand(RESTATEPTR, lo_off));
 	armAsm->Bind(&done);
 }
 
-// ------------------------------------------------------------------------
-// Shared unsigned 32-bit divide.
-//   LO = (s32)(rs / rt), HI = (s32)(rs % rt)  (note: sign-extended to 64).
-// Divide-by-zero: LO = -1 (full 64-bit), HI = rs (sign-extended).
-// ------------------------------------------------------------------------
-static void emitDivU(u32 rs, u32 rt, u32 lo_off, u32 hi_off)
+// emitUnsignedDivBody: same convention, unsigned variant.
+static void emitUnsignedDivBody(s64 hilo_off)
 {
+	a64::Label divzero;
 	a64::Label done;
 
-	armAsm->Ldr(RSCRATCHW, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));  // dividend
-	armAsm->Ldr(RSCRATCH2W, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt))); // divisor
+	armAsm->Cbz(RWSCRATCH2, &divzero);
 
-	armAsm->Udiv(RSCRATCHW, RSCRATCHW, RSCRATCH2W);  // RSCRATCHW = quotient (÷0 -> 0)
-	armAsm->Mul(RSCRATCH2W, RSCRATCHW, RSCRATCH2W);  // RSCRATCH2W = quotient * divisor
+	armAsm->Udiv(RWSCRATCH3, RWSCRATCH, RWSCRATCH2);                    // w6 = rs / rt
+	armAsm->Msub(RWSCRATCH, RWSCRATCH3, RWSCRATCH2, RWSCRATCH);         // w4 = rs - w6*rt
+	armAsm->Sxtw(RSCRATCHGPR3, RWSCRATCH3);                             // sign-ext (s32) cast → s64
+	armAsm->Sxtw(RSCRATCHGPR, RWSCRATCH);
+	armAsm->Str(RSCRATCHGPR3, a64::MemOperand(RCPUSTATE, LO_OFFSET + hilo_off));
+	armAsm->Str(RSCRATCHGPR, a64::MemOperand(RCPUSTATE, HI_OFFSET + hilo_off));
+	armAsm->B(&done);
 
-	armAsm->Sxtw(RSCRATCH, RSCRATCHW);               // LO = (s32)quotient
-	armAsm->Str(RSCRATCH, a64::MemOperand(RESTATEPTR, lo_off));
+	armAsm->Bind(&divzero);
+	// LO = -1 (sign-extended)
+	// HI = sign_extend((s32)rs)
+	armAsm->Mov(RSCRATCHGPR3, static_cast<u64>(-1));
+	armAsm->Sxtw(RSCRATCHGPR, RWSCRATCH);
+	armAsm->Str(RSCRATCHGPR3, a64::MemOperand(RCPUSTATE, LO_OFFSET + hilo_off));
+	armAsm->Str(RSCRATCHGPR, a64::MemOperand(RCPUSTATE, HI_OFFSET + hilo_off));
 
-	armAsm->Ldr(RSCRATCHW, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-	armAsm->Sub(RSCRATCH2W, RSCRATCHW, RSCRATCH2W);  // remainder
-	armAsm->Sxtw(RSCRATCH2, RSCRATCH2W);             // HI = (s32)remainder
-	armAsm->Str(RSCRATCH2, a64::MemOperand(RESTATEPTR, hi_off));
-
-	// Divide-by-zero fixup for LO (HI already correct: == sign-extended dividend).
-	armAsm->Ldr(RSCRATCH2W, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt)));
-	armAsm->Cmp(RSCRATCH2W, 0);
-	armAsm->B(a64::ne, &done);
-	armAsm->Mov(RSCRATCH, 0xFFFFFFFFFFFFFFFFull);    // LO = -1 (encodable: all ones)
-	armAsm->Str(RSCRATCH, a64::MemOperand(RESTATEPTR, lo_off));
 	armAsm->Bind(&done);
 }
 
-// ------------------------------------------------------------------------
-// SPECIAL group: MULT/MULTU (funct 0x18/0x19), DIV/DIVU (0x1A/0x1B).
-// ------------------------------------------------------------------------
-void armEmitMULT(u32 rd, u32 rs, u32 rt) { emitMult(true, rd, rs, rt, EE_LO_OFFSET, EE_HI_OFFSET); }
-void armEmitMULTU(u32 rd, u32 rs, u32 rt) { emitMult(false, rd, rs, rt, EE_LO_OFFSET, EE_HI_OFFSET); }
-void armEmitDIV(u32 rs, u32 rt) { emitDivS(rs, rt, EE_LO_OFFSET, EE_HI_OFFSET); }
-void armEmitDIVU(u32 rs, u32 rt) { emitDivU(rs, rt, EE_LO_OFFSET, EE_HI_OFFSET); }
+// ============================================================================
+//  DIV — signed 32-bit divide. HI:LO updated; Rd unused.
+// ============================================================================
 
-// ------------------------------------------------------------------------
-// MMI group: MULT1/MULTU1 (funct 0x18/0x19), DIV1/DIVU1 (0x1A/0x1B).
-// Identical arithmetic, but results target the upper doubleword HI1/LO1, and
-// the optional Rd write reads LO.UD[1] (== the value we store to LO1).
-// ------------------------------------------------------------------------
-void armEmitMULT1(u32 rd, u32 rs, u32 rt) { emitMult(true, rd, rs, rt, EE_LO1_OFFSET, EE_HI1_OFFSET); }
-void armEmitMULTU1(u32 rd, u32 rs, u32 rt) { emitMult(false, rd, rs, rt, EE_LO1_OFFSET, EE_HI1_OFFSET); }
-void armEmitDIV1(u32 rs, u32 rt) { emitDivS(rs, rt, EE_LO1_OFFSET, EE_HI1_OFFSET); }
-void armEmitDIVU1(u32 rs, u32 rt) { emitDivU(rs, rt, EE_LO1_OFFSET, EE_HI1_OFFSET); }
-
-// ------------------------------------------------------------------------
-// Multiply-accumulate (MMI funct 0x00/0x01 MADD/MADDU, 0x20/0x21 MADD1/MADDU1).
-//   acc  = (u64)LO.UL[0] | ((u64)HI.UL[0] << 32)   (low 32 of each accumulator word)
-//   temp = acc + (rs * rt)        (signed for MADD/MADD1, unsigned for the U forms)
-//   LO   = (s32)(temp & 0xffffffff)  (sign-extended to 64)
-//   HI   = (s32)(temp >> 32)         (sign-extended to 64)
-//   if rd != 0: GPR[rd].UD[0] = LO   (R5900 3-operand form)
-// The two 32-bit accumulator words are added straight onto the 64-bit product
-// (HI word << 32, then LO word), so `acc` never needs its own register and the op
-// fits in the two manual scratch registers. Result sign-extension is identical for
-// the unsigned forms (the interpreter sign-extends LO/HI regardless). The pipeline-1
-// forms select the upper doubleword via lo_off/hi_off, exactly like MULT1.
-// ------------------------------------------------------------------------
-static void emitMadd(bool sign, u32 rd, u32 rs, u32 rt, u32 lo_off, u32 hi_off)
+#if ISTUB_DIV
+void recDIV() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::DIV); }
+#else
+void recDIV()
 {
-	armAsm->Ldr(RSCRATCH2W, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-	armAsm->Ldr(RSCRATCHW, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt)));
-
-	// The live 64-bit accumulator is kept in RSCRATCH (x17), which armStartBlock removes
-	// from VIXL's scratch-register list, so it is safe to hold across the macro ops below —
-	// even if one of them allocated a VIXL temp it could not pick x17. RSCRATCH2 (x16 ==
-	// RXVIXLSCRATCH) is VIXL's macro scratch, so it is only ever loaded and immediately
-	// consumed as a plain operand here, never held across a macro.
-	if (sign)
-		armAsm->Smull(RSCRATCH, RSCRATCH2W, RSCRATCHW);   // x17 = (s64)rs * (s32)rt
-	else
-		armAsm->Umull(RSCRATCH, RSCRATCH2W, RSCRATCHW);   // x17 = (u64)rs * (u32)rt
-
-	// temp = product + (HI.UL[0] << 32) + LO.UL[0]. The w-loads zero-extend, so each
-	// accumulator word contributes exactly its 32 bits with no stray high bits.
-	armAsm->Ldr(RSCRATCH2W, a64::MemOperand(RESTATEPTR, hi_off));   // HI accumulator word
-	armAsm->Add(RSCRATCH, RSCRATCH, a64::Operand(RSCRATCH2, a64::LSL, 32));
-	armAsm->Ldr(RSCRATCH2W, a64::MemOperand(RESTATEPTR, lo_off));   // LO accumulator word
-	armAsm->Add(RSCRATCH, RSCRATCH, RSCRATCH2);                     // RSCRATCH = temp
-
-	// LO = sign-extended low 32 bits of temp; also Rd in the R5900 3-operand form.
-	armAsm->Sxtw(RSCRATCH2, RSCRATCHW);
-	armAsm->Str(RSCRATCH2, a64::MemOperand(RESTATEPTR, lo_off));
-	if (rd != 0)
-		armAsm->Str(RSCRATCH2, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd)));
-
-	// HI = sign-extended high 32 bits (asr #32 sign-extends from bit 63 == bit 31 hi).
-	armAsm->Asr(RSCRATCH, RSCRATCH, 32);
-	armAsm->Str(RSCRATCH, a64::MemOperand(RESTATEPTR, hi_off));
+	armLoadGPR32(RWSCRATCH, _Rs_);
+	armLoadGPR32(RWSCRATCH2, _Rt_);
+	emitSignedDivBody(0);
 }
+#endif
 
-void armEmitMADD(u32 rd, u32 rs, u32 rt)   { emitMadd(true,  rd, rs, rt, EE_LO_OFFSET,  EE_HI_OFFSET); }
-void armEmitMADDU(u32 rd, u32 rs, u32 rt)  { emitMadd(false, rd, rs, rt, EE_LO_OFFSET,  EE_HI_OFFSET); }
-void armEmitMADD1(u32 rd, u32 rs, u32 rt)  { emitMadd(true,  rd, rs, rt, EE_LO1_OFFSET, EE_HI1_OFFSET); }
-void armEmitMADDU1(u32 rd, u32 rs, u32 rt) { emitMadd(false, rd, rs, rt, EE_LO1_OFFSET, EE_HI1_OFFSET); }
+// ============================================================================
+//  DIVU — unsigned 32-bit divide.
+// ============================================================================
 
-// ------------------------------------------------------------------------
-// Pipeline-1 HI/LO moves (MMI funct 0x10-0x13: MFHI1/MTHI1/MFLO1/MTLO1).
-// Full 64-bit copies to/from the upper doubleword HI1/LO1 — mirror MFHI/MFLO/
-// MTHI/MTLO (aR5900Arith.cpp) but with the +8 offsets.
-// ------------------------------------------------------------------------
-void armEmitMFHI1(u32 rd)
+#if ISTUB_DIVU
+void recDIVU() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::DIVU); }
+#else
+void recDIVU()
 {
-	if (rd == 0)
-		return;
-	armAsm->Ldr(RSCRATCH, a64::MemOperand(RESTATEPTR, EE_HI1_OFFSET));
-	armAsm->Str(RSCRATCH, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd)));
+	armLoadGPR32(RWSCRATCH, _Rs_);
+	armLoadGPR32(RWSCRATCH2, _Rt_);
+	emitUnsignedDivBody(0);
 }
+#endif
 
-void armEmitMFLO1(u32 rd)
-{
-	if (rd == 0)
-		return;
-	armAsm->Ldr(RSCRATCH, a64::MemOperand(RESTATEPTR, EE_LO1_OFFSET));
-	armAsm->Str(RSCRATCH, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd)));
-}
+// ============================================================================
+//  DIV1 — signed divide writing pipeline 1 (HI.SD[1] / LO.SD[1])
+// ============================================================================
 
-void armEmitMTHI1(u32 rs)
+#if ISTUB_DIV1
+void recDIV1() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::DIV1); }
+#else
+void recDIV1()
 {
-	armAsm->Ldr(RSCRATCH, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-	armAsm->Str(RSCRATCH, a64::MemOperand(RESTATEPTR, EE_HI1_OFFSET));
+	armLoadGPR32(RWSCRATCH, _Rs_);
+	armLoadGPR32(RWSCRATCH2, _Rt_);
+	emitSignedDivBody(8);
 }
+#endif
 
-void armEmitMTLO1(u32 rs)
+// ============================================================================
+//  DIVU1 — unsigned divide writing pipeline 1 (HI.SD[1] / LO.SD[1])
+// ============================================================================
+
+#if ISTUB_DIVU1
+void recDIVU1() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::DIVU1); }
+#else
+void recDIVU1()
 {
-	armAsm->Ldr(RSCRATCH, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-	armAsm->Str(RSCRATCH, a64::MemOperand(RESTATEPTR, EE_LO1_OFFSET));
+	armLoadGPR32(RWSCRATCH, _Rs_);
+	armLoadGPR32(RWSCRATCH2, _Rt_);
+	emitUnsignedDivBody(8);
 }
+#endif
+
+} // namespace OpcodeImpl
+} // namespace Dynarec
+} // namespace R5900

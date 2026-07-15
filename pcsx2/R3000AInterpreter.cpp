@@ -16,6 +16,10 @@ using namespace R3000A;
 // Used to flag delay slot instructions when throwig exceptions.
 bool iopIsDelaySlot = false;
 
+// Shared with the Pi-proven ARM64 IOP recompiler. A value of one preserves
+// the current timing while keeping the backend's per-instruction accounting.
+u32 g_iopCycleMultiplier = 1;
+
 static bool branch2 = 0;
 static u32 branchPC;
 

@@ -1,5 +1,4 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
-// SPDX-FileCopyrightText: 2026 isztld <https://isztld.com/>
 // SPDX-License-Identifier: GPL-3.0
 
 #pragma once

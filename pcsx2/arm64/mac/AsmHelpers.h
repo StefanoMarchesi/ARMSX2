@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-FileCopyrightText: 2026 isztld <https://isztld.com/>
 // SPDX-License-Identifier: GPL-3.0
 
 #pragma once
@@ -46,11 +47,18 @@
 #define RQSCRATCH2F vixl::aarch64::VRegister(31, 128, 4)
 #define RQSCRATCH2D vixl::aarch64::VRegister(31, 128, 2)
 
+
+namespace pcsx2_macrec {
+
 static inline s64 GetPCDisplacement(const void* current, const void* target)
 {
 	return static_cast<s64>((reinterpret_cast<ptrdiff_t>(target) - reinterpret_cast<ptrdiff_t>(current)) >> 2);
 }
 
+const vixl::aarch64::Register& armWRegister(int n);
+const vixl::aarch64::Register& armXRegister(int n);
+const vixl::aarch64::VRegister& armSRegister(int n);
+const vixl::aarch64::VRegister& armDRegister(int n);
 const vixl::aarch64::VRegister& armQRegister(int n);
 
 class ArmConstantPool;
@@ -85,13 +93,14 @@ u8* armEndBlock();
 void armDisassembleAndDumpCode(const void* ptr, size_t size);
 void armEmitJmp(const void* ptr, bool force_inline = false);
 void armEmitCall(const void* ptr, bool force_inline = false);
-void armEmitJmpPtr(void* code_address, const void* target, bool flush_icache = true);
 void armEmitCbnz(const vixl::aarch64::Register& reg, const void* ptr);
 void armEmitCondBranch(vixl::aarch64::Condition cond, const void* ptr);
 void armMoveAddressToReg(const vixl::aarch64::Register& reg, const void* addr);
 void armLoadPtr(const vixl::aarch64::CPURegister& reg, const void* addr);
 void armStorePtr(const vixl::aarch64::CPURegister& reg, const void* addr);
 void armBeginStackFrame(bool save_fpr);
+void armEndStackFrame(bool save_fpr);
+bool armIsCalleeSavedRegister(int reg);
 
 vixl::aarch64::MemOperand armOffsetMemOperand(const vixl::aarch64::MemOperand& op, s64 offset);
 void armGetMemOperandInRegister(const vixl::aarch64::Register& addr_reg,
@@ -139,3 +148,6 @@ private:
 	u32 m_capacity = 0;
 	u32 m_used = 0;
 };
+
+
+} // namespace pcsx2_macrec

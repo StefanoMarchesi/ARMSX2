@@ -1,329 +1,943 @@
-// SPDX-FileCopyrightText: 2026 isztld <https://isztld.com/>
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
-// SPDX-License-Identifier: GPL-3.0+
-
-// ARM64 EE (R5900) recompiler — branch/jump codegen (Phase 4.1 / 4.2).
+// SPDX-License-Identifier: GPL-3.0
 //
-// These generators emit only the control-flow effect of a branch or jump: the
-// next-PC write into cpuRegs.pc and, for the linking forms, the return-address
-// write into a GPR. They do NOT compile the delay-slot instruction or terminate
-// the block — that is the block compiler's job (it compiles the delay slot after
-// invoking the generator, then RETs back to the dispatcher loop, which re-reads
-// cpuRegs.pc to find the next block).
-//
-// Why writing cpuRegs.pc *before* the delay slot is safe: no EE delay-slot
-// instruction writes cpuRegs.pc, so the early write survives unchanged. For the
-// register-target forms (JR/JALR) this is also *required* for correctness — the
-// jump target must be the value of GPR[rs] as it was before the delay slot, which
-// may overwrite rs. Reading rs into pc here captures it at the right time.
-//
-// No register allocator yet — sources are read from / results written to cpuRegs
-// in memory via RESTATEPTR. The only scratch used is RSCRATCHADDR (x17); the
-// immediates materialized here (Mov of a 32-bit constant) go straight into the
-// destination register, so VIXL never needs RXVIXLSCRATCH (x16) as a temp.
+// ARM64 EE Recompiler — Branch & Jump Instructions
+// BEQ, BNE, BGEZ, BLTZ, BLEZ, BGTZ, J, JAL, JR, JALR + Likely variants
 
-#include "aR5900.h"
+#include "Common.h"
+#include "R5900OpcodeTables.h"
+#include "arm64/arm64Emitter.h"
 
-#include "R5900.h"
-#include "VU.h" // VU0 / REG_VPU_STAT for the COP2 (BC2) branch condition
-#include "Memory.h" // eeHw — the backing store the DMAC registers alias into
-#include "Hw.h"     // HW-register address enum (Dmac.h prerequisite)
-#include "Dmac.h"   // dmacRegs / DMACregisters for the COP0 (BC0) CPCOND0 condition
+#include <cstdlib>
 
-#include "common/Assertions.h"
+using namespace R5900;
 
-namespace a64 = vixl::aarch64;
+// Per-instruction interp stub toggle. Set to 1 = interp, 0 = native.
+#if defined(INTERP_BRANCH) || defined(INTERP_EE)
+#define ISTUB_BEQ      1
+#define ISTUB_BNE      1
+#define ISTUB_BEQL     1
+#define ISTUB_BNEL     1
+#define ISTUB_BGEZ     1
+#define ISTUB_BGTZ     1
+#define ISTUB_BLEZ     1
+#define ISTUB_BLTZ     1
+#define ISTUB_BGEZL    1
+#define ISTUB_BGTZL    1
+#define ISTUB_BLEZL    1
+#define ISTUB_BLTZL    1
+#define ISTUB_BGEZAL   1
+#define ISTUB_BLTZAL   1
+#define ISTUB_BGEZALL  1
+#define ISTUB_BLTZALL  1
+#define ISTUB_J        1
+#define ISTUB_JAL      1
+#define ISTUB_JR       1
+#define ISTUB_JALR     1
+#define ISTUB_SYSCALL  1
+#define ISTUB_BREAK    1
+#else
+#define ISTUB_BEQ      0
+#define ISTUB_BNE      0
+#define ISTUB_BEQL     0
+#define ISTUB_BNEL     0
+#define ISTUB_BGEZ     0
+#define ISTUB_BGTZ     0
+#define ISTUB_BLEZ     0
+#define ISTUB_BLTZ     0
+#define ISTUB_BGEZL    0
+#define ISTUB_BGTZL    0
+#define ISTUB_BLEZL    0
+#define ISTUB_BLTZL    0
+#define ISTUB_BGEZAL   0
+#define ISTUB_BLTZAL   0
+#define ISTUB_BGEZALL  0
+#define ISTUB_BLTZALL  0
+#define ISTUB_J        0
+#define ISTUB_JAL      0  // Native by default. The interp stub forced a full event
+                          // test at EVERY JAL (armBranchCallInterpreter mirrors x86
+                          // recBranchCall), split blocks and killed linking — measured
+                          // 3-5% on Mafia/SotC. The historical GT4 regression (wobbly
+                          // wheels, reflections, loading spinner) survived a body that
+                          // fully mirrors x86 recJAL, so the suspect is the game's
+                          // sensitivity to event-test timing, not the JAL codegen.
+                          // Runtime kill-switch: ARMSX2_JAL_INTERP=1 restores the
+                          // interp stub without a rebuild (GT4 A/B debugging).
+#define ISTUB_JR       0
+#define ISTUB_JALR     0
+#define ISTUB_SYSCALL  0
+#define ISTUB_BREAK    0
+#endif
 
-// Scratch register (caller-saved; clobbered freely by these generators).
-static const a64::Register RSCRATCH = RSCRATCHADDR;
-static const a64::Register RSCRATCHW = RSCRATCHADDR.W();
+// ============================================================================
+//  Native codegen helpers (only compiled when at least one native branch exists)
+// ============================================================================
 
-// Store a 32-bit value into cpuRegs.pc.
-static void emitWritePcReg(const a64::Register& src_w)
+#if !ISTUB_BEQ || !ISTUB_BNE || !ISTUB_BEQL || !ISTUB_BNEL || \
+    !ISTUB_BGEZ || !ISTUB_BGTZ || !ISTUB_BLEZ || !ISTUB_BLTZ || \
+    !ISTUB_BGEZL || !ISTUB_BGTZL || !ISTUB_BLEZL || !ISTUB_BLTZL || \
+    !ISTUB_BGEZAL || !ISTUB_BLTZAL || !ISTUB_BGEZALL || !ISTUB_BLTZALL || \
+    !ISTUB_J || !ISTUB_JAL || !ISTUB_JR || !ISTUB_JALR || \
+    !ISTUB_SYSCALL || !ISTUB_BREAK
+
+extern void recompileNextInstruction(bool delayslot, bool swapped_delay_slot);
+
+// Helper: set PC to a known immediate and mark branch done
+static void SetBranchImm(u32 imm)
 {
-	armAsm->Str(src_w, a64::MemOperand(RESTATEPTR, EE_PC_OFFSET));
+	armAsm->Mov(RWSCRATCH, imm);
+	armAsm->Str(RWSCRATCH, a64::MemOperand(RCPUSTATE, PC_OFFSET));
+	g_branch = 1;
+	g_cpuFlushedPC = true;
+	// Signal to recRecompile's block-end link gate that the successor PC
+	// is statically known. Covers J/JAL, the `_Rs_ == _Rt_` BEQ (MIPS's
+	// `b label` encoding), and every const-folded conditional branch.
+	g_eeStaticBranchPC = imm;
 }
 
-// cpuRegs.pc = imm
-static void emitWritePcImm(u32 pc)
+// Helper: for conditional branches with two GPR operands. Emits split
+// taken/not-taken exit tails, each independently linkable via
+// emitEELinkableExit. The taken tail is emitted here inline; the
+// not-taken tail is staged for recRecompile's block-end iBranchTest via
+// g_eeStaticBranchPC = fallthrough.
+static void recBranch_GPR64(a64::Condition cond, int rs, int rt, u32 branchTarget, u32 fallthrough)
 {
-	armAsm->Mov(RSCRATCHW, pc);
-	emitWritePcReg(RSCRATCHW);
-}
-
-// GPR[reg].UD[0] = linkpc (zero-extended 32->64; upper 64 bits of the 128-bit reg
-// are left untouched, matching the x86 JIT / interpreter _SetLink).
-static void emitWriteLink(u32 reg, u32 linkpc)
-{
-	armAsm->Mov(RSCRATCHW, linkpc);                                          // X upper 32 bits zeroed
-	armAsm->Str(RSCRATCH, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(reg))); // store 64-bit => UD[0]
-}
-
-// ------------------------------------------------------------------------
-// J / JAL  (primary opcodes 0x02 / 0x03) — immediate (region) target.
-// ------------------------------------------------------------------------
-void armEmitJ(u32 target)
-{
-	emitWritePcImm(target);
-}
-
-void armEmitJAL(u32 target, u32 linkpc)
-{
-	emitWriteLink(31, linkpc);
-	emitWritePcImm(target);
-}
-
-// ------------------------------------------------------------------------
-// JR / JALR  (SPECIAL funct 0x08 / 0x09) — register target.
-// The target is GPR[rs].UL[0] read *before* the delay slot.
-// ------------------------------------------------------------------------
-void armEmitJR(u32 rs)
-{
-	armAsm->Ldr(RSCRATCHW, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-	emitWritePcReg(RSCRATCHW);
-}
-
-void armEmitJALR(u32 rd, u32 rs, u32 linkpc)
-{
-	// Read rs and commit the target first, so that rd==rs (link overwriting the
-	// target source) still jumps to the original GPR[rs].
-	armAsm->Ldr(RSCRATCHW, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-	emitWritePcReg(RSCRATCHW);
-	if (rd != 0)
-		emitWriteLink(rd, linkpc);
-}
-
-// ------------------------------------------------------------------------
-// Conditional branches (Phase 4.2).
-// ------------------------------------------------------------------------
-// Given that a preceding Cmp has set the condition flags, write
-//   cpuRegs.pc = cond ? target : fallthrough.
-// Both constants are materialized straight into their destination registers
-// (x17 = fallthrough, x16 = target), so neither Mov needs a VIXL temp and the
-// flags from the Cmp survive into the Csel.
-static void emitSelectPc(u32 target, u32 fallthrough, a64::Condition cond)
-{
-	armAsm->Mov(RSCRATCHW, fallthrough);
-	armAsm->Mov(RXVIXLSCRATCH.W(), target);
-	armAsm->Csel(RSCRATCHW, RXVIXLSCRATCH.W(), RSCRATCHW, cond);
-	emitWritePcReg(RSCRATCHW);
-}
-
-void armEmitBEQ(u32 rs, u32 rt, u32 target, u32 fallthrough)
-{
-	armAsm->Ldr(RSCRATCH, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));     // GPR[rs].UD[0]
-	armAsm->Ldr(RXVIXLSCRATCH, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt))); // GPR[rt].UD[0]
-	armAsm->Cmp(RSCRATCH, RXVIXLSCRATCH);
-	emitSelectPc(target, fallthrough, a64::eq);
-}
-
-void armEmitBNE(u32 rs, u32 rt, u32 target, u32 fallthrough)
-{
-	armAsm->Ldr(RSCRATCH, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-	armAsm->Ldr(RXVIXLSCRATCH, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt)));
-	armAsm->Cmp(RSCRATCH, RXVIXLSCRATCH);
-	emitSelectPc(target, fallthrough, a64::ne);
-}
-
-// Single-operand forms compare signed 64-bit GPR[rs] against zero.
-static void emitBranchZero(u32 rs, u32 target, u32 fallthrough, a64::Condition cond)
-{
-	armAsm->Ldr(RSCRATCH, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-	armAsm->Cmp(RSCRATCH, 0);
-	emitSelectPc(target, fallthrough, cond);
-}
-
-void armEmitBLTZ(u32 rs, u32 target, u32 fallthrough)
-{
-	emitBranchZero(rs, target, fallthrough, a64::lt); // rs <  0
-}
-
-void armEmitBGEZ(u32 rs, u32 target, u32 fallthrough)
-{
-	emitBranchZero(rs, target, fallthrough, a64::ge); // rs >= 0
-}
-
-void armEmitBLEZ(u32 rs, u32 target, u32 fallthrough)
-{
-	emitBranchZero(rs, target, fallthrough, a64::le); // rs <= 0
-}
-
-void armEmitBGTZ(u32 rs, u32 target, u32 fallthrough)
-{
-	emitBranchZero(rs, target, fallthrough, a64::gt); // rs >  0
-}
-
-// *AL forms: the link is written unconditionally and *before* rs is read, matching
-// the interpreter's _SetLink ordering (so a degenerate rs==31 compares the link).
-void armEmitBLTZAL(u32 rs, u32 target, u32 fallthrough, u32 linkpc)
-{
-	emitWriteLink(31, linkpc);
-	emitBranchZero(rs, target, fallthrough, a64::lt);
-}
-
-void armEmitBGEZAL(u32 rs, u32 target, u32 fallthrough, u32 linkpc)
-{
-	emitWriteLink(31, linkpc);
-	emitBranchZero(rs, target, fallthrough, a64::ge);
-}
-
-// ------------------------------------------------------------------------
-// COP1 conditional branches BC1F/BC1T (opcode 0x11, rs==0x08, rt 0x00/0x01).
-// Branch on the FCR31 C (condition) bit set by the C.* compares. The likely
-// forms BC1FL/BC1TL (rt 0x02/0x03) are handled by armEmitBranchLikelyTest below.
-static constexpr u32 FPUflagC = 0x00800000;
-
-void armEmitBC1F(u32 target, u32 fallthrough)
-{
-	armAsm->Ldr(RSCRATCHW, a64::MemOperand(RESTATEPTR, EE_FPRC_OFFSET(31)));
-	armAsm->Tst(RSCRATCHW, FPUflagC);
-	emitSelectPc(target, fallthrough, a64::eq); // C == 0 -> branch
-}
-
-void armEmitBC1T(u32 target, u32 fallthrough)
-{
-	armAsm->Ldr(RSCRATCHW, a64::MemOperand(RESTATEPTR, EE_FPRC_OFFSET(31)));
-	armAsm->Tst(RSCRATCHW, FPUflagC);
-	emitSelectPc(target, fallthrough, a64::ne); // C != 0 -> branch
-}
-
-// ------------------------------------------------------------------------
-// COP2 conditional branches BC2F/BC2T (opcode 0x12, rs==0x08 (BC), rt 0x00/0x01).
-// Branch on the VU0 macro-mode condition bit VBS0: VU0.VI[REG_VPU_STAT].UL & 0x100
-// (CP2COND = bit 8). BC2F branches when the bit is CLEAR (CP2COND==0), BC2T when
-// SET (CP2COND==1) — matching the interpreter (COP2.cpp BC2F/BC2T) and x86
-// microVU_Macro.inl recBC2F/T (_setupBranchTest: TEST VPU_STAT,0x100 then
-// recBC2F=JNZ32 / recBC2T=JZ32, where the jmpType skips the taken path on the
-// opposite condition). This is purely a bit-test branch — x86 BC2 emits NO VU
-// sync / interlock / cycle commit, so neither do we (unlike the M3 transfer ops).
-// VU0.VI is global state (not RESTATEPTR-relative), so the address is materialized.
-// The likely forms BC2FL/BC2TL (rt 0x02/0x03) are in armEmitBranchLikelyTest below.
-static constexpr u32 VU0_VBS0 = 0x100;
-
-void armEmitBC2F(u32 target, u32 fallthrough)
-{
-	armMoveAddressToReg(RSCRATCHADDR, &VU0.VI[REG_VPU_STAT].UL);
-	armAsm->Ldr(RSCRATCHW, a64::MemOperand(RSCRATCHADDR));
-	armAsm->Tst(RSCRATCHW, VU0_VBS0);
-	emitSelectPc(target, fallthrough, a64::eq); // bit clear (CP2COND==0) -> branch
-}
-
-void armEmitBC2T(u32 target, u32 fallthrough)
-{
-	armMoveAddressToReg(RSCRATCHADDR, &VU0.VI[REG_VPU_STAT].UL);
-	armAsm->Ldr(RSCRATCHW, a64::MemOperand(RSCRATCHADDR));
-	armAsm->Tst(RSCRATCHW, VU0_VBS0);
-	emitSelectPc(target, fallthrough, a64::ne); // bit set (CP2COND==1) -> branch
-}
-
-// ------------------------------------------------------------------------
-// COP0 conditional branches BC0F/BC0T (opcode 0x10, rs==0x08 (BC), rt 0x00/0x01).
-// Branch on CPCOND0, the DMA-ready flag the EE polls while waiting for DMA to finish:
-//   CPCOND0 = (((dmacRegs.stat.CIS | ~dmacRegs.pcr.CPC) & 0x3FF) == 0x3FF)  (COP0.cpp:595)
-// i.e. true once every PCR-enabled DMA channel has its STAT interrupt bit set. The OR
-// form is emitted verbatim from CPCOND0() so the polarity is self-evident; CIS/CPC are
-// bits[9:0] of stat/pcr, so masking the 32-bit loads with 0x3FF is exact. dmacRegs is
-// global HW state (a reference into eeHw[0xE000]); materialize its base once and load
-// stat+pcr by offset — the second Ldr's destination (w17) reuses the base register, so
-// it must come last (the base is consumed for address-gen before being overwritten).
-// BC0T branches when CPCOND0==1, BC0F when ==0, matching the interpreter (COP0.cpp
-// BC0F/BC0T) and x86 iCOP0.cpp _setupBranchTest. No cycle commit / VU sync — a plain
-// HW-register-test branch like BC1/BC2. The likely forms BC0FL/BC0TL (rt 0x02/0x03)
-// are in armEmitBranchLikelyTest below.
-//
-// RSCRATCHADDR (x17) holds the base; RXVIXLSCRATCH (x16) accumulates the condition.
-// Every macro op below uses register operands or encodable immediates (Mvn/Orr regs,
-// And #0x3FF — 10-bit run of ones, Cmp #0x3FF — 12-bit arith imm), so VIXL never needs
-// x16 as a temp and it is safe to hold live across them.
-static void emitCpcond0Test()
-{
-	armMoveAddressToReg(RSCRATCHADDR, &dmacRegs);                                                    // x17 = &dmacRegs
-	armAsm->Ldr(RXVIXLSCRATCH.W(), a64::MemOperand(RSCRATCHADDR, offsetof(DMACregisters, pcr)));     // w16 = PCR (CPC)
-	armAsm->Ldr(RSCRATCHW, a64::MemOperand(RSCRATCHADDR, offsetof(DMACregisters, stat)));            // w17 = STAT (CIS); clobbers base last
-	armAsm->Mvn(RXVIXLSCRATCH.W(), RXVIXLSCRATCH.W());               // ~CPC
-	armAsm->Orr(RXVIXLSCRATCH.W(), RXVIXLSCRATCH.W(), RSCRATCHW);    // CIS | ~CPC
-	armAsm->And(RXVIXLSCRATCH.W(), RXVIXLSCRATCH.W(), 0x3FF);        // & 0x3FF (bits[9:0])
-	armAsm->Cmp(RXVIXLSCRATCH.W(), 0x3FF);                           // eq <=> CPCOND0 == 1
-}
-
-void armEmitBC0F(u32 target, u32 fallthrough)
-{
-	emitCpcond0Test();
-	emitSelectPc(target, fallthrough, a64::ne); // CPCOND0 == 0 -> branch
-}
-
-void armEmitBC0T(u32 target, u32 fallthrough)
-{
-	emitCpcond0Test();
-	emitSelectPc(target, fallthrough, a64::eq); // CPCOND0 == 1 -> branch
-}
-
-// ------------------------------------------------------------------------
-// Branch-likely forms. Evaluate the condition, write
-// cpuRegs.pc = taken ? target : fallthrough, and return the "taken" condition
-// with the flags still live (the Mov/Csel/Str of the PC select don't touch
-// flags), so the block compiler can branch around the nullified delay slot.
-// Forms: 0x14 BEQL, 0x15 BNEL, 0x16 BLEZL, 0x17 BGTZL,
-//        REGIMM rt 0x02 BLTZL / 0x03 BGEZL,
-//        COP1 rs==0x08, rt 0x02 BC1FL / 0x03 BC1TL,
-//        COP2 rs==0x08, rt 0x02 BC2FL / 0x03 BC2TL.
-// ------------------------------------------------------------------------
-vixl::aarch64::Condition armEmitBranchLikelyTest(u32 op, u32 target, u32 fallthrough)
-{
-	const u32 opcode = op >> 26;
-	const u32 rs = (op >> 21) & 0x1f;
-	const u32 rt = (op >> 16) & 0x1f;
-
-	a64::Condition taken = a64::nv;
-	switch (opcode)
+	if (GPR_IS_CONST2(rs, rt))
 	{
-		case 0x14: // BEQL
-		case 0x15: // BNEL
-			armAsm->Ldr(RSCRATCH, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-			armAsm->Ldr(RXVIXLSCRATCH, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt)));
-			armAsm->Cmp(RSCRATCH, RXVIXLSCRATCH);
-			taken = (opcode == 0x14) ? a64::eq : a64::ne;
-			break;
-
-		case 0x16: // BLEZL
-		case 0x17: // BGTZL
-			armAsm->Ldr(RSCRATCH, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-			armAsm->Cmp(RSCRATCH, 0);
-			taken = (opcode == 0x16) ? a64::le : a64::gt;
-			break;
-
-		case 0x01: // REGIMM: BLTZL (0x02) / BGEZL (0x03)
-			pxAssert(rt == 0x02 || rt == 0x03);
-			armAsm->Ldr(RSCRATCH, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-			armAsm->Cmp(RSCRATCH, 0);
-			taken = (rt == 0x02) ? a64::lt : a64::ge;
-			break;
-
-		case 0x11: // COP1: BC1FL (rt 0x02) / BC1TL (rt 0x03)
-			pxAssert(rs == 0x08 && (rt == 0x02 || rt == 0x03));
-			armAsm->Ldr(RSCRATCHW, a64::MemOperand(RESTATEPTR, EE_FPRC_OFFSET(31)));
-			armAsm->Tst(RSCRATCHW, FPUflagC);
-			taken = (rt == 0x02) ? a64::eq : a64::ne;
-			break;
-
-		case 0x12: // COP2: BC2FL (rt 0x02) / BC2TL (rt 0x03)
-			pxAssert(rs == 0x08 && (rt == 0x02 || rt == 0x03));
-			armMoveAddressToReg(RSCRATCHADDR, &VU0.VI[REG_VPU_STAT].UL);
-			armAsm->Ldr(RSCRATCHW, a64::MemOperand(RSCRATCHADDR));
-			armAsm->Tst(RSCRATCHW, VU0_VBS0);
-			taken = (rt == 0x02) ? a64::eq : a64::ne; // FL: bit clear; TL: bit set
-			break;
-
-		case 0x10: // COP0: BC0FL (rt 0x02) / BC0TL (rt 0x03)
-			pxAssert(rs == 0x08 && (rt == 0x02 || rt == 0x03));
-			emitCpcond0Test();                        // Cmp sets eq <=> CPCOND0 == 1
-			taken = (rt == 0x03) ? a64::eq : a64::ne; // TL: CPCOND0==1; FL: CPCOND0==0
-			break;
-
-		default:
-			pxFailRel("armEmitBranchLikelyTest: not a likely branch");
+		bool taken = false;
+		switch (cond)
+		{
+			case a64::eq: taken = (g_cpuConstRegs[rs].SD[0] == g_cpuConstRegs[rt].SD[0]); break;
+			case a64::ne: taken = (g_cpuConstRegs[rs].SD[0] != g_cpuConstRegs[rt].SD[0]); break;
+			default: break;
+		}
+		recompileNextInstruction(true, false);
+		SetBranchImm(taken ? branchTarget : fallthrough);
+		return;
 	}
 
-	emitSelectPc(target, fallthrough, taken);
-	return taken;
+	armLoadGPR64(RSCRATCHGPR, rs);
+	if (rt == 0)
+		armAsm->Cmp(RSCRATCHGPR, 0);
+	else
+	{
+		armLoadGPR64(RSCRATCHGPR2, rt);
+		armAsm->Cmp(RSCRATCHGPR, RSCRATCHGPR2);
+	}
+
+	// Cset into RDELAYSLOTGPR — survives the delay-slot emit so we can
+	// test it again after the flush.
+	armAsm->Cset(RDELAYSLOTGPR, cond);
+
+	// Pre-DS flush — gated on DS opcode safety. Most non-faulting ALU
+	// delay slots can skip this; only memory-access / trap-capable DSes
+	// need GPR memory coherent before DS execution.
+	armFlushConstRegsBeforeDS();
+	recompileNextInstruction(true, false);
+	armFlushConstRegs();
+
+	// WaitLoop-candidate blocks keep the non-split CSEL exit: iBranchTest
+	// will emit a fast-forward-and-jump-to-event tail, which direct-B
+	// linking would bypass (defeating the speedhack). Budget > correctness-
+	// preserving convergence with the interpreter.
+	const bool waitloop_fire = EmuConfig.Speedhacks.WaitLoop && s_nBlockFF;
+	if (waitloop_fire)
+	{
+		armAsm->Mov(RWSCRATCH, branchTarget);
+		armAsm->Mov(RWSCRATCH2, fallthrough);
+		armAsm->Cmp(RDELAYSLOTGPR, 0);
+		armAsm->Csel(RWSCRATCH, RWSCRATCH, RWSCRATCH2, a64::ne);
+		armAsm->Str(RWSCRATCH, a64::MemOperand(RCPUSTATE, PC_OFFSET));
+
+		g_branch = 1;
+		g_cpuFlushedPC = true;
+		return;
+	}
+
+	// Split exits. RDELAYSLOTGPR == 0 → not taken. Cbz keeps the test
+	// one insn and stays within range for the local label (±1 MB).
+	a64::Label not_taken;
+	armAsm->Cbz(RDELAYSLOTGPR, &not_taken);
+
+	// Taken path: write cpuRegs.pc = branchTarget and emit a linkable
+	// tail. emitEELinkableExit terminates (no fall-through) — the not-
+	// taken label binds immediately after.
+	armAsm->Mov(RWSCRATCH, branchTarget);
+	armAsm->Str(RWSCRATCH, a64::MemOperand(RCPUSTATE, PC_OFFSET));
+	emitEELinkableExit(branchTarget);
+
+	// Not-taken path: write cpuRegs.pc = fallthrough and let the block-
+	// end machinery (iBranchTest via s_eeLinkTarget = fallthrough) emit
+	// the not-taken linkable tail.
+	armAsm->Bind(&not_taken);
+	armAsm->Mov(RWSCRATCH, fallthrough);
+	armAsm->Str(RWSCRATCH, a64::MemOperand(RCPUSTATE, PC_OFFSET));
+
+	g_branch = 1;
+	g_cpuFlushedPC = true;
+	g_eeStaticBranchPC = fallthrough;
 }
+
+// Helper: for conditional branches comparing one GPR against zero. Same
+// split-exit strategy as recBranch_GPR64 — see that function's comments
+// for the shape rationale.
+static void recBranch_GPR64_vs_Zero(a64::Condition cond, int rs, u32 branchTarget, u32 fallthrough)
+{
+	if (GPR_IS_CONST1(rs))
+	{
+		bool taken = false;
+		s64 val = g_cpuConstRegs[rs].SD[0];
+		switch (cond)
+		{
+			case a64::ge: taken = (val >= 0); break;
+			case a64::lt: taken = (val < 0); break;
+			case a64::le: taken = (val <= 0); break;
+			case a64::gt: taken = (val > 0); break;
+			default: break;
+		}
+		recompileNextInstruction(true, false);
+		SetBranchImm(taken ? branchTarget : fallthrough);
+		return;
+	}
+
+	armLoadGPR64(RSCRATCHGPR, rs);
+	armAsm->Cmp(RSCRATCHGPR, 0);
+	armAsm->Cset(RDELAYSLOTGPR, cond);
+
+	// Pre-DS flush gated on DS safety (see armFlushConstRegsBeforeDS).
+	armFlushConstRegsBeforeDS();
+	recompileNextInstruction(true, false);
+	armFlushConstRegs();
+
+	// WaitLoop guard — see recBranch_GPR64 for rationale.
+	const bool waitloop_fire = EmuConfig.Speedhacks.WaitLoop && s_nBlockFF;
+	if (waitloop_fire)
+	{
+		armAsm->Mov(RWSCRATCH, branchTarget);
+		armAsm->Mov(RWSCRATCH2, fallthrough);
+		armAsm->Cmp(RDELAYSLOTGPR, 0);
+		armAsm->Csel(RWSCRATCH, RWSCRATCH, RWSCRATCH2, a64::ne);
+		armAsm->Str(RWSCRATCH, a64::MemOperand(RCPUSTATE, PC_OFFSET));
+
+		g_branch = 1;
+		g_cpuFlushedPC = true;
+		return;
+	}
+
+	a64::Label not_taken;
+	armAsm->Cbz(RDELAYSLOTGPR, &not_taken);
+
+	// Taken path.
+	armAsm->Mov(RWSCRATCH, branchTarget);
+	armAsm->Str(RWSCRATCH, a64::MemOperand(RCPUSTATE, PC_OFFSET));
+	emitEELinkableExit(branchTarget);
+
+	// Not-taken path — block-end iBranchTest emits its linkable tail.
+	armAsm->Bind(&not_taken);
+	armAsm->Mov(RWSCRATCH, fallthrough);
+	armAsm->Str(RWSCRATCH, a64::MemOperand(RCPUSTATE, PC_OFFSET));
+
+	g_branch = 1;
+	g_cpuFlushedPC = true;
+	g_eeStaticBranchPC = fallthrough;
+}
+
+// Helper: likely branch — if NOT taken, skip the delay slot entirely
+static void recBranch_GPR64_Likely(a64::Condition cond, int rs, int rt, u32 branchTarget, u32 fallthrough)
+{
+	if (GPR_IS_CONST2(rs, rt))
+	{
+		bool taken = false;
+		switch (cond)
+		{
+			case a64::eq: taken = (g_cpuConstRegs[rs].SD[0] == g_cpuConstRegs[rt].SD[0]); break;
+			case a64::ne: taken = (g_cpuConstRegs[rs].SD[0] != g_cpuConstRegs[rt].SD[0]); break;
+			default: break;
+		}
+		if (taken)
+		{
+			recompileNextInstruction(true, false);
+			SetBranchImm(branchTarget);
+		}
+		else
+		{
+			SetBranchImm(fallthrough);
+		}
+		return;
+	}
+
+	// Flush unconditionally up front — the not-taken path also exits the block,
+	// so any unflushed const-tracked GPRs must be written to memory regardless
+	// of which side of the branch we take. Const tracking itself is preserved
+	// (only the flushed bit is set), so subsequent armLoadGPR* still uses
+	// Mov-imm for any const operands. Flushing before the load also protects
+	// RSCRATCHGPR, which armFlushConstRegs uses internally as scratch.
+	armFlushConstRegs();
+
+	armLoadGPR64(RSCRATCHGPR, rs);
+	if (rt == 0)
+		armAsm->Cmp(RSCRATCHGPR, 0);
+	else
+	{
+		armLoadGPR64(RSCRATCHGPR2, rt);
+		armAsm->Cmp(RSCRATCHGPR, RSCRATCHGPR2);
+	}
+
+	// WaitLoop guard — see recBranch_GPR64 for rationale. Likely-variant
+	// twist: delay slot is conditional (executed only on taken side).
+	// We preserve that here by re-emitting the old combined path when
+	// the block is a wait-loop candidate.
+	const bool waitloop_fire = EmuConfig.Speedhacks.WaitLoop && s_nBlockFF;
+	if (waitloop_fire)
+	{
+		a64::Label skipDS_wl, done_wl;
+		armAsm->B(&skipDS_wl, a64::InvertCondition(cond));
+		recompileNextInstruction(true, false);
+		armFlushConstRegs();
+		armAsm->Mov(RWSCRATCH, branchTarget);
+		armAsm->Str(RWSCRATCH, a64::MemOperand(RCPUSTATE, PC_OFFSET));
+		armAsm->B(&done_wl);
+		armAsm->Bind(&skipDS_wl);
+		armAsm->Mov(RWSCRATCH, fallthrough);
+		armAsm->Str(RWSCRATCH, a64::MemOperand(RCPUSTATE, PC_OFFSET));
+		armAsm->Bind(&done_wl);
+		g_branch = 1;
+		g_cpuFlushedPC = true;
+		return;
+	}
+
+	// If condition is NOT met, skip the delay slot and go to fallthrough.
+	// Both paths emit their own linkable exit — taken inline here, not-
+	// taken via g_eeStaticBranchPC routed through block-end iBranchTest.
+	a64::Label skipDelaySlot;
+	armAsm->B(&skipDelaySlot, a64::InvertCondition(cond));
+
+	// Condition met: execute delay slot, then exit to target with a
+	// linkable tail. emitEELinkableExit terminates (no fall-through).
+	recompileNextInstruction(true, false);
+	armFlushConstRegs();
+	armAsm->Mov(RWSCRATCH, branchTarget);
+	armAsm->Str(RWSCRATCH, a64::MemOperand(RCPUSTATE, PC_OFFSET));
+	emitEELinkableExit(branchTarget);
+
+	// Not taken: skip delay slot, PC = fallthrough. Block-end iBranchTest
+	// emits the linkable tail.
+	armAsm->Bind(&skipDelaySlot);
+	armAsm->Mov(RWSCRATCH, fallthrough);
+	armAsm->Str(RWSCRATCH, a64::MemOperand(RCPUSTATE, PC_OFFSET));
+
+	g_branch = 1;
+	g_cpuFlushedPC = true;
+	g_eeStaticBranchPC = fallthrough;
+}
+
+static void recBranch_GPR64_vs_Zero_Likely(a64::Condition cond, int rs, u32 branchTarget, u32 fallthrough)
+{
+	if (GPR_IS_CONST1(rs))
+	{
+		bool taken = false;
+		s64 val = g_cpuConstRegs[rs].SD[0];
+		switch (cond)
+		{
+			case a64::ge: taken = (val >= 0); break;
+			case a64::lt: taken = (val < 0); break;
+			case a64::le: taken = (val <= 0); break;
+			case a64::gt: taken = (val > 0); break;
+			default: break;
+		}
+		if (taken)
+		{
+			recompileNextInstruction(true, false);
+			SetBranchImm(branchTarget);
+		}
+		else
+		{
+			SetBranchImm(fallthrough);
+		}
+		return;
+	}
+
+	// Flush unconditionally up front — see recBranch_GPR64_Likely for rationale.
+	// Both paths exit the block, so consts must hit memory before either side.
+	// Flushing before the load also protects RSCRATCHGPR (used internally by
+	// the flush as scratch) so the Tbz/Tbnz below sees the loaded value.
+	armFlushConstRegs();
+
+	armLoadGPR64(RSCRATCHGPR, rs);
+
+	// WaitLoop guard — see recBranch_GPR64 for rationale.
+	const bool waitloop_fire = EmuConfig.Speedhacks.WaitLoop && s_nBlockFF;
+	if (waitloop_fire)
+	{
+		a64::Label skipDS_wl, done_wl;
+		if (cond == a64::lt)
+			armAsm->Tbz(RSCRATCHGPR, 63, &skipDS_wl);
+		else if (cond == a64::ge)
+			armAsm->Tbnz(RSCRATCHGPR, 63, &skipDS_wl);
+		else
+		{
+			armAsm->Cmp(RSCRATCHGPR, 0);
+			armAsm->B(&skipDS_wl, a64::InvertCondition(cond));
+		}
+		recompileNextInstruction(true, false);
+		armFlushConstRegs();
+		armAsm->Mov(RWSCRATCH, branchTarget);
+		armAsm->Str(RWSCRATCH, a64::MemOperand(RCPUSTATE, PC_OFFSET));
+		armAsm->B(&done_wl);
+		armAsm->Bind(&skipDS_wl);
+		armAsm->Mov(RWSCRATCH, fallthrough);
+		armAsm->Str(RWSCRATCH, a64::MemOperand(RCPUSTATE, PC_OFFSET));
+		armAsm->Bind(&done_wl);
+		g_branch = 1;
+		g_cpuFlushedPC = true;
+		return;
+	}
+
+	// For lt/ge, use Tbz/Tbnz to test sign bit directly (1 instruction vs 2)
+	a64::Label skipDelaySlot;
+	if (cond == a64::lt)
+		armAsm->Tbz(RSCRATCHGPR, 63, &skipDelaySlot);
+	else if (cond == a64::ge)
+		armAsm->Tbnz(RSCRATCHGPR, 63, &skipDelaySlot);
+	else
+	{
+		armAsm->Cmp(RSCRATCHGPR, 0);
+		armAsm->B(&skipDelaySlot, a64::InvertCondition(cond));
+	}
+
+	// Condition met: execute delay slot, then exit to target with a
+	// linkable tail. emitEELinkableExit terminates (no fall-through).
+	recompileNextInstruction(true, false);
+	armFlushConstRegs();
+	armAsm->Mov(RWSCRATCH, branchTarget);
+	armAsm->Str(RWSCRATCH, a64::MemOperand(RCPUSTATE, PC_OFFSET));
+	emitEELinkableExit(branchTarget);
+
+	// Not taken: skip delay slot, PC = fallthrough. Block-end iBranchTest
+	// emits the linkable tail.
+	armAsm->Bind(&skipDelaySlot);
+	armAsm->Mov(RWSCRATCH, fallthrough);
+	armAsm->Str(RWSCRATCH, a64::MemOperand(RCPUSTATE, PC_OFFSET));
+
+	g_branch = 1;
+	g_cpuFlushedPC = true;
+	g_eeStaticBranchPC = fallthrough;
+}
+
+#endif // at least one native branch
+
+// ============================================================================
+//  Instruction implementations
+// ============================================================================
+
+namespace R5900 {
+namespace Dynarec {
+namespace OpcodeImpl {
+
+// ---- BEQ ----
+#if ISTUB_BEQ
+void recBEQ() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::BEQ); }
+#else
+void recBEQ()
+{
+	u32 branchTarget = ((s32)_Imm_ * 4) + pc;
+	u32 fallthrough = pc + 4;
+
+	if (_Rs_ == _Rt_)
+	{
+		recompileNextInstruction(true, false);
+		SetBranchImm(branchTarget);
+		return;
+	}
+
+	recBranch_GPR64(a64::eq, _Rs_, _Rt_, branchTarget, fallthrough);
+}
+#endif
+
+// ---- BNE ----
+#if ISTUB_BNE
+void recBNE() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::BNE); }
+#else
+void recBNE()
+{
+	u32 branchTarget = ((s32)_Imm_ * 4) + pc;
+	u32 fallthrough = pc + 4;
+
+	if (_Rs_ == _Rt_)
+	{
+		// rs != rs is always false
+		recompileNextInstruction(true, false);
+		SetBranchImm(fallthrough);
+		return;
+	}
+
+	recBranch_GPR64(a64::ne, _Rs_, _Rt_, branchTarget, fallthrough);
+}
+#endif
+
+// ---- BEQL ----
+#if ISTUB_BEQL
+void recBEQL() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::BEQL); }
+#else
+void recBEQL()
+{
+	u32 branchTarget = ((s32)_Imm_ * 4) + pc;
+	u32 fallthrough = pc + 4;
+
+	if (_Rs_ == _Rt_)
+	{
+		recompileNextInstruction(true, false);
+		SetBranchImm(branchTarget);
+		return;
+	}
+
+	recBranch_GPR64_Likely(a64::eq, _Rs_, _Rt_, branchTarget, fallthrough);
+}
+#endif
+
+// ---- BNEL ----
+#if ISTUB_BNEL
+void recBNEL() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::BNEL); }
+#else
+void recBNEL()
+{
+	u32 branchTarget = ((s32)_Imm_ * 4) + pc;
+	u32 fallthrough = pc + 4;
+
+	if (_Rs_ == _Rt_)
+	{
+		// Likely: not taken → skip delay slot
+		SetBranchImm(fallthrough);
+		return;
+	}
+
+	recBranch_GPR64_Likely(a64::ne, _Rs_, _Rt_, branchTarget, fallthrough);
+}
+#endif
+
+// ---- BGEZ ----
+#if ISTUB_BGEZ
+void recBGEZ() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::BGEZ); }
+#else
+void recBGEZ()
+{
+	u32 branchTarget = ((s32)_Imm_ * 4) + pc;
+	u32 fallthrough = pc + 4;
+
+	if (!_Rs_)
+	{
+		// 0 >= 0 is always true
+		recompileNextInstruction(true, false);
+		SetBranchImm(branchTarget);
+		return;
+	}
+
+	recBranch_GPR64_vs_Zero(a64::ge, _Rs_, branchTarget, fallthrough);
+}
+#endif
+
+// ---- BGTZ ----
+#if ISTUB_BGTZ
+void recBGTZ() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::BGTZ); }
+#else
+void recBGTZ()
+{
+	u32 branchTarget = ((s32)_Imm_ * 4) + pc;
+	u32 fallthrough = pc + 4;
+
+	if (!_Rs_)
+	{
+		// 0 > 0 is always false
+		recompileNextInstruction(true, false);
+		SetBranchImm(fallthrough);
+		return;
+	}
+
+	recBranch_GPR64_vs_Zero(a64::gt, _Rs_, branchTarget, fallthrough);
+}
+#endif
+
+// ---- BLEZ ----
+#if ISTUB_BLEZ
+void recBLEZ() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::BLEZ); }
+#else
+void recBLEZ()
+{
+	u32 branchTarget = ((s32)_Imm_ * 4) + pc;
+	u32 fallthrough = pc + 4;
+
+	if (!_Rs_)
+	{
+		// 0 <= 0 is always true
+		recompileNextInstruction(true, false);
+		SetBranchImm(branchTarget);
+		return;
+	}
+
+	recBranch_GPR64_vs_Zero(a64::le, _Rs_, branchTarget, fallthrough);
+}
+#endif
+
+// ---- BLTZ ----
+#if ISTUB_BLTZ
+void recBLTZ() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::BLTZ); }
+#else
+void recBLTZ()
+{
+	u32 branchTarget = ((s32)_Imm_ * 4) + pc;
+	u32 fallthrough = pc + 4;
+
+	if (!_Rs_)
+	{
+		// 0 < 0 is always false
+		recompileNextInstruction(true, false);
+		SetBranchImm(fallthrough);
+		return;
+	}
+
+	recBranch_GPR64_vs_Zero(a64::lt, _Rs_, branchTarget, fallthrough);
+}
+#endif
+
+// ---- BGEZL ----
+#if ISTUB_BGEZL
+void recBGEZL() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::BGEZL); }
+#else
+void recBGEZL()
+{
+	u32 branchTarget = ((s32)_Imm_ * 4) + pc;
+	u32 fallthrough = pc + 4;
+
+	if (!_Rs_)
+	{
+		recompileNextInstruction(true, false);
+		SetBranchImm(branchTarget);
+		return;
+	}
+
+	recBranch_GPR64_vs_Zero_Likely(a64::ge, _Rs_, branchTarget, fallthrough);
+}
+#endif
+
+// ---- BGTZL ----
+#if ISTUB_BGTZL
+void recBGTZL() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::BGTZL); }
+#else
+void recBGTZL()
+{
+	u32 branchTarget = ((s32)_Imm_ * 4) + pc;
+	u32 fallthrough = pc + 4;
+
+	if (!_Rs_)
+	{
+		SetBranchImm(fallthrough);
+		return;
+	}
+
+	recBranch_GPR64_vs_Zero_Likely(a64::gt, _Rs_, branchTarget, fallthrough);
+}
+#endif
+
+// ---- BLEZL ----
+#if ISTUB_BLEZL
+void recBLEZL() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::BLEZL); }
+#else
+void recBLEZL()
+{
+	u32 branchTarget = ((s32)_Imm_ * 4) + pc;
+	u32 fallthrough = pc + 4;
+
+	if (!_Rs_)
+	{
+		recompileNextInstruction(true, false);
+		SetBranchImm(branchTarget);
+		return;
+	}
+
+	recBranch_GPR64_vs_Zero_Likely(a64::le, _Rs_, branchTarget, fallthrough);
+}
+#endif
+
+// ---- BLTZL ----
+#if ISTUB_BLTZL
+void recBLTZL() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::BLTZL); }
+#else
+void recBLTZL()
+{
+	u32 branchTarget = ((s32)_Imm_ * 4) + pc;
+	u32 fallthrough = pc + 4;
+
+	if (!_Rs_)
+	{
+		SetBranchImm(fallthrough);
+		return;
+	}
+
+	recBranch_GPR64_vs_Zero_Likely(a64::lt, _Rs_, branchTarget, fallthrough);
+}
+#endif
+
+// ---- BGEZAL ----
+#if ISTUB_BGEZAL
+void recBGEZAL() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::BGEZAL); }
+#else
+void recBGEZAL()
+{
+	u32 branchTarget = ((s32)_Imm_ * 4) + pc;
+	u32 fallthrough = pc + 4;
+
+	g_cpuConstRegs[31].SD[0] = (s32)(pc + 4);
+	GPR_SET_CONST(31);
+
+	if (!_Rs_)
+	{
+		recompileNextInstruction(true, false);
+		SetBranchImm(branchTarget);
+		return;
+	}
+
+	recBranch_GPR64_vs_Zero(a64::ge, _Rs_, branchTarget, fallthrough);
+}
+#endif
+
+// ---- BLTZAL ----
+#if ISTUB_BLTZAL
+void recBLTZAL() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::BLTZAL); }
+#else
+void recBLTZAL()
+{
+	u32 branchTarget = ((s32)_Imm_ * 4) + pc;
+	u32 fallthrough = pc + 4;
+
+	g_cpuConstRegs[31].SD[0] = (s32)(pc + 4);
+	GPR_SET_CONST(31);
+
+	if (!_Rs_)
+	{
+		recompileNextInstruction(true, false);
+		SetBranchImm(fallthrough);
+		return;
+	}
+
+	recBranch_GPR64_vs_Zero(a64::lt, _Rs_, branchTarget, fallthrough);
+}
+#endif
+
+// ---- BGEZALL ----
+#if ISTUB_BGEZALL
+void recBGEZALL() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::BGEZALL); }
+#else
+void recBGEZALL()
+{
+	u32 branchTarget = ((s32)_Imm_ * 4) + pc;
+	u32 fallthrough = pc + 4;
+
+	g_cpuConstRegs[31].SD[0] = (s32)(pc + 4);
+	GPR_SET_CONST(31);
+
+	if (!_Rs_)
+	{
+		recompileNextInstruction(true, false);
+		SetBranchImm(branchTarget);
+		return;
+	}
+
+	recBranch_GPR64_vs_Zero_Likely(a64::ge, _Rs_, branchTarget, fallthrough);
+}
+#endif
+
+// ---- BLTZALL ----
+#if ISTUB_BLTZALL
+void recBLTZALL() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::BLTZALL); }
+#else
+void recBLTZALL()
+{
+	u32 branchTarget = ((s32)_Imm_ * 4) + pc;
+	u32 fallthrough = pc + 4;
+
+	g_cpuConstRegs[31].SD[0] = (s32)(pc + 4);
+	GPR_SET_CONST(31);
+
+	if (!_Rs_)
+	{
+		SetBranchImm(fallthrough);
+		return;
+	}
+
+	recBranch_GPR64_vs_Zero_Likely(a64::lt, _Rs_, branchTarget, fallthrough);
+}
+#endif
+
+// ---- J ----
+// Target: upper 4 bits come from the delay-slot address (= `pc` at entry here,
+// since the recompiler's `pc` is already pointing at the delay slot), not from
+// pc+4. Matches x86 recJ (iR5900Jump.cpp:34).
+#if ISTUB_J
+void recJ() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::J); }
+#else
+void recJ()
+{
+	u32 target = (_Target_ << 2) | (pc & 0xf0000000);
+	recompileNextInstruction(true, false);
+	SetBranchImm(target);
+}
+#endif
+
+// ---- JAL ----
+// Fully mirrors x86 recJAL (iR5900Jump.cpp:43-66), including its
+// _deleteEEreg(31, 0) prologue which we'd previously skipped on the assumption
+// the GPR cache / const tracker were clean at op entry. That assumption was
+// load-bearing and GT4 proved it unreliable — something was leaving stale
+// state for $ra across ops.
+//
+// Structural mapping x86 → arm64:
+//   _deleteEEreg(31, 0) with flush=0:
+//     - _deleteGPRtoX86reg(31, DELETE_REG_FLUSH_AND_FREE)   → armGprInvalidate(31)
+//     - GPR_DEL_CONST(31)                                   → GPR_DEL_CONST(31)
+//     - (no const flush emitted — we're about to overwrite)
+//
+// Value fixes vs. the old (disabled) arm64 implementation:
+//   1. Target upper 4 bits come from `pc & 0xf0000000`, not `(pc+4) & …`.
+//      In this recompiler pc at op entry IS the delay-slot address, so
+//      the +4 pulled the wrong 256MB segment at boundaries.
+//   2. Link address written as zero-extended u32 (UL[0] = pc+4, UL[1] = 0),
+//      not sign-extended s32 → s64. The old SD[0] = (s32)(pc+4) stored
+//      0xFFFFFFFF???????? in the upper half for any pc+4 ≥ 0x80000000
+//      (BIOS / kseg0 / kseg1), silently corrupting $ra.
+#if ISTUB_JAL
+void recJAL() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::JAL); }
+#else
+void recJAL()
+{
+	// Runtime kill-switch for A/B against the interp stub (see ISTUB_JAL note).
+	static const bool interp_forced = []() {
+		const char* v = std::getenv("ARMSX2_JAL_INTERP");
+		return v && v[0] == '1';
+	}();
+	if (interp_forced)
+	{
+		armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::JAL);
+		return;
+	}
+
+	u32 target = (_Target_ << 2) | (pc & 0xf0000000);
+
+	// Match x86's _deleteEEreg(31, 0): drop any host cache slot and clear the
+	// const-tracker bit for $ra before installing the new link value.
+	armGprInvalidate(31);
+	GPR_DEL_CONST(31);
+
+	g_cpuConstRegs[31].UL[0] = pc + 4;
+	g_cpuConstRegs[31].UL[1] = 0;
+	GPR_SET_CONST(31);
+
+	recompileNextInstruction(true, false);
+	SetBranchImm(target);
+}
+#endif
+
+// ---- JR ----
+#if ISTUB_JR
+void recJR() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::JR); }
+#else
+void recJR()
+{
+	armLoadGPR64(RDELAYSLOTGPR, _Rs_);
+
+	// Pre-DS flush gated on DS safety (see armFlushConstRegsBeforeDS).
+	armFlushConstRegsBeforeDS();
+	recompileNextInstruction(true, false);
+	armFlushConstRegs();
+
+	armAsm->Str(RWDELAYSLOT, a64::MemOperand(RCPUSTATE, PC_OFFSET));
+
+	g_branch = 1;
+	g_cpuFlushedPC = true;
+}
+#endif
+
+// ---- JALR ----
+// MIPS spec: rd is encoded in the instruction and can be any GPR, including
+// $zero (r0). When rd == 0 the link write is discarded (hardware behavior on
+// $zero) and the op degenerates to JR. Matches x86 recJALR (iR5900Jump.cpp:145):
+// `if (_Rd_) { ...write link... }` — NO fallback to r31.
+//
+// Link write is zero-extended u32 (UL[0] = pc+4, UL[1] = 0), matching the
+// same invariant fixed in recJAL above.
+#if ISTUB_JALR
+void recJALR() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::JALR); }
+#else
+void recJALR()
+{
+	armLoadGPR64(RDELAYSLOTGPR, _Rs_);
+
+	if (_Rd_)
+	{
+		// Match x86 _deleteEEreg(_Rd_, 0): drop host cache + const tracker
+		// for the link register before installing the new link value.
+		armGprInvalidate(_Rd_);
+		GPR_DEL_CONST(_Rd_);
+
+		g_cpuConstRegs[_Rd_].UL[0] = pc + 4;
+		g_cpuConstRegs[_Rd_].UL[1] = 0;
+		GPR_SET_CONST(_Rd_);
+	}
+
+	// Pre-DS flush gated on DS safety (see armFlushConstRegsBeforeDS).
+	armFlushConstRegsBeforeDS();
+	recompileNextInstruction(true, false);
+	armFlushConstRegs();
+
+	armAsm->Str(RWDELAYSLOT, a64::MemOperand(RCPUSTATE, PC_OFFSET));
+
+	g_branch = 1;
+	g_cpuFlushedPC = true;
+}
+#endif
+
+// ---- SYSCALL ----
+#if ISTUB_SYSCALL
+void recSYSCALL() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::SYSCALL); }
+#else
+void recSYSCALL()
+{
+	// Interpreter SYSCALL does cpuRegs.pc -= 4 internally, so flush pc as-is
+	// (pc = SYSCALL_addr + 4, interpreter subtracts to get SYSCALL_addr)
+	armFlushPC();
+	armFlushCode();
+	armFlushConstRegs();
+
+	armEmitCall((const void*)R5900::Interpreter::OpcodeImpl::SYSCALL);
+
+	// Interpreter may modify any GPR/PC — clear all const tracking
+	g_cpuHasConstReg = 1;
+	g_cpuFlushedConstReg = 1;
+	g_branch = 2;
+	g_cpuFlushedPC = true;
+}
+#endif
+
+// ---- BREAK ----
+#if ISTUB_BREAK
+void recBREAK() { armBranchCallInterpreter(R5900::Interpreter::OpcodeImpl::BREAK); }
+#else
+void recBREAK()
+{
+	// Interpreter BREAK does cpuRegs.pc -= 4 internally, so flush pc as-is
+	armFlushPC();
+	armFlushCode();
+	armFlushConstRegs();
+
+	armEmitCall((const void*)R5900::Interpreter::OpcodeImpl::BREAK);
+
+	// Interpreter may modify any GPR/PC — clear all const tracking
+	g_cpuHasConstReg = 1;
+	g_cpuFlushedConstReg = 1;
+	g_branch = 2;
+	g_cpuFlushedPC = true;
+}
+#endif
+
+} // namespace OpcodeImpl
+} // namespace Dynarec
+} // namespace R5900

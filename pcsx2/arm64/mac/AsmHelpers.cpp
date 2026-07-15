@@ -1,12 +1,16 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-FileCopyrightText: 2026 isztld <https://isztld.com/>
 // SPDX-License-Identifier: GPL-3.0
 
-#include "arm64/AsmHelpers.h"
+#include "arm64/mac/AsmHelpers.h"
 
 #include "common/Assertions.h"
 #include "common/BitUtils.h"
 #include "common/Console.h"
 #include "common/HostSys.h"
+
+
+namespace pcsx2_macrec {
 
 const vixl::aarch64::Register& armWRegister(int n)
 {
@@ -96,10 +100,6 @@ void armAlignAsmPtr()
 	armAsmPtr = new_ptr;
 }
 
-// Use placement new with a thread-local buffer to avoid heap alloc/free cycles
-// for the MacroAssembler, which can trigger scudo tag/header corruption on Android.
-alignas(alignof(a64::MacroAssembler)) static thread_local u8 s_masmStorage[sizeof(a64::MacroAssembler)];
-
 u8* armStartBlock()
 {
 	armAlignAsmPtr();
@@ -107,7 +107,7 @@ u8* armStartBlock()
 	HostSys::BeginCodeWrite();
 
 	pxAssert(!armAsm);
-	armAsm = new (s_masmStorage) a64::MacroAssembler(static_cast<vixl::byte*>(armAsmPtr), armAsmCapacity);
+	armAsm = new vixl::aarch64::MacroAssembler(static_cast<vixl::byte*>(armAsmPtr), armAsmCapacity);
 	armAsm->GetScratchVRegisterList()->Remove(31);
 	armAsm->GetScratchRegisterList()->Remove(RSCRATCHADDR.GetCode());
 	return armAsmPtr;
@@ -122,7 +122,7 @@ u8* armEndBlock()
 	const u32 size = static_cast<u32>(armAsm->GetSizeOfCodeGenerated());
 	pxAssert(size < armAsmCapacity);
 
-	armAsm->~MacroAssembler();
+	delete armAsm;
 	armAsm = nullptr;
 
 	HostSys::EndCodeWrite();
@@ -199,22 +199,6 @@ void armEmitCall(const void* ptr, bool force_inline)
 		a64::SingleEmissionCheckScope guard(armAsm);
 		armAsm->bl(displacement);
 	}
-}
-
-void armEmitJmpPtr(void* code_address, const void* target, bool flush_icache)
-{
-	const s64 displacement = GetPCDisplacement(code_address, target);
-	pxAssert(vixl::IsInt26(displacement));
-
-	// ARM64 B (unconditional branch): 0b000101 | imm26
-	u32 insn = 0x14000000u | (static_cast<u32>(displacement) & 0x03FFFFFFu);
-
-	HostSys::BeginCodeWrite();
-	std::memcpy(code_address, &insn, sizeof(insn));
-	HostSys::EndCodeWrite();
-
-	if (flush_icache)
-		HostSys::FlushInstructionCache(code_address, 4);
 }
 
 void armEmitCbnz(const vixl::aarch64::Register& reg, const void* ptr)
@@ -479,3 +463,6 @@ void ArmConstantPool::EmitLoadLiteral(const vixl::aarch64::CPURegister& reg, con
 	armMoveAddressToReg(RXVIXLSCRATCH, literal);
 	armAsm->Ldr(reg, a64::MemOperand(RXVIXLSCRATCH));
 }
+
+
+} // namespace pcsx2_macrec

@@ -1,1333 +1,1558 @@
-// SPDX-FileCopyrightText: 2026 isztld <https://isztld.com/>
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
-// SPDX-License-Identifier: GPL-3.0+
-
-// ARM64 EE (R5900) recompiler — MMI 128-bit SIMD codegen (Phase 5.4).
+// SPDX-License-Identifier: GPL-3.0
 //
-// The R5900's MMI group operates on the full 128-bit GPRs as packed vectors of
-// bytes / halfwords / words / doublewords. These map almost one-for-one onto
-// ARM64 NEON, so each generator loads GPR[rs]/GPR[rt] into scratch q-registers,
-// runs a single NEON instruction, and stores the q-register back to GPR[rd].
+// ARM64 EE Recompiler — MMI (MultiMedia Instructions)
+// Packed SIMD ops: PADD*/PSUB*, PCGT*, PMAX/MIN*, PCEQ*, PABS*,
+// PSxx shifts, PEXTL*/PPAC*/PEXTU*, PINTH/PINTEH, PADSBH,
+// PAND/POR/PXOR/PNOR, PMFHI/LO, PMTHI/LO, PCPYLD/UD,
+// PREVH, PCPYH, PLZCW, PEXEH/PEXEW/PEXCH/PEXCW, PROT3W,
+// PSLLVW/PSRLVW/PSRAVW, and more.
 //
-// Guest GPRs are stored little-endian in cpuRegs, so a NEON 128-bit load places
-// guest element 0 (UL[0]/US[0]/UC[0]/UD[0]) into NEON lane 0 — the lane ordering
-// matches the interpreter's index ordering exactly (no shuffling needed).
-//
-// Ground truth is pcsx2/MMI.cpp (the interpreter). Each mapping below is chosen
-// to reproduce that behaviour bit-for-bit:
-//   PADD*/PSUB*       -> Add / Sub            (wrapping element add/subtract)
-//   PADDS*/PSUBS*     -> Sqadd / Sqsub        (signed saturating)
-//   PADDU*/PSUBU*     -> Uqadd / Uqsub        (unsigned saturating)
-//   PCGT*             -> Cmgt (signed)        (Rs > Rt -> all-ones mask)
-//   PCEQ*             -> Cmeq                 (Rs == Rt -> all-ones mask)
-//   PMAX*/PMIN*       -> Smax / Smin          (signed)
-//   PABSW/PABSH       -> Sqabs               (saturating abs: 0x8000.. -> 0x7FFF..)
-//   PAND/POR/PXOR     -> And / Orr / Eor
-//   PNOR              -> Orr then Not
-//   PEXTL*/PEXTU*     -> Zip1 / Zip2 (rt,rs)  (interleave low/high halves)
-//   PPAC*             -> Uzp1 (rt,rs)         (pack: keep even-indexed elements)
-//   PCPYLD            -> Zip1 .2D (rt,rs)     (Rd = Rs.lo : Rt.lo)
-//   PCPYUD            -> Zip2 .2D (rs,rt)     (Rd = Rt.hi : Rs.hi)
-//   PCPYH             -> broadcast US[0]/US[4] into the low/high doublewords
-//
-// Operand order matters for the non-commutative ops: the pack/interleave/PCPYLD
-// generators feed (rt, rs) into the NEON op because the interpreter takes Rt as
-// the low/even source. $zero destination writes are discarded.
+// Native implementations use ARM64 NEON 128-bit SIMD instructions.
+// Complex or rarely-used ops remain as interpreter stubs (ISTUB=1).
 
-#include "aR5900.h"
+#include "Common.h"
+#include "R5900OpcodeTables.h"
+#include "arm64/arm64Emitter.h"
 
-#include "R5900.h"
+using namespace R5900;
 
-namespace a64 = vixl::aarch64;
+namespace R5900 {
+namespace Dynarec {
+namespace OpcodeImpl {
+namespace MMI {
 
-// Scratch q-registers (caller-saved NEON, not held across any external call):
-//   VS = GPR[rs], VT = GPR[rt], VD = result.  Same physical regs as the shared
-//   RQSCRATCH/RQSCRATCH2/RQSCRATCH3 (q30/q31/q29).
-static const a64::VRegister VS = a64::VRegister(30, 128);
-static const a64::VRegister VT = a64::VRegister(31, 128);
-static const a64::VRegister VD = a64::VRegister(29, 128);
+// ============================================================================
+//  INTERP_MMI master switch: ALL ops become unconditional interpreter stubs.
+//  No templates, no _Rd_ guards, no NEON code — just plain interpreter calls.
+// ============================================================================
 
-static void loadQ(const a64::VRegister& v, u32 n)
+#if defined(INTERP_MMI) || defined(INTERP_EE)
+
+#define REC_MMI_STUB(name) \
+	void rec##name() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::name); }
+
+// MMI main
+REC_MMI_STUB(PLZCW)
+REC_MMI_STUB(PMFHL)
+REC_MMI_STUB(PMTHL)
+REC_MMI_STUB(PSLLH)
+REC_MMI_STUB(PSRLH)
+REC_MMI_STUB(PSRAH)
+REC_MMI_STUB(PSLLW)
+REC_MMI_STUB(PSRLW)
+REC_MMI_STUB(PSRAW)
+
+// MMI0
+REC_MMI_STUB(PADDW)
+REC_MMI_STUB(PSUBW)
+REC_MMI_STUB(PCGTW)
+REC_MMI_STUB(PMAXW)
+REC_MMI_STUB(PADDH)
+REC_MMI_STUB(PSUBH)
+REC_MMI_STUB(PCGTH)
+REC_MMI_STUB(PMAXH)
+REC_MMI_STUB(PADDB)
+REC_MMI_STUB(PSUBB)
+REC_MMI_STUB(PCGTB)
+REC_MMI_STUB(PADDSW)
+REC_MMI_STUB(PSUBSW)
+REC_MMI_STUB(PEXTLW)
+REC_MMI_STUB(PPACW)
+REC_MMI_STUB(PADDSH)
+REC_MMI_STUB(PSUBSH)
+REC_MMI_STUB(PEXTLH)
+REC_MMI_STUB(PPACH)
+REC_MMI_STUB(PADDSB)
+REC_MMI_STUB(PSUBSB)
+REC_MMI_STUB(PEXTLB)
+REC_MMI_STUB(PPACB)
+REC_MMI_STUB(PEXT5)
+REC_MMI_STUB(PPAC5)
+
+// MMI1
+REC_MMI_STUB(PABSW)
+REC_MMI_STUB(PCEQW)
+REC_MMI_STUB(PMINW)
+REC_MMI_STUB(PADSBH)
+REC_MMI_STUB(PABSH)
+REC_MMI_STUB(PCEQH)
+REC_MMI_STUB(PMINH)
+REC_MMI_STUB(PCEQB)
+REC_MMI_STUB(PADDUW)
+REC_MMI_STUB(PSUBUW)
+REC_MMI_STUB(PEXTUW)
+REC_MMI_STUB(PADDUH)
+REC_MMI_STUB(PSUBUH)
+REC_MMI_STUB(PEXTUH)
+REC_MMI_STUB(PADDUB)
+REC_MMI_STUB(PSUBUB)
+REC_MMI_STUB(PEXTUB)
+REC_MMI_STUB(QFSRV)
+
+// MMI2
+REC_MMI_STUB(PMADDW)
+REC_MMI_STUB(PSLLVW)
+REC_MMI_STUB(PMSUBW)
+REC_MMI_STUB(PMFHI)
+REC_MMI_STUB(PMFLO)
+REC_MMI_STUB(PINTH)
+REC_MMI_STUB(PMULTW)
+REC_MMI_STUB(PDIVW)
+REC_MMI_STUB(PCPYLD)
+REC_MMI_STUB(PMADDH)
+REC_MMI_STUB(PHMADH)
+REC_MMI_STUB(PAND)
+REC_MMI_STUB(PXOR)
+REC_MMI_STUB(PMSUBH)
+REC_MMI_STUB(PHMSBH)
+REC_MMI_STUB(PEXEH)
+REC_MMI_STUB(PREVH)
+REC_MMI_STUB(PMULTH)
+REC_MMI_STUB(PDIVBW)
+REC_MMI_STUB(PEXEW)
+REC_MMI_STUB(PROT3W)
+
+// MMI3
+REC_MMI_STUB(PMADDUW)
+REC_MMI_STUB(PSRLVW)
+REC_MMI_STUB(PSRAVW)
+REC_MMI_STUB(PMTHI)
+REC_MMI_STUB(PMTLO)
+REC_MMI_STUB(PINTEH)
+REC_MMI_STUB(PCPYUD)
+REC_MMI_STUB(POR)
+REC_MMI_STUB(PNOR)
+REC_MMI_STUB(PMULTUW)
+REC_MMI_STUB(PDIVUW)
+REC_MMI_STUB(PEXCH)
+REC_MMI_STUB(PCPYH)
+REC_MMI_STUB(PEXCW)
+
+#undef REC_MMI_STUB
+
+#else // !INTERP_MMI — native NEON implementations with per-op ISTUB toggles
+
+// ============================================================================
+//  NEON scratch register aliases (128-bit Q registers, caller-saved)
+// ============================================================================
+
+#define RVMMI0  a64::q0
+#define RVMMI1  a64::q1
+#define RVMMI2  a64::q2
+
+// ============================================================================
+//  Per-instruction interp stub toggles
+//  Individual ISTUB_* = 1 for interpreter fallback, 0 for native NEON
+// ============================================================================
+
+// Simple packed arithmetic — native NEON (direct equivalents)
+#define ISTUB_PADDW    0
+#define ISTUB_PADDH    0
+#define ISTUB_PADDB    0
+#define ISTUB_PADDSW   0
+#define ISTUB_PADDSH   0
+#define ISTUB_PADDSB   0
+#define ISTUB_PADDUW   0
+#define ISTUB_PADDUH   0
+#define ISTUB_PADDUB   0
+#define ISTUB_PSUBW    0
+#define ISTUB_PSUBH    0
+#define ISTUB_PSUBB    0
+#define ISTUB_PSUBSW   0
+#define ISTUB_PSUBSH   0
+#define ISTUB_PSUBSB   0
+#define ISTUB_PSUBUW   0
+#define ISTUB_PSUBUH   0
+#define ISTUB_PSUBUB   0
+
+// Compare / min / max — native NEON
+#define ISTUB_PCGTW    0
+#define ISTUB_PCGTH    0
+#define ISTUB_PCGTB    0
+#define ISTUB_PMAXW    0
+#define ISTUB_PMAXH    0
+#define ISTUB_PMINW    0
+#define ISTUB_PMINH    0
+#define ISTUB_PCEQW    0
+#define ISTUB_PCEQH    0
+#define ISTUB_PCEQB    0
+#define ISTUB_PABSW    0
+#define ISTUB_PABSH    0
+
+// Logic — native NEON
+#define ISTUB_PAND     0
+#define ISTUB_POR      0
+#define ISTUB_PXOR     0
+#define ISTUB_PNOR     0
+
+// HI/LO transfers — native (simple 128b load/store)
+#define ISTUB_PMFHI    0
+#define ISTUB_PMFLO    0
+#define ISTUB_PMTHI    0
+#define ISTUB_PMTLO    0
+
+// 128-bit copy — native
+#define ISTUB_PCPYLD   0
+#define ISTUB_PCPYUD   0
+
+// Packed shifts (immediate _Sa_) — native NEON
+#define ISTUB_PSLLH    0
+#define ISTUB_PSRLH    0
+#define ISTUB_PSRAH    0
+#define ISTUB_PSLLW    0
+#define ISTUB_PSRLW    0
+#define ISTUB_PSRAW    0
+
+// Variable-shift — native NEON (Sshl/Ushl with negation)
+#define ISTUB_PSLLVW   0
+#define ISTUB_PSRLVW   0
+#define ISTUB_PSRAVW   0
+
+// Interleave / pack / extract — native (zip1/zip2/uzp1/ext)
+#define ISTUB_PEXTLW   0
+#define ISTUB_PEXTLH   0
+#define ISTUB_PEXTLB   0
+#define ISTUB_PPACW    0
+#define ISTUB_PPACH    0
+#define ISTUB_PPACB    0
+#define ISTUB_PEXTUW   0
+#define ISTUB_PEXTUH   0
+#define ISTUB_PEXTUB   0
+#define ISTUB_PINTH    0
+#define ISTUB_PINTEH   0
+
+// Misc packed — native NEON
+#define ISTUB_PADSBH   0
+#define ISTUB_PLZCW    0
+#define ISTUB_PREVH    0
+#define ISTUB_PCPYH    0
+
+// Shuffle ops — native (Ins sequences)
+#define ISTUB_PEXEH    0
+#define ISTUB_PEXEW    0
+#define ISTUB_PEXCW    0
+#define ISTUB_PEXCH    0
+#define ISTUB_PROT3W   0
+
+// Complex ops — ported natively to match x86 coverage.
+#define ISTUB_PMFHL    0   // 4 native modes (LW/UW/LH/SH) + SLW/invalid → interp
+#define ISTUB_PMTHL    0   // mode 0 only (other modes are no-ops per x86)
+#define ISTUB_PEXT5    0   // RGB5→RGBA8 bit shuffle, mirrors x86 mask+shift chain
+#define ISTUB_PPAC5    0   // RGBA8→RGB5 bit shuffle, mirrors x86 mask+shift chain
+#define ISTUB_QFSRV    0   // 32-byte stage + unaligned 128b load from [tempqw+sa]
+#define ISTUB_PMADDH   0   // 8×16b MAC to HI/LO
+#define ISTUB_PHMADH   0   // horizontal MAC
+#define ISTUB_PMSUBH   0   // 8×16b MSUB to HI/LO
+#define ISTUB_PHMSBH   0   // horizontal MSUB
+#define ISTUB_PMULTH   0   // 8×16b multiply to HI/LO
+#define ISTUB_PMADDW   0   // 2×32b MAC to HI/LO
+#define ISTUB_PMSUBW   0   // 2×32b MSUB to HI/LO
+#define ISTUB_PMULTW   0   // 2×32b multiply to HI/LO
+#define ISTUB_PMADDUW  0   // 2×32b unsigned MAC to HI/LO
+#define ISTUB_PMULTUW  0   // 2×32b unsigned multiply to HI/LO
+#define ISTUB_PDIVW    1   // 2×32b signed divide to HI/LO
+#define ISTUB_PDIVUW   1   // 2×32b unsigned divide to HI/LO
+#define ISTUB_PDIVBW   1   // 4×32/16b divide to HI/LO
+
+// ============================================================================
+//  Codegen helpers
+// ============================================================================
+
+// Load PS2 128-bit GPR into a NEON Q register.
+// Must commit any pending const-prop value AND any cached lower-64-bit GPR
+// value first — both only track the lower half, so the upper half in memory
+// is authoritative but the lower half may be stale.
+static __fi void armLoadGPR128(const a64::VRegister& dst, int gpr)
 {
-	armAsm->Ldr(v.Q(), a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(n)));
+	armFlushConstReg(gpr);
+	armGprFlush(gpr);
+	armAsm->Ldr(dst, a64::MemOperand(RCPUSTATE, GPR_OFFSET(gpr)));
 }
 
-static void storeQ(const a64::VRegister& v, u32 n)
+// Store NEON Q register into PS2 128-bit GPR. Any cached lower-64-bit value
+// must be retired BEFORE the NEON store: armGprInvalidate flushes a dirty
+// cache slot to memory, and if we did that AFTER the NEON store it would
+// overwrite the new bytes with the stale lower-64. The slot's old value
+// would have been wasted anyway (the NEON store replaces it), but keeping
+// the order correct is what matters.
+static __fi void armStoreGPR128(int gpr, const a64::VRegister& src)
 {
-	armAsm->Str(v.Q(), a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(n)));
+	armGprInvalidate(gpr);
+	armAsm->Str(src, a64::MemOperand(RCPUSTATE, GPR_OFFSET(gpr)));
 }
 
-// Binary op with the interpreter's natural (rs, rt) operand order:
-//   GPR[rd] = OP(GPR[rs], GPR[rt])   over the lanes given by VIEW.
-#define MMI_3OP(NAME, OP, VIEW)                                  \
-	void armEmit##NAME(u32 rd, u32 rs, u32 rt)                   \
-	{                                                           \
-		if (rd == 0)                                            \
-			return;                                             \
-		loadQ(VS, rs);                                          \
-		loadQ(VT, rt);                                          \
-		armAsm->OP(VD.VIEW(), VS.VIEW(), VT.VIEW());            \
-		storeQ(VD, rd);                                         \
-	}
-
-// Binary op with swapped (rt, rs) operand order — for the pack/interleave ops
-// where the interpreter uses Rt as the low/even source operand.
-#define MMI_3OP_TS(NAME, OP, VIEW)                               \
-	void armEmit##NAME(u32 rd, u32 rs, u32 rt)                   \
-	{                                                           \
-		if (rd == 0)                                            \
-			return;                                             \
-		loadQ(VS, rs);                                          \
-		loadQ(VT, rt);                                          \
-		armAsm->OP(VD.VIEW(), VT.VIEW(), VS.VIEW());            \
-		storeQ(VD, rd);                                         \
-	}
-
-// --- Parallel add / subtract (wrapping) -------------------------------------
-MMI_3OP(PADDW, Add, V4S)
-MMI_3OP(PADDH, Add, V8H)
-MMI_3OP(PADDB, Add, V16B)
-MMI_3OP(PSUBW, Sub, V4S)
-MMI_3OP(PSUBH, Sub, V8H)
-MMI_3OP(PSUBB, Sub, V16B)
-
-// --- Parallel add / subtract with signed saturation -------------------------
-MMI_3OP(PADDSW, Sqadd, V4S)
-MMI_3OP(PADDSH, Sqadd, V8H)
-MMI_3OP(PADDSB, Sqadd, V16B)
-MMI_3OP(PSUBSW, Sqsub, V4S)
-MMI_3OP(PSUBSH, Sqsub, V8H)
-MMI_3OP(PSUBSB, Sqsub, V16B)
-
-// --- Parallel add / subtract with unsigned saturation -----------------------
-MMI_3OP(PADDUW, Uqadd, V4S)
-MMI_3OP(PADDUH, Uqadd, V8H)
-MMI_3OP(PADDUB, Uqadd, V16B)
-MMI_3OP(PSUBUW, Uqsub, V4S)
-MMI_3OP(PSUBUH, Uqsub, V8H)
-MMI_3OP(PSUBUB, Uqsub, V16B)
-
-// --- Parallel compares (produce an all-ones / all-zeros mask per lane) -------
-MMI_3OP(PCGTW, Cmgt, V4S)
-MMI_3OP(PCGTH, Cmgt, V8H)
-MMI_3OP(PCGTB, Cmgt, V16B)
-MMI_3OP(PCEQW, Cmeq, V4S)
-MMI_3OP(PCEQH, Cmeq, V8H)
-MMI_3OP(PCEQB, Cmeq, V16B)
-
-// --- Parallel signed min / max ----------------------------------------------
-MMI_3OP(PMAXW, Smax, V4S)
-MMI_3OP(PMAXH, Smax, V8H)
-MMI_3OP(PMINW, Smin, V4S)
-MMI_3OP(PMINH, Smin, V8H)
-
-// --- Parallel bitwise logic -------------------------------------------------
-MMI_3OP(PAND, And, V16B)
-MMI_3OP(POR, Orr, V16B)
-MMI_3OP(PXOR, Eor, V16B)
-
-void armEmitPNOR(u32 rd, u32 rs, u32 rt)
+// Binary op template: loads rs→q0, rt→q1, runs opFunc(), stores q0→rd.
+template<typename OpFunc>
+static void armMMIBinOp(OpFunc opFunc)
 {
-	if (rd == 0)
+	if (!_Rd_) return;
+	armDelConstReg(_Rd_);
+	armLoadGPR128(RVMMI0, _Rs_);
+	armLoadGPR128(RVMMI1, _Rt_);
+	opFunc();
+	armStoreGPR128(_Rd_, RVMMI0);
+}
+
+// Unary op template: loads rt→q0, runs opFunc(), stores q0→rd.
+template<typename OpFunc>
+static void armMMIUnaryOp(OpFunc opFunc)
+{
+	if (!_Rd_) return;
+	armDelConstReg(_Rd_);
+	armLoadGPR128(RVMMI0, _Rt_);
+	opFunc();
+	armStoreGPR128(_Rd_, RVMMI0);
+}
+
+// ============================================================================
+//  MMI — PLZCW, PMFHL, PMTHL, PSxx shifts (main MMI sub-table)
+// ============================================================================
+
+#if ISTUB_PLZCW
+void recPLZCW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PLZCW); }
+#else
+void recPLZCW()
+{
+	if (!_Rd_) return;
+	armDelConstReg(_Rd_);
+	// Direct upper-half read bypasses armLoadGPR* — commit const AND any
+	// cached lower-64 first. The _Rd_ store overwrites the cached lower-64,
+	// so drop the cache slot (before the store, to avoid clobbering it).
+	armFlushConstReg(_Rs_);
+	armGprFlush(_Rs_);
+	armGprInvalidate(_Rd_);
+	armAsm->Ldr(RWSCRATCH,  a64::MemOperand(RCPUSTATE, GPR_OFFSET(_Rs_) + 0));
+	armAsm->Ldr(RWSCRATCH2, a64::MemOperand(RCPUSTATE, GPR_OFFSET(_Rs_) + 4));
+	armAsm->Cls(RWSCRATCH,  RWSCRATCH);
+	armAsm->Cls(RWSCRATCH2, RWSCRATCH2);
+	armAsm->Str(RWSCRATCH,  a64::MemOperand(RCPUSTATE, GPR_OFFSET(_Rd_) + 0));
+	armAsm->Str(RWSCRATCH2, a64::MemOperand(RCPUSTATE, GPR_OFFSET(_Rd_) + 4));
+}
+#endif
+
+#if ISTUB_PMFHL
+void recPMFHL() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMFHL); }
+#else
+// _Sa_ selects one of 5 extraction modes from HI/LO into Rd:
+//   0x00 LW  — Rd = {LO.L[0], HI.L[0], LO.L[2], HI.L[2]}
+//   0x01 UW  — Rd = {LO.L[1], HI.L[1], LO.L[3], HI.L[3]}
+//   0x02 SLW — saturate HI/LO doubleword to 32b signed; x86 falls to interp
+//   0x03 LH  — Rd.H = {LO[0], LO[2], HI[0], HI[2], LO[4], LO[6], HI[4], HI[6]}
+//   0x04 SH  — Rd.H = {sat(LO[0]), sat(LO[1]), sat(HI[0]), sat(HI[1]),
+//                      sat(LO[2]), sat(LO[3]), sat(HI[2]), sat(HI[3])}
+//              (signed 32→16 saturation per lane, then interleave L/H halves)
+// Mirrors x86 recPMFHL in iMMI.cpp:162-232.
+void recPMFHL()
+{
+	if (!_Rd_)
 		return;
-	loadQ(VS, rs);
-	loadQ(VT, rt);
-	armAsm->Orr(VD.V16B(), VS.V16B(), VT.V16B());
-	armAsm->Not(VD.V16B(), VD.V16B());
-	storeQ(VD, rd);
-}
+	armDelConstReg(_Rd_);
 
-// --- Interleave (extend) low / high halves ----------------------------------
-// PEXTL* interleaves the low halves of Rt (even output lanes) and Rs (odd);
-// PEXTU* does the same for the high halves. Rt is the first NEON operand.
-MMI_3OP_TS(PEXTLW, Zip1, V4S)
-MMI_3OP_TS(PEXTLH, Zip1, V8H)
-MMI_3OP_TS(PEXTLB, Zip1, V16B)
-MMI_3OP_TS(PEXTUW, Zip2, V4S)
-MMI_3OP_TS(PEXTUH, Zip2, V8H)
-MMI_3OP_TS(PEXTUB, Zip2, V16B)
-
-// --- Pack (keep even-indexed elements of Rt then Rs) ------------------------
-MMI_3OP_TS(PPACW, Uzp1, V4S)
-MMI_3OP_TS(PPACH, Uzp1, V8H)
-MMI_3OP_TS(PPACB, Uzp1, V16B)
-
-// --- Doubleword copy combines ------------------------------------------------
-// PCPYLD: Rd = { Rt.UD[0], Rs.UD[0] }  -> Zip1.2D(Rt, Rs)
-// PCPYUD: Rd = { Rs.UD[1], Rt.UD[1] }  -> Zip2.2D(Rs, Rt)
-MMI_3OP_TS(PCPYLD, Zip1, V2D)
-MMI_3OP(PCPYUD, Zip2, V2D)
-
-// --- Parallel saturating absolute value (Rt only) ---------------------------
-void armEmitPABSW(u32 rd, u32 rt)
-{
-	if (rd == 0)
-		return;
-	loadQ(VT, rt);
-	armAsm->Sqabs(VD.V4S(), VT.V4S()); // 0x80000000 -> 0x7FFFFFFF, matching the clamp
-	storeQ(VD, rd);
-}
-
-void armEmitPABSH(u32 rd, u32 rt)
-{
-	if (rd == 0)
-		return;
-	loadQ(VT, rt);
-	armAsm->Sqabs(VD.V8H(), VT.V8H()); // 0x8000 -> 0x7FFF
-	storeQ(VD, rd);
-}
-
-// --- PCPYH: broadcast Rt.US[0] into the low doubleword, Rt.US[4] into the high.
-void armEmitPCPYH(u32 rd, u32 rt)
-{
-	if (rd == 0)
-		return;
-	loadQ(VT, rt);
-	armAsm->Dup(VS.V8H(), VT.V8H(), 0); // all 8 halfwords = US[0]
-	armAsm->Dup(VD.V8H(), VT.V8H(), 4); // all 8 halfwords = US[4]
-	armAsm->Ins(VD.V2D(), 0, VS.V2D(), 0); // low doubleword <- US[0]x4; high stays US[4]x4
-	storeQ(VD, rd);
-}
-
-// =============================================================================
-// Parallel shifts by immediate (Phase 5.4 continuation)
-// =============================================================================
-// Each lane is shifted independently by the same immediate amount `sa`.
-// ARM64 NEON provides single-instruction forms for all three shift types:
-//   Shl  — shift left (zero-extend out bits)
-//   Ushr — unsigned/logical shift right (zero-fill from the left)
-//   Sshr — signed/arithmetic shift right (sign-extend from the left)
-//
-// The guest GPRs are little-endian, so NEON lane 0 holds guest element 0 —
-// the lane indexing matches the interpreter's element indexing exactly.
-
-// --- PSLLH/PSLLW: parallel logical shift left by `sa` ------------------------
-void armEmitPSLLH(u32 rd, u32 rt, u32 sa)
-{
-	if (rd == 0)
-		return;
-	loadQ(VT, rt);
-	u32 shift = sa & 0x0F;
-	if (shift == 0) {
-		armAsm->Mov(VD.V16B(), VT.V16B()); // no-op shift, just copy
-	} else {
-		armAsm->Shl(VD.V8H(), VT.V8H(), shift); // 16-bit lanes
-	}
-	storeQ(VD, rd);
-}
-
-void armEmitPSLLW(u32 rd, u32 rt, u32 sa)
-{
-	if (rd == 0)
-		return;
-	loadQ(VT, rt);
-	u32 shift = sa & 0x1F;
-	if (shift == 0) {
-		armAsm->Mov(VD.V16B(), VT.V16B()); // no-op shift, just copy
-	} else {
-		armAsm->Shl(VD.V4S(), VT.V4S(), shift); // 32-bit lanes
-	}
-	storeQ(VD, rd);
-}
-
-// --- PSRLH/PSRLW: parallel logical (unsigned) shift right by `sa` ------------
-void armEmitPSRLH(u32 rd, u32 rt, u32 sa)
-{
-	if (rd == 0)
-		return;
-	loadQ(VT, rt);
-	u32 shift = sa & 0x0F;
-	if (shift == 0) {
-		armAsm->Mov(VD.V16B(), VT.V16B()); // no-op shift, just copy
-	} else {
-		armAsm->Ushr(VD.V8H(), VT.V8H(), shift); // zero-fill from left
-	}
-	storeQ(VD, rd);
-}
-
-void armEmitPSRLW(u32 rd, u32 rt, u32 sa)
-{
-	if (rd == 0)
-		return;
-	loadQ(VT, rt);
-	u32 shift = sa & 0x1F;
-	if (shift == 0) {
-		armAsm->Mov(VD.V16B(), VT.V16B()); // no-op shift, just copy
-	} else {
-		armAsm->Ushr(VD.V4S(), VT.V4S(), shift); // zero-fill from left
-	}
-	storeQ(VD, rd);
-}
-
-// --- PSRAH/PSRAW: parallel arithmetic (signed) shift right by `sa` -----------
-void armEmitPSRAH(u32 rd, u32 rt, u32 sa)
-{
-	if (rd == 0)
-		return;
-	loadQ(VT, rt);
-	u32 shift = sa & 0x0F;
-	if (shift == 0) {
-		armAsm->Mov(VD.V16B(), VT.V16B()); // no-op shift, just copy
-	} else {
-		armAsm->Sshr(VD.V8H(), VT.V8H(), shift); // sign-extend from left
-	}
-	storeQ(VD, rd);
-}
-
-void armEmitPSRAW(u32 rd, u32 rt, u32 sa)
-{
-	if (rd == 0)
-		return;
-	loadQ(VT, rt);
-	u32 shift = sa & 0x1F;
-	if (shift == 0) {
-		armAsm->Mov(VD.V16B(), VT.V16B()); // no-op shift, just copy
-	} else {
-		armAsm->Sshr(VD.V4S(), VT.V4S(), shift); // sign-extend from left
-	}
-	storeQ(VD, rd);
-}
-
-
-// =============================================================================
-// Parallel lane permutes (Phase 5.4 continuation)
-// =============================================================================
-// These rearrange the halfword/word lanes within the 128-bit GPR. They don't
-// map to single NEON instructions, so we use lane-by-lane insertion (Ins).
-
-// --- PINTH: interleave halfwords ---------------------------------------------
-// Output: [Rt[0], Rs[4], Rt[1], Rs[5], Rt[2], Rs[6], Rt[3], Rs[7]]
-void armEmitPINTH(u32 rd, u32 rs, u32 rt)
-{
-	if (rd == 0)
-		return;
-	loadQ(VT, rt);
-	loadQ(VS, rs);
-	// Build result lane-by-lane using Ins.
-	armAsm->Ins(VD.V8H(), 0, VT.V8H(), 0); // VD[0] = Rt[0]
-	armAsm->Ins(VD.V8H(), 1, VS.V8H(), 4); // VD[1] = Rs[4]
-	armAsm->Ins(VD.V8H(), 2, VT.V8H(), 1); // VD[2] = Rt[1]
-	armAsm->Ins(VD.V8H(), 3, VS.V8H(), 5); // VD[3] = Rs[5]
-	armAsm->Ins(VD.V8H(), 4, VT.V8H(), 2); // VD[4] = Rt[2]
-	armAsm->Ins(VD.V8H(), 5, VS.V8H(), 6); // VD[5] = Rs[6]
-	armAsm->Ins(VD.V8H(), 6, VT.V8H(), 3); // VD[6] = Rt[3]
-	armAsm->Ins(VD.V8H(), 7, VS.V8H(), 7); // VD[7] = Rs[7]
-	storeQ(VD, rd);
-}
-
-// --- PINTEH: interleave even halfwords ---------------------------------------
-// Output: [Rt[0], Rs[0], Rt[2], Rs[2], Rt[4], Rs[4], Rt[6], Rs[6]]
-void armEmitPINTEH(u32 rd, u32 rs, u32 rt)
-{
-	if (rd == 0)
-		return;
-	loadQ(VT, rt);
-	loadQ(VS, rs);
-	armAsm->Ins(VD.V8H(), 0, VT.V8H(), 0); // VD[0] = Rt[0]
-	armAsm->Ins(VD.V8H(), 1, VS.V8H(), 0); // VD[1] = Rs[0]
-	armAsm->Ins(VD.V8H(), 2, VT.V8H(), 2); // VD[2] = Rt[2]
-	armAsm->Ins(VD.V8H(), 3, VS.V8H(), 2); // VD[3] = Rs[2]
-	armAsm->Ins(VD.V8H(), 4, VT.V8H(), 4); // VD[4] = Rt[4]
-	armAsm->Ins(VD.V8H(), 5, VS.V8H(), 4); // VD[5] = Rs[4]
-	armAsm->Ins(VD.V8H(), 6, VT.V8H(), 6); // VD[6] = Rt[6]
-	armAsm->Ins(VD.V8H(), 7, VS.V8H(), 6); // VD[7] = Rs[6]
-	storeQ(VD, rd);
-}
-
-// --- PEXEH: extract even halfwords (swap 0<->2 in each 64-bit half) ----------
-// Output: [Rt[2], Rt[1], Rt[0], Rt[3], Rt[6], Rt[5], Rt[4], Rt[7]]
-void armEmitPEXEH(u32 rd, u32 rt)
-{
-	if (rd == 0)
-		return;
-	loadQ(VT, rt);
-	armAsm->Ins(VD.V8H(), 0, VT.V8H(), 2); // VD[0] = Rt[2]
-	armAsm->Ins(VD.V8H(), 1, VT.V8H(), 1); // VD[1] = Rt[1]
-	armAsm->Ins(VD.V8H(), 2, VT.V8H(), 0); // VD[2] = Rt[0]
-	armAsm->Ins(VD.V8H(), 3, VT.V8H(), 3); // VD[3] = Rt[3]
-	armAsm->Ins(VD.V8H(), 4, VT.V8H(), 6); // VD[4] = Rt[6]
-	armAsm->Ins(VD.V8H(), 5, VT.V8H(), 5); // VD[5] = Rt[5]
-	armAsm->Ins(VD.V8H(), 6, VT.V8H(), 4); // VD[6] = Rt[4]
-	armAsm->Ins(VD.V8H(), 7, VT.V8H(), 7); // VD[7] = Rt[7]
-	storeQ(VD, rd);
-}
-
-// --- PEXEW: extract even words (swap 32-bit lanes 0<->2) ---------------------
-// Output: [Rt[2], Rt[1], Rt[0], Rt[3]]  (32-bit lanes)
-void armEmitPEXEW(u32 rd, u32 rt)
-{
-	if (rd == 0)
-		return;
-	loadQ(VT, rt);
-	armAsm->Ins(VD.V4S(), 0, VT.V4S(), 2); // VD[0] = Rt[2]
-	armAsm->Ins(VD.V4S(), 1, VT.V4S(), 1); // VD[1] = Rt[1]
-	armAsm->Ins(VD.V4S(), 2, VT.V4S(), 0); // VD[2] = Rt[0]
-	armAsm->Ins(VD.V4S(), 3, VT.V4S(), 3); // VD[3] = Rt[3]
-	storeQ(VD, rd);
-}
-
-// --- PREVH: reverse halfwords within each 64-bit half ------------------------
-// Output: [Rt[3], Rt[2], Rt[1], Rt[0], Rt[7], Rt[6], Rt[5], Rt[4]]
-void armEmitPREVH(u32 rd, u32 rt)
-{
-	if (rd == 0)
-		return;
-	loadQ(VT, rt);
-	armAsm->Rev64(VD.V8H(), VT.V8H()); // Single instruction!
-	storeQ(VD, rd);
-}
-
-// =============================================================================
-// Remaining lane permutes (Phase 5.4 continuation)
-// =============================================================================
-
-// --- PROT3W: rotate 3 words (Rt-only, Rt = {UL[0],UL[1],UL[2],UL[3]} ) --------
-// Output: [Rt[1], Rt[2], Rt[0], Rt[3]]  (32-bit lanes; lane 3 is unchanged)
-void armEmitPROT3W(u32 rd, u32 rt)
-{
-	if (rd == 0)
-		return;
-	loadQ(VT, rt);
-	armAsm->Ins(VD.V4S(), 0, VT.V4S(), 1); // VD[0] = Rt[1]
-	armAsm->Ins(VD.V4S(), 1, VT.V4S(), 2); // VD[1] = Rt[2]
-	armAsm->Ins(VD.V4S(), 2, VT.V4S(), 0); // VD[2] = Rt[0]
-	armAsm->Ins(VD.V4S(), 3, VT.V4S(), 3); // VD[3] = Rt[3]  (unchanged)
-	storeQ(VD, rd);
-}
-
-// --- PEXCH: extract even halfwords within each 64-bit half -------------------
-// Swaps halfword pairs (1<->2) within each 64-bit half.
-// Output: [Rt[0], Rt[2], Rt[1], Rt[3], Rt[4], Rt[6], Rt[5], Rt[7]]
-void armEmitPEXCH(u32 rd, u32 rt)
-{
-	if (rd == 0)
-		return;
-	loadQ(VT, rt);
-	armAsm->Ins(VD.V8H(), 0, VT.V8H(), 0); // VD[0] = Rt[0]
-	armAsm->Ins(VD.V8H(), 1, VT.V8H(), 2); // VD[1] = Rt[2]
-	armAsm->Ins(VD.V8H(), 2, VT.V8H(), 1); // VD[2] = Rt[1]
-	armAsm->Ins(VD.V8H(), 3, VT.V8H(), 3); // VD[3] = Rt[3]
-	armAsm->Ins(VD.V8H(), 4, VT.V8H(), 4); // VD[4] = Rt[4]
-	armAsm->Ins(VD.V8H(), 5, VT.V8H(), 6); // VD[5] = Rt[6]
-	armAsm->Ins(VD.V8H(), 6, VT.V8H(), 5); // VD[6] = Rt[5]
-	armAsm->Ins(VD.V8H(), 7, VT.V8H(), 7); // VD[7] = Rt[7]
-	storeQ(VD, rd);
-}
-
-// --- PEXCW: extract even words (swap word pairs 1<->2) -----------------------
-// Output: [Rt[0], Rt[2], Rt[1], Rt[3]]  (32-bit lanes)
-void armEmitPEXCW(u32 rd, u32 rt)
-{
-	if (rd == 0)
-		return;
-	loadQ(VT, rt);
-	armAsm->Ins(VD.V4S(), 0, VT.V4S(), 0); // VD[0] = Rt[0]
-	armAsm->Ins(VD.V4S(), 1, VT.V4S(), 2); // VD[1] = Rt[2]
-	armAsm->Ins(VD.V4S(), 2, VT.V4S(), 1); // VD[2] = Rt[1]
-	armAsm->Ins(VD.V4S(), 3, VT.V4S(), 3); // VD[3] = Rt[3]
-	storeQ(VD, rd);
-}
-
-// =============================================================================
-// Parallel variable shifts (Phase 5.4 continuation)
-// =============================================================================
-// IMPORTANT: despite the "VW" name, the interpreter (MMI.cpp PSLLVW/PSRLVW/
-// PSRAVW) does NOT shift four independent 32-bit lanes. It shifts only lanes 0
-// and 2 of Rt (each by the matching lane of Rs, masked to 5 bits) and writes the
-// 32-bit result *sign-extended to a full 64-bit doubleword*:
-//
-//   Rd.SD[0] = (s64)(s32)(Rt.UL[0] <</>> (Rs.UL[0] & 0x1F));   // fills Rd.UD[0]
-//   Rd.SD[1] = (s64)(s32)(Rt.UL[2] <</>> (Rs.UL[2] & 0x1F));   // fills Rd.UD[1]
-//
-// So each doubleword's high word is the sign fill of its low word, NOT a shift of
-// Rt.UL[1]/Rt.UL[3]. We compute each lane in a w-register (the variable shift form
-// already masks the amount mod 32 == & 0x1F), Sxtw it to 64 bits, and store the
-// whole doubleword.
-//
-// Caller-saved GPRs used as scratch: x9-x10 (avoiding x16 which is VIXL scratch).
-
-// --- PSLLVW: parallel logical shift left by GPR[rs] -------------------------
-void armEmitPSLLVW(u32 rd, u32 rs, u32 rt)
-{
-	if (rd == 0)
-		return;
-
-	armAsm->Ldr(a64::w9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt)));      // Rt.UL[0]
-	armAsm->Ldr(a64::w10, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));     // Rs.UL[0]
-	armAsm->Lsl(a64::w9, a64::w9, a64::w10);
-	armAsm->Sxtw(a64::x9, a64::w9);                                            // sign-extend to UD[0]
-	armAsm->Str(a64::x9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd)));
-
-	armAsm->Ldr(a64::w9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt) + 8));  // Rt.UL[2]
-	armAsm->Ldr(a64::w10, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs) + 8)); // Rs.UL[2]
-	armAsm->Lsl(a64::w9, a64::w9, a64::w10);
-	armAsm->Sxtw(a64::x9, a64::w9);                                            // sign-extend to UD[1]
-	armAsm->Str(a64::x9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd) + 8));
-}
-
-// --- PSRLVW: parallel logical (unsigned) shift right by GPR[rs] -------------
-void armEmitPSRLVW(u32 rd, u32 rs, u32 rt)
-{
-	if (rd == 0)
-		return;
-
-	armAsm->Ldr(a64::w9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt)));      // Rt.UL[0]
-	armAsm->Ldr(a64::w10, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));     // Rs.UL[0]
-	armAsm->Lsr(a64::w9, a64::w9, a64::w10);
-	armAsm->Sxtw(a64::x9, a64::w9);                                            // sign-extend to UD[0]
-	armAsm->Str(a64::x9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd)));
-
-	armAsm->Ldr(a64::w9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt) + 8));  // Rt.UL[2]
-	armAsm->Ldr(a64::w10, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs) + 8)); // Rs.UL[2]
-	armAsm->Lsr(a64::w9, a64::w9, a64::w10);
-	armAsm->Sxtw(a64::x9, a64::w9);                                            // sign-extend to UD[1]
-	armAsm->Str(a64::x9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd) + 8));
-}
-
-// --- PSRAVW: parallel arithmetic (signed) shift right by GPR[rs] ------------
-void armEmitPSRAVW(u32 rd, u32 rs, u32 rt)
-{
-	if (rd == 0)
-		return;
-
-	armAsm->Ldr(a64::w9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt)));      // Rt.SL[0]
-	armAsm->Ldr(a64::w10, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));     // Rs.UL[0]
-	armAsm->Asr(a64::w9, a64::w9, a64::w10);
-	armAsm->Sxtw(a64::x9, a64::w9);                                            // sign-extend to UD[0]
-	armAsm->Str(a64::x9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd)));
-
-	armAsm->Ldr(a64::w9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt) + 8));  // Rt.SL[2]
-	armAsm->Ldr(a64::w10, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs) + 8)); // Rs.UL[2]
-	armAsm->Asr(a64::w9, a64::w9, a64::w10);
-	armAsm->Sxtw(a64::x9, a64::w9);                                            // sign-extend to UD[1]
-	armAsm->Str(a64::x9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd) + 8));
-}
-
-// =============================================================================
-// Multiply-accumulate family (Phase 5.4 continuation)
-// =============================================================================
-// These ops multiply pairs of elements and accumulate into the HI/LO special
-// registers. The result is also written to GPR[rd] for some ops.
-//
-// HI/LO offsets (matching aR5900MultDiv.cpp):
-//   HI  = 32 * 16 = 512  (HI.UD[0])
-//   LO  = 33 * 16 = 528  (LO.UD[0])
-//   HI1 = HI + 8 = 520   (HI.UD[1])
-//   LO1 = LO + 8 = 536   (LO.UD[1])
-static constexpr u32 EE_HI_OFFSET = 32u * 16u;
-static constexpr u32 EE_LO_OFFSET = 33u * 16u;
-static constexpr u32 EE_HI1_OFFSET = EE_HI_OFFSET + 8u;
-static constexpr u32 EE_LO1_OFFSET = EE_LO_OFFSET + 8u;
-
-// Scratch registers for multiply-accumulate (caller-saved GPRs):
-//   w9-w12: 32-bit lane data and intermediates
-//   x13:   64-bit accumulate result
-// Use the VIXL register objects directly (w9, w10, etc. are already WRegister objects).
-#define WTEMP1 a64::w9
-#define WTEMP2 a64::w10
-#define WTEMP3 a64::w11
-#define WTEMP4 a64::w12
-#define XTEMP a64::x13
-
-// -----------------------------------------------------------------------------
-// PMULTW: Word multiply (lanes 0 and 2)
-// -----------------------------------------------------------------------------
-//   LO.SD[0] = (s32)(Rs[0] * Rt[0])
-//   HI.SD[0] = (s32)((Rs[0] * Rt[0]) >> 32)
-//   if (Rd) GPR[rd].SD[0] = Rs[0] * Rt[0] (full 64-bit)
-//   LO.SD[1] = (s32)(Rs[2] * Rt[2])
-//   HI.SD[1] = (s32)((Rs[2] * Rt[2]) >> 32)
-//   if (Rd) GPR[rd].SD[1] = Rs[2] * Rt[2]
-// Store a 32x32->64 product (held in XTEMP) to one lane:
-//   LO.SD[dd] = (s32)low32 sign-extended, HI.SD[dd] = high32 sign-extended,
-//   and the full 64-bit product to GPR[rd].UD[dd] when rd != 0.
-static void emitWordMulStore(u32 rd, u32 rdOff, u32 loOff, u32 hiOff)
-{
-	if (rd != 0)
-		armAsm->Str(XTEMP, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd) + rdOff));
-	armAsm->Sxtw(a64::x9, XTEMP.W()); // LO = sign-extend low 32 into 64
-	armAsm->Str(a64::x9, a64::MemOperand(RESTATEPTR, loOff));
-	armAsm->Asr(a64::x9, XTEMP, 32); // HI = arithmetic high 32 (already 64-bit)
-	armAsm->Str(a64::x9, a64::MemOperand(RESTATEPTR, hiOff));
-}
-
-void armEmitPMULTW(u32 rd, u32 rs, u32 rt)
-{
-	armAsm->Ldr(WTEMP1, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-	armAsm->Ldr(WTEMP2, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt)));
-	armAsm->Smull(XTEMP, WTEMP1, WTEMP2);
-	emitWordMulStore(rd, /*rdOff*/ 0, EE_LO_OFFSET, EE_HI_OFFSET);
-
-	armAsm->Ldr(WTEMP1, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs) + 8));
-	armAsm->Ldr(WTEMP2, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt) + 8));
-	armAsm->Smull(XTEMP, WTEMP1, WTEMP2);
-	emitWordMulStore(rd, /*rdOff*/ 8, EE_LO1_OFFSET, EE_HI1_OFFSET);
-}
-
-// -----------------------------------------------------------------------------
-// PMULTUW: Unsigned word multiply (lanes 0 and 2)
-// -----------------------------------------------------------------------------
-// Same as PMULTW but unsigned multiply.
-void armEmitPMULTUW(u32 rd, u32 rs, u32 rt)
-{
-	armAsm->Ldr(WTEMP1, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-	armAsm->Ldr(WTEMP2, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt)));
-	armAsm->Umull(XTEMP, WTEMP1, WTEMP2);
-	emitWordMulStore(rd, /*rdOff*/ 0, EE_LO_OFFSET, EE_HI_OFFSET);
-
-	armAsm->Ldr(WTEMP1, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs) + 8));
-	armAsm->Ldr(WTEMP2, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt) + 8));
-	armAsm->Umull(XTEMP, WTEMP1, WTEMP2);
-	emitWordMulStore(rd, /*rdOff*/ 8, EE_LO1_OFFSET, EE_HI1_OFFSET);
-}
-
-// -----------------------------------------------------------------------------
-// PMADDUW: Unsigned word multiply-add
-// -----------------------------------------------------------------------------
-// For each lane (dd=0/ss=0 and dd=1/ss=2):
-//   temp = Rs[ss] * Rt[ss] (unsigned 32x32->64)
-//   temp2 = temp + (HI[ss] << 32)
-//   LO.SD[dd] = (s32)(temp & 0xffffffff) + LO[ss]
-//   HI.SD[dd] = (s32)(temp2 >> 32)  (no division voodoo for unsigned)
-//   if (Rd) { GPR[rd].UL[dd*2] = LO.UL[dd*2]; GPR[rd].UL[dd*2+1] = HI.UL[dd*2]; }
-// One PMADDUW lane. Interpreter:
-//   tempu = (LO.UL[ss] | (HI.UL[ss] << 32)) + (u64)Rs.UL[ss] * (u64)Rt.UL[ss];
-//   LO.SD[dd] = (s32)(tempu & 0xffffffff);  HI.SD[dd] = (s32)(tempu >> 32);
-//   if (Rd) GPR[rd].UD[dd] = tempu;
-// The whole 64-bit accumulator is formed first so a carry out of the low word
-// propagates into the high word.
-static void emitPMADDUWLane(u32 rd, u32 rs, u32 rt, u32 srcOff, u32 loOff, u32 hiOff, u32 rdOff)
-{
-	armAsm->Ldr(a64::w9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs) + srcOff));  // Rs.UL[ss]
-	armAsm->Ldr(a64::w10, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt) + srcOff)); // Rt.UL[ss]
-	armAsm->Umull(a64::x11, a64::w9, a64::w10); // product
-	armAsm->Ldr(a64::w9, a64::MemOperand(RESTATEPTR, loOff));  // LO.UL[ss] (zero-extended)
-	armAsm->Ldr(a64::w10, a64::MemOperand(RESTATEPTR, hiOff)); // HI.UL[ss] (zero-extended)
-	armAsm->Add(a64::x11, a64::x11, a64::x9);
-	armAsm->Add(a64::x11, a64::x11, a64::Operand(a64::x10, a64::LSL, 32)); // tempu
-
-	if (rd != 0)
-		armAsm->Str(a64::x11, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd) + rdOff)); // full 64-bit
-
-	armAsm->Sxtw(a64::x9, a64::w11); // (s32)(tempu & 0xffffffff)
-	armAsm->Str(a64::x9, a64::MemOperand(RESTATEPTR, loOff));
-	armAsm->Asr(a64::x10, a64::x11, 32);
-	armAsm->Sxtw(a64::x10, a64::w10); // (s32)(tempu >> 32)
-	armAsm->Str(a64::x10, a64::MemOperand(RESTATEPTR, hiOff));
-}
-
-void armEmitPMADDUW(u32 rd, u32 rs, u32 rt)
-{
-	emitPMADDUWLane(rd, rs, rt, /*srcOff*/ 0, EE_LO_OFFSET, EE_HI_OFFSET, /*rdOff*/ 0);
-	emitPMADDUWLane(rd, rs, rt, /*srcOff*/ 8, EE_LO1_OFFSET, EE_HI1_OFFSET, /*rdOff*/ 8);
-}
-
-// -----------------------------------------------------------------------------
-// PMADDW: Word multiply-add with EE division voodoo
-// -----------------------------------------------------------------------------
-// For each lane (dd=0/ss=0 and dd=1/ss=2):
-//   temp = Rs[ss] * Rt[ss]  (64-bit)
-//   temp2 = temp + (HI[ss] << 32)
-//   // EE division voodoo for lane 0 only:
-//   if (ss==0 && ((Rt[0]&0x7FFFFFFF)==0 || (Rt[0]&0x7FFFFFFF)==0x7FFFFFFF) && Rs[0]!=Rt[0])
-//     temp2 += 0x70000000
-//   temp2 = (s32)(temp2 / 4294967295)  // off-by-1 multiplication error
-//   LO.SD[dd] = (s32)(temp & 0xffffffff) + LO[ss]
-//   HI.SD[dd] = (s32)temp2
-//   if (Rd) { GPR[rd].UL[dd*2] = LO.UL[dd*2]; GPR[rd].UL[dd*2+1] = HI.UL[dd*2]; }
-// Emit one PMADDW lane: dd selects LO/HI.UD[dd], srcOff is the GPR byte offset of
-// lane `ss` (Rs/Rt low word) and loOff/hiOff the LO/HI lane offsets. `voodoo` adds
-// the PS2 lane-0 division quirk.
-static void emitPMADDWLane(u32 rd, u32 rs, u32 rt, u32 srcOff, u32 loOff, u32 hiOff,
-	u32 rdOff, bool voodoo)
-{
-	a64::Label voodoo_done;
-
-	armAsm->Ldr(a64::w9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs) + srcOff));  // Rs[ss]
-	armAsm->Ldr(a64::w10, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt) + srcOff)); // Rt[ss]
-	armAsm->Smull(a64::x11, a64::w9, a64::w10); // temp = (s64)Rs[ss] * (s64)Rt[ss]
-
-	// LO.SD[dd] = (s32)(temp & 0xffffffff) + LO[ss]  — uses the *pure* product.
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, loOff));
-	armAsm->Add(a64::w12, a64::w11, a64::w12);
-	armAsm->Sxtw(a64::x12, a64::w12);
-	armAsm->Str(a64::x12, a64::MemOperand(RESTATEPTR, loOff));
-
-	// temp2 = temp + (HI.SL[ss] << 32), with the lane-0 division voodoo.
-	if (voodoo)
+	switch (_Sa_)
 	{
-		// Condition: ((Rt&0x7FFFFFFF)==0 || ==0x7FFFFFFF) && Rs != Rt
-		// Both ==0 and ==0x7FFFFFFF are triggers, so a zero result must fall
-		// through to the Rs!=Rt check, not skip the add.
-		a64::Label voodoo_check_rs;
-		armAsm->And(a64::w12, a64::w10, 0x7FFFFFFF);
-		armAsm->Cbz(a64::w12, &voodoo_check_rs);   // ==0 -> still a trigger
-		armAsm->Cmp(a64::w12, 0x7FFFFFFF);
-		armAsm->B(&voodoo_done, a64::ne);          // neither 0 nor 0x7FFFFFFF -> no voodoo
-		armAsm->Bind(&voodoo_check_rs);
-		armAsm->Cmp(a64::w9, a64::w10);
-		armAsm->B(&voodoo_done, a64::eq);          // Rs == Rt -> no voodoo
-		armAsm->Mov(a64::w12, 0x70000000);
-		armAsm->Add(a64::x11, a64::x11, a64::x12); // temp2 += 0x70000000
-		armAsm->Bind(&voodoo_done);
-	}
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, hiOff)); // HI.SL[ss]
-	armAsm->Sxtw(a64::x12, a64::w12);
-	armAsm->Add(a64::x11, a64::x11, a64::Operand(a64::x12, a64::LSL, 32));
+		case 0x00: // LW
+			armAsm->Ldr(a64::q3, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+			armAsm->Ldr(a64::q4, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+			// Even-indexed 32b lanes of each, packed to low 64b, then interleave.
+			armAsm->Uzp1(a64::v3.V4S(), a64::v3.V4S(), a64::v3.V4S());
+			armAsm->Uzp1(a64::v4.V4S(), a64::v4.V4S(), a64::v4.V4S());
+			armAsm->Zip1(a64::v0.V4S(), a64::v3.V4S(), a64::v4.V4S());
+			armStoreGPR128(_Rd_, a64::q0);
+			return;
 
-	// temp2 = (s32)(temp2 / 4294967295)  — positive 64-bit divisor.
-	armAsm->Mov(a64::x12, 0xFFFFFFFF);
-	armAsm->Sdiv(a64::x11, a64::x11, a64::x12);
-	armAsm->Sxtw(a64::x11, a64::w11);
-	armAsm->Str(a64::x11, a64::MemOperand(RESTATEPTR, hiOff));
+		case 0x01: // UW
+			armAsm->Ldr(a64::q3, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+			armAsm->Ldr(a64::q4, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+			// Odd-indexed 32b lanes, then interleave.
+			armAsm->Uzp2(a64::v3.V4S(), a64::v3.V4S(), a64::v3.V4S());
+			armAsm->Uzp2(a64::v4.V4S(), a64::v4.V4S(), a64::v4.V4S());
+			armAsm->Zip1(a64::v0.V4S(), a64::v3.V4S(), a64::v4.V4S());
+			armStoreGPR128(_Rd_, a64::q0);
+			return;
 
-	if (rd != 0)
-	{
-		armAsm->Ldr(a64::x9, a64::MemOperand(RESTATEPTR, loOff));
-		armAsm->Ldr(a64::x10, a64::MemOperand(RESTATEPTR, hiOff));
-		armAsm->Bfi(a64::x9, a64::x10, 32, 32);
-		armAsm->Str(a64::x9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd) + rdOff));
-	}
-}
+		case 0x02: // SLW — x86 falls through to interp (iMMI.cpp:193-198)
+			armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMFHL);
+			return;
 
-void armEmitPMADDW(u32 rd, u32 rs, u32 rt)
-{
-	emitPMADDWLane(rd, rs, rt, /*srcOff*/ 0, EE_LO_OFFSET, EE_HI_OFFSET, /*rdOff*/ 0, /*voodoo*/ true);
-	emitPMADDWLane(rd, rs, rt, /*srcOff*/ 8, EE_LO1_OFFSET, EE_HI1_OFFSET, /*rdOff*/ 8, /*voodoo*/ false);
-}
+		case 0x03: // LH
+			armAsm->Ldr(a64::q3, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+			armAsm->Ldr(a64::q4, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+			// Even-indexed 16b lanes of each. After Uzp1.V8H the low 4H of each
+			// holds {lane 0, 2, 4, 6}; interleaving as 4S packs them as halfword
+			// pairs per PS2 spec (same shape as x86's PSHUF.LW/HW 0x88 + PSRL.DQ
+			// + PUNPCK.LDQ sequence).
+			armAsm->Uzp1(a64::v3.V8H(), a64::v3.V8H(), a64::v3.V8H());
+			armAsm->Uzp1(a64::v4.V8H(), a64::v4.V8H(), a64::v4.V8H());
+			armAsm->Zip1(a64::v0.V4S(), a64::v3.V4S(), a64::v4.V4S());
+			armStoreGPR128(_Rd_, a64::q0);
+			return;
 
-// -----------------------------------------------------------------------------
-// PMSUBW: Word multiply-subtract
-// -----------------------------------------------------------------------------
-// For each lane (dd=0/ss=0 and dd=1/ss=2):
-//   temp = Rs[ss] * Rt[ss]
-//   temp2 = (HI[ss] << 32) - temp
-//   temp2 = (s32)(temp2 / 4294967295)
-//   LO.SD[dd] = LO[ss] - (s32)(temp & 0xffffffff)
-//   HI.SD[dd] = (s32)temp2
-//   if (Rd) { GPR[rd].UL[dd*2] = LO.UL[dd*2]; GPR[rd].UL[dd*2+1] = HI.UL[dd*2]; }
-// One PMSUBW lane. Interpreter:
-//   temp = Rs[ss]*Rt[ss];  temp2 = (HI.SL[ss] << 32) - temp;
-//   temp2 = (s32)(temp2 / 4294967295);
-//   LO.SD[dd] = LO.SL[ss] - (s32)(temp & 0xffffffff);  HI.SD[dd] = (s32)temp2;
-static void emitPMSUBWLane(u32 rd, u32 rs, u32 rt, u32 srcOff, u32 loOff, u32 hiOff, u32 rdOff)
-{
-	armAsm->Ldr(a64::w9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs) + srcOff));
-	armAsm->Ldr(a64::w10, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rt) + srcOff));
-	armAsm->Smull(a64::x11, a64::w9, a64::w10); // temp (pure product)
+		case 0x04: // SH — 32→16 signed saturating pack + swap middle 2 words
+			armAsm->Ldr(a64::q3, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+			armAsm->Ldr(a64::q4, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+			// Pack LO 4×s32 → low 4×s16, then HI 4×s32 → upper 4×s16.
+			armAsm->Sqxtn(a64::v0.V4H(), a64::v3.V4S());
+			armAsm->Sqxtn2(a64::v0.V8H(), a64::v4.V4S());
+			// Swap lanes 1 and 2 (PSHUF.D 0xd8 equivalent).
+			armAsm->Mov(a64::v1.V16B(), a64::v0.V16B());
+			armAsm->Ins(a64::v1.S(), 1, a64::v0.S(), 2);
+			armAsm->Ins(a64::v1.S(), 2, a64::v0.S(), 1);
+			armStoreGPR128(_Rd_, a64::q1);
+			return;
 
-	// LO.SD[dd] = LO[ss] - (s32)(temp & 0xffffffff)  — from the pure product.
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, loOff));
-	armAsm->Sub(a64::w12, a64::w12, a64::w11);
-	armAsm->Sxtw(a64::x12, a64::w12);
-	armAsm->Str(a64::x12, a64::MemOperand(RESTATEPTR, loOff));
-
-	// temp2 = (HI.SL[ss] << 32) - temp
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, hiOff));
-	armAsm->Sxtw(a64::x12, a64::w12);
-	armAsm->Lsl(a64::x12, a64::x12, 32);
-	armAsm->Sub(a64::x11, a64::x12, a64::x11);
-
-	armAsm->Mov(a64::x12, 0xFFFFFFFF);
-	armAsm->Sdiv(a64::x11, a64::x11, a64::x12);
-	armAsm->Sxtw(a64::x11, a64::w11);
-	armAsm->Str(a64::x11, a64::MemOperand(RESTATEPTR, hiOff));
-
-	if (rd != 0)
-	{
-		armAsm->Ldr(a64::x9, a64::MemOperand(RESTATEPTR, loOff));
-		armAsm->Ldr(a64::x10, a64::MemOperand(RESTATEPTR, hiOff));
-		armAsm->Bfi(a64::x9, a64::x10, 32, 32);
-		armAsm->Str(a64::x9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd) + rdOff));
+		default:
+			// Invalid mode — x86 pxFails; we fall to interp for parity.
+			armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMFHL);
+			return;
 	}
 }
+#endif
 
-void armEmitPMSUBW(u32 rd, u32 rs, u32 rt)
+#if ISTUB_PMTHL
+void recPMTHL() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMTHL); }
+#else
+// _Sa_ == 0: LO.L[0,2] = Rs.L[0,2], HI.L[0,2] = Rs.L[1,3]; other lanes preserved.
+// Other _Sa_ values are silently no-op (matches x86 recPMTHL in iMMI.cpp:234-248,
+// which early-returns on _Sa_ != 0).
+void recPMTHL()
 {
-	emitPMSUBWLane(rd, rs, rt, /*srcOff*/ 0, EE_LO_OFFSET, EE_HI_OFFSET, /*rdOff*/ 0);
-	emitPMSUBWLane(rd, rs, rt, /*srcOff*/ 8, EE_LO1_OFFSET, EE_HI1_OFFSET, /*rdOff*/ 8);
-}
-
-// -----------------------------------------------------------------------------
-// PMULTH: Halfword multiply (8 lanes, alternating LO/HI)
-// -----------------------------------------------------------------------------
-// For n = 0,2,4,6:
-//   LO.SD[n/2] = (s32)(Rs.SS[n] * Rt.SS[n])
-//   HI.SD[n/2] = (s32)((Rs.SS[n] * Rt.SS[n]) >> 32)
-//   if (Rd) GPR[rd].SD[n/2] = Rs.SS[n] * Rt.SS[n]
-// Byte offsets of the 8 halfword-product destinations LO/HI.UL[n] for n=0..7,
-// matching the interpreter: LO0,LO1,HI0,HI1,LO2,LO3,HI2,HI3.
-static const u32 kHalfwordMacOff[8] = {
-	EE_LO_OFFSET + 0, EE_LO_OFFSET + 4, EE_HI_OFFSET + 0, EE_HI_OFFSET + 4,
-	EE_LO_OFFSET + 8, EE_LO_OFFSET + 12, EE_HI_OFFSET + 8, EE_HI_OFFSET + 12};
-
-// Pack GPR[rd] = {LO.UL[0], HI.UL[0], LO.UL[2], HI.UL[2]} (shared by the
-// halfword multiply-accumulate family).
-static void emitHalfwordMacStoreRd(u32 rd)
-{
-	if (rd == 0)
-		return;
-	armAsm->Ldr(a64::x9, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET));
-	armAsm->Ldr(a64::x10, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET));
-	armAsm->Bfi(a64::x9, a64::x10, 32, 32);
-	armAsm->Ldr(a64::x11, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET + 8));
-	armAsm->Ldr(a64::x12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET + 8));
-	armAsm->Bfi(a64::x11, a64::x12, 32, 32);
-	armAsm->Str(a64::x9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd)));
-	armAsm->Str(a64::x11, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd) + 8));
-}
-
-void armEmitPMULTH(u32 rd, u32 rs, u32 rt)
-{
-	loadQ(VS, rs);
-	loadQ(VT, rt);
-
-	// 8 independent halfword products: LO/HI.UL[n] = (s32)(Rs.SS[n] * Rt.SS[n]).
-	for (int n = 0; n < 8; n++)
-	{
-		armAsm->Smov(a64::w9, VT.V8H(), n);
-		armAsm->Smov(a64::w10, VS.V8H(), n);
-		armAsm->Mul(a64::w11, a64::w9, a64::w10);
-		armAsm->Str(a64::w11, a64::MemOperand(RESTATEPTR, kHalfwordMacOff[n]));
-	}
-
-	emitHalfwordMacStoreRd(rd);
-}
-
-// -----------------------------------------------------------------------------
-// PMADDH: Halfword multiply-add (8 lanes)
-// -----------------------------------------------------------------------------
-// For n = 0,1,2,3,4,5,6,7:
-//   temp = LO/HI.UL[n] + Rs.SS[n] * Rt.SS[n]
-//   LO/HI.UL[n] = temp (alternating: n even -> LO, n odd -> HI)
-//   if (Rd) { GPR[rd].UL[0]=LO.UL[0], GPR[rd].UL[1]=HI.UL[0],
-//             GPR[rd].UL[2]=LO.UL[2], GPR[rd].UL[3]=HI.UL[2] }
-void armEmitPMADDH(u32 rd, u32 rs, u32 rt)
-{
-	loadQ(VS, rs);
-	loadQ(VT, rt);
-
-	a64::Label skip_rd;
-
-	// Process 8 halfword lanes, accumulating into LO/HI
-	// n=0 -> LO.UL[0], n=1 -> LO.UL[1], n=2 -> HI.UL[0], n=3 -> HI.UL[1]
-	// n=4 -> LO.UL[2], n=5 -> LO.UL[3], n=6 -> HI.UL[2], n=7 -> HI.UL[3]
-
-	// We need to load each halfword, multiply, accumulate, and store
-	// For simplicity, do scalar operations lane by lane
-
-	// n=0: LO.UL[0] += Rs.SS[0] * Rt.SS[0]
-	armAsm->Smov(a64::w9, VT.V8H(), 0);
-	armAsm->Smov(a64::w10, VS.V8H(), 0);
-	armAsm->Smull(a64::x11, a64::w9, a64::w10);
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET));
-	armAsm->Add(a64::w12, a64::w12, a64::w11);
-	armAsm->Str(a64::w12, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET));
-
-	// n=1: LO.UL[1] += Rs.SS[1] * Rt.SS[1]
-	armAsm->Smov(a64::w9, VT.V8H(), 1);
-	armAsm->Smov(a64::w10, VS.V8H(), 1);
-	armAsm->Smull(a64::x11, a64::w9, a64::w10);
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET + 4));
-	armAsm->Add(a64::w12, a64::w12, a64::w11);
-	armAsm->Str(a64::w12, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET + 4));
-
-	// n=2: HI.UL[0] += Rs.SS[2] * Rt.SS[2]
-	armAsm->Smov(a64::w9, VT.V8H(), 2);
-	armAsm->Smov(a64::w10, VS.V8H(), 2);
-	armAsm->Smull(a64::x11, a64::w9, a64::w10);
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET));
-	armAsm->Add(a64::w12, a64::w12, a64::w11);
-	armAsm->Str(a64::w12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET));
-
-	// n=3: HI.UL[1] += Rs.SS[3] * Rt.SS[3]
-	armAsm->Smov(a64::w9, VT.V8H(), 3);
-	armAsm->Smov(a64::w10, VS.V8H(), 3);
-	armAsm->Smull(a64::x11, a64::w9, a64::w10);
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET + 4));
-	armAsm->Add(a64::w12, a64::w12, a64::w11);
-	armAsm->Str(a64::w12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET + 4));
-
-	// n=4: LO.UL[2] += Rs.SS[4] * Rt.SS[4]
-	armAsm->Smov(a64::w9, VT.V8H(), 4);
-	armAsm->Smov(a64::w10, VS.V8H(), 4);
-	armAsm->Smull(a64::x11, a64::w9, a64::w10);
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET + 8));
-	armAsm->Add(a64::w12, a64::w12, a64::w11);
-	armAsm->Str(a64::w12, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET + 8));
-
-	// n=5: LO.UL[3] += Rs.SS[5] * Rt.SS[5]
-	armAsm->Smov(a64::w9, VT.V8H(), 5);
-	armAsm->Smov(a64::w10, VS.V8H(), 5);
-	armAsm->Smull(a64::x11, a64::w9, a64::w10);
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET + 12));
-	armAsm->Add(a64::w12, a64::w12, a64::w11);
-	armAsm->Str(a64::w12, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET + 12));
-
-	// n=6: HI.UL[2] += Rs.SS[6] * Rt.SS[6]
-	armAsm->Smov(a64::w9, VT.V8H(), 6);
-	armAsm->Smov(a64::w10, VS.V8H(), 6);
-	armAsm->Smull(a64::x11, a64::w9, a64::w10);
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET + 8));
-	armAsm->Add(a64::w12, a64::w12, a64::w11);
-	armAsm->Str(a64::w12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET + 8));
-
-	// n=7: HI.UL[3] += Rs.SS[7] * Rt.SS[7]
-	armAsm->Smov(a64::w9, VT.V8H(), 7);
-	armAsm->Smov(a64::w10, VS.V8H(), 7);
-	armAsm->Smull(a64::x11, a64::w9, a64::w10);
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET + 12));
-	armAsm->Add(a64::w12, a64::w12, a64::w11);
-	armAsm->Str(a64::w12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET + 12));
-
-	// GPR[rd] if rd != 0: {LO.UL[2], HI.UL[2], LO.UL[0], HI.UL[0]}
-	// Actually per interpreter: UL[0]=LO.UL[0], UL[1]=HI.UL[0], UL[2]=LO.UL[2], UL[3]=HI.UL[2]
-	if (rd != 0) {
-		armAsm->Ldr(a64::x9, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET));
-		armAsm->Ldr(a64::x10, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET));
-		armAsm->Bfi(a64::x9, a64::x10, 32, 32);
-		armAsm->Ldr(a64::x11, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET + 8));
-		armAsm->Ldr(a64::x12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET + 8));
-		armAsm->Bfi(a64::x11, a64::x12, 32, 32);
-		armAsm->Str(a64::x9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd)));
-		armAsm->Str(a64::x11, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd) + 8));
-	}
-}
-
-// -----------------------------------------------------------------------------
-// PMSUBH: Halfword multiply-subtract (8 lanes)
-// -----------------------------------------------------------------------------
-// For n = 0,1,2,3,4,5,6,7:
-//   temp = LO/HI.UL[n] - Rs.SS[n] * Rt.SS[n]
-//   LO/HI.UL[n] = temp (alternating: n even -> LO, n odd -> HI)
-//   if (Rd) { GPR[rd].UL[0]=LO.UL[0], GPR[rd].UL[1]=HI.UL[0],
-//             GPR[rd].UL[2]=LO.UL[2], GPR[rd].UL[3]=HI.UL[2] }
-void armEmitPMSUBH(u32 rd, u32 rs, u32 rt)
-{
-	loadQ(VS, rs);
-	loadQ(VT, rt);
-
-	// n=0: LO.UL[0] -= Rs.SS[0] * Rt.SS[0]
-	armAsm->Smov(a64::w9, VT.V8H(), 0);
-	armAsm->Smov(a64::w10, VS.V8H(), 0);
-	armAsm->Smull(a64::x11, a64::w9, a64::w10);
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET));
-	armAsm->Sub(a64::w12, a64::w12, a64::w11);
-	armAsm->Str(a64::w12, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET));
-
-	// n=1: LO.UL[1] -= Rs.SS[1] * Rt.SS[1]
-	armAsm->Smov(a64::w9, VT.V8H(), 1);
-	armAsm->Smov(a64::w10, VS.V8H(), 1);
-	armAsm->Smull(a64::x11, a64::w9, a64::w10);
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET + 4));
-	armAsm->Sub(a64::w12, a64::w12, a64::w11);
-	armAsm->Str(a64::w12, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET + 4));
-
-	// n=2: HI.UL[0] -= Rs.SS[2] * Rt.SS[2]
-	armAsm->Smov(a64::w9, VT.V8H(), 2);
-	armAsm->Smov(a64::w10, VS.V8H(), 2);
-	armAsm->Smull(a64::x11, a64::w9, a64::w10);
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET));
-	armAsm->Sub(a64::w12, a64::w12, a64::w11);
-	armAsm->Str(a64::w12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET));
-
-	// n=3: HI.UL[1] -= Rs.SS[3] * Rt.SS[3]
-	armAsm->Smov(a64::w9, VT.V8H(), 3);
-	armAsm->Smov(a64::w10, VS.V8H(), 3);
-	armAsm->Smull(a64::x11, a64::w9, a64::w10);
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET + 4));
-	armAsm->Sub(a64::w12, a64::w12, a64::w11);
-	armAsm->Str(a64::w12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET + 4));
-
-	// n=4: LO.UL[2] -= Rs.SS[4] * Rt.SS[4]
-	armAsm->Smov(a64::w9, VT.V8H(), 4);
-	armAsm->Smov(a64::w10, VS.V8H(), 4);
-	armAsm->Smull(a64::x11, a64::w9, a64::w10);
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET + 8));
-	armAsm->Sub(a64::w12, a64::w12, a64::w11);
-	armAsm->Str(a64::w12, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET + 8));
-
-	// n=5: LO.UL[3] -= Rs.SS[5] * Rt.SS[5]
-	armAsm->Smov(a64::w9, VT.V8H(), 5);
-	armAsm->Smov(a64::w10, VS.V8H(), 5);
-	armAsm->Smull(a64::x11, a64::w9, a64::w10);
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET + 12));
-	armAsm->Sub(a64::w12, a64::w12, a64::w11);
-	armAsm->Str(a64::w12, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET + 12));
-
-	// n=6: HI.UL[2] -= Rs.SS[6] * Rt.SS[6]
-	armAsm->Smov(a64::w9, VT.V8H(), 6);
-	armAsm->Smov(a64::w10, VS.V8H(), 6);
-	armAsm->Smull(a64::x11, a64::w9, a64::w10);
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET + 8));
-	armAsm->Sub(a64::w12, a64::w12, a64::w11);
-	armAsm->Str(a64::w12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET + 8));
-
-	// n=7: HI.UL[3] -= Rs.SS[7] * Rt.SS[7]
-	armAsm->Smov(a64::w9, VT.V8H(), 7);
-	armAsm->Smov(a64::w10, VS.V8H(), 7);
-	armAsm->Smull(a64::x11, a64::w9, a64::w10);
-	armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET + 12));
-	armAsm->Sub(a64::w12, a64::w12, a64::w11);
-	armAsm->Str(a64::w12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET + 12));
-
-	// GPR[rd] if rd != 0
-	if (rd != 0) {
-		armAsm->Ldr(a64::x9, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET));
-		armAsm->Ldr(a64::x10, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET));
-		armAsm->Bfi(a64::x9, a64::x10, 32, 32);
-		armAsm->Ldr(a64::x11, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET + 8));
-		armAsm->Ldr(a64::x12, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET + 8));
-		armAsm->Bfi(a64::x11, a64::x12, 32, 32);
-		armAsm->Str(a64::x9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd)));
-		armAsm->Str(a64::x11, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd) + 8));
-	}
-}
-
-// -----------------------------------------------------------------------------
-// PHMADH: Packed halfword multiply-add (8 lanes, paired)
-// -----------------------------------------------------------------------------
-// For n = 0,2,4,6:
-//   temp = Rs.SS[n]*Rt.SS[n] + Rs.SS[n+1]*Rt.SS[n+1]
-//   if (n%4==0) LO.UL[n/2] += temp; else HI.UL[n/2] += temp
-//   if (Rd) { GPR[rd].UL[0]=LO.UL[0], GPR[rd].UL[1]=HI.UL[0], ... }
-// One PHMADH/PHMSBH pair (Rs/Rt already loaded into VS/VT):
-//   firsttemp = Rs.SS[n+1] * Rt.SS[n+1]
-//   add: temp = firsttemp + Rs.SS[n]*Rt.SS[n];  odd lane = firsttemp
-//   sub: temp = firsttemp - Rs.SS[n]*Rt.SS[n];  odd lane = ~firsttemp (undocumented)
-// `offTemp`/`offFirst` are the even/odd destination lane offsets. No accumulation
-// with the previous LO/HI contents (matches the interpreter).
-static void emitPHMPair(int n, u32 offTemp, u32 offFirst, bool sub)
-{
-	armAsm->Smov(a64::w9, VT.V8H(), n + 1);
-	armAsm->Smov(a64::w10, VS.V8H(), n + 1);
-	armAsm->Mul(a64::w11, a64::w9, a64::w10); // firsttemp
-	armAsm->Smov(a64::w9, VT.V8H(), n);
-	armAsm->Smov(a64::w10, VS.V8H(), n);
-	armAsm->Mul(a64::w12, a64::w9, a64::w10); // Rs.SS[n] * Rt.SS[n]
-	if (sub)
-	{
-		armAsm->Sub(a64::w9, a64::w11, a64::w12);
-		armAsm->Str(a64::w9, a64::MemOperand(RESTATEPTR, offTemp));
-		armAsm->Mvn(a64::w11, a64::w11); // ~firsttemp
-	}
-	else
-	{
-		armAsm->Add(a64::w9, a64::w11, a64::w12);
-		armAsm->Str(a64::w9, a64::MemOperand(RESTATEPTR, offTemp));
-	}
-	armAsm->Str(a64::w11, a64::MemOperand(RESTATEPTR, offFirst));
-}
-
-void armEmitPHMADH(u32 rd, u32 rs, u32 rt)
-{
-	loadQ(VS, rs);
-	loadQ(VT, rt);
-	emitPHMPair(/*n*/ 0, EE_LO_OFFSET + 0, EE_LO_OFFSET + 4, /*sub*/ false);
-	emitPHMPair(/*n*/ 2, EE_HI_OFFSET + 0, EE_HI_OFFSET + 4, /*sub*/ false);
-	emitPHMPair(/*n*/ 4, EE_LO_OFFSET + 8, EE_LO_OFFSET + 12, /*sub*/ false);
-	emitPHMPair(/*n*/ 6, EE_HI_OFFSET + 8, EE_HI_OFFSET + 12, /*sub*/ false);
-	emitHalfwordMacStoreRd(rd);
-}
-
-// -----------------------------------------------------------------------------
-// PHMSBH: Packed halfword multiply-subtract (8 lanes, paired)
-// -----------------------------------------------------------------------------
-// For n = 0,2,4,6:
-//   temp = Rs.SS[n]*Rt.SS[n] - Rs.SS[n+1]*Rt.SS[n+1]
-//   if (n%4==0) LO.UL[n/2] += temp; else HI.UL[n/2] += temp
-void armEmitPHMSBH(u32 rd, u32 rs, u32 rt)
-{
-	loadQ(VS, rs);
-	loadQ(VT, rt);
-	emitPHMPair(/*n*/ 0, EE_LO_OFFSET + 0, EE_LO_OFFSET + 4, /*sub*/ true);
-	emitPHMPair(/*n*/ 2, EE_HI_OFFSET + 0, EE_HI_OFFSET + 4, /*sub*/ true);
-	emitPHMPair(/*n*/ 4, EE_LO_OFFSET + 8, EE_LO_OFFSET + 12, /*sub*/ true);
-	emitPHMPair(/*n*/ 6, EE_HI_OFFSET + 8, EE_HI_OFFSET + 12, /*sub*/ true);
-	emitHalfwordMacStoreRd(rd);
-}
-
-// -----------------------------------------------------------------------------
-// PMFHI/PMFLO/PMTHI/PMTLO: MMI HI/LO moves (full 128-bit)
-// -----------------------------------------------------------------------------
-// PMFHI: Rd = HI (full 128-bit)
-// PMFLO: Rd = LO (full 128-bit)
-// PMTHI: HI = Rs (full 128-bit)
-// PMTLO: LO = Rs (full 128-bit)
-void armEmitPMFHI(u32 rd)
-{
-	if (rd == 0)
-		return;
-	// Load full 128-bit HI into q-register
-	armAsm->Ldr(VD.Q(), a64::MemOperand(RESTATEPTR, EE_HI_OFFSET));
-	armAsm->Str(VD.Q(), a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd)));
-}
-
-void armEmitPMFLO(u32 rd)
-{
-	if (rd == 0)
-		return;
-	armAsm->Ldr(VD.Q(), a64::MemOperand(RESTATEPTR, EE_LO_OFFSET));
-	armAsm->Str(VD.Q(), a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd)));
-}
-
-void armEmitPMTHI(u32 rs)
-{
-	armAsm->Ldr(VD.Q(), a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-	armAsm->Str(VD.Q(), a64::MemOperand(RESTATEPTR, EE_HI_OFFSET));
-}
-
-void armEmitPMTLO(u32 rs)
-{
-	armAsm->Ldr(VD.Q(), a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-	armAsm->Str(VD.Q(), a64::MemOperand(RESTATEPTR, EE_LO_OFFSET));
-}
-
-// =============================================================================
-// Remaining MMI misc ops (Phase 5.4 completion)
-// =============================================================================
-
-// -----------------------------------------------------------------------------
-// PLZCW: Count leading sign bits (excluding the sign bit itself)
-// -----------------------------------------------------------------------------
-// GPR[rd].UL[0] = CountLeadingSignBits(Rs.SL[0]) - 1
-// GPR[rd].UL[1] = CountLeadingSignBits(Rs.SL[1]) - 1
-void armEmitPLZCW(u32 rd, u32 rs)
-{
-	if (rd == 0)
+	if (_Sa_ != 0)
 		return;
 
-	// Interpreter: GPR[rd].UL[n] = CountLeadingSignBits(Rs.SL[n]) - 1.
-	// ARM64 CLS counts leading bits equal to the sign bit *excluding* the sign
-	// bit, which is exactly CountLeadingSignBits(x) - 1 — so no adjustment.
-	// Lane 0 (low 32 bits)
-	armAsm->Ldr(WTEMP1, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-	armAsm->Cls(WTEMP2, WTEMP1);
-	armAsm->Str(WTEMP2, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd)));
+	armLoadGPR128(a64::q0, _Rs_);
+	armAsm->Ldr(a64::q3, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+	armAsm->Ldr(a64::q4, a64::MemOperand(RCPUSTATE, HI_OFFSET));
 
-	// Lane 1 (high 32 bits of low 64 bits)
-	armAsm->Ldr(WTEMP1, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs) + 4));
-	armAsm->Cls(WTEMP2, WTEMP1);
-	armAsm->Str(WTEMP2, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd) + 4));
+	// LO.L[0] ← Rs.L[0], LO.L[2] ← Rs.L[2] (lanes 1 and 3 of LO preserved).
+	armAsm->Ins(a64::v3.S(), 0, a64::v0.S(), 0);
+	armAsm->Ins(a64::v3.S(), 2, a64::v0.S(), 2);
+	// HI.L[0] ← Rs.L[1], HI.L[2] ← Rs.L[3] (lanes 1 and 3 of HI preserved).
+	armAsm->Ins(a64::v4.S(), 0, a64::v0.S(), 1);
+	armAsm->Ins(a64::v4.S(), 2, a64::v0.S(), 3);
+
+	armAsm->Str(a64::q3, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+	armAsm->Str(a64::q4, a64::MemOperand(RCPUSTATE, HI_OFFSET));
 }
+#endif
 
-// -----------------------------------------------------------------------------
-// PADSBH: Packed add/subtract halfwords (subtract low 4, add high 4)
-// -----------------------------------------------------------------------------
-// Rd.US[0..3] = Rs.US[0..3] - Rt.US[0..3] (no saturation, just truncate)
-// Rd.US[4..7] = Rs.US[4..7] + Rt.US[4..7] (no saturation, just truncate)
-void armEmitPADSBH(u32 rd, u32 rs, u32 rt)
+// ---- Packed shifts (immediate sa) ----
+
+#if ISTUB_PSLLH
+void recPSLLH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PSLLH); }
+#else
+void recPSLLH()
 {
-	if (rd == 0)
+	const int sa = _Sa_ & 0xF;
+	armMMIUnaryOp([sa]() {
+		armAsm->Shl(a64::v0.V8H(), a64::v0.V8H(), sa);
+	});
+}
+#endif
+
+#if ISTUB_PSRLH
+void recPSRLH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PSRLH); }
+#else
+void recPSRLH()
+{
+	const int sa = _Sa_ & 0xF;
+	armMMIUnaryOp([sa]() {
+		if (sa != 0)
+			armAsm->Ushr(a64::v0.V8H(), a64::v0.V8H(), sa);
+	});
+}
+#endif
+
+#if ISTUB_PSRAH
+void recPSRAH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PSRAH); }
+#else
+void recPSRAH()
+{
+	const int sa = _Sa_ & 0xF;
+	armMMIUnaryOp([sa]() {
+		if (sa != 0)
+			armAsm->Sshr(a64::v0.V8H(), a64::v0.V8H(), sa);
+	});
+}
+#endif
+
+#if ISTUB_PSLLW
+void recPSLLW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PSLLW); }
+#else
+void recPSLLW()
+{
+	const int sa = _Sa_;
+	armMMIUnaryOp([sa]() {
+		armAsm->Shl(a64::v0.V4S(), a64::v0.V4S(), sa);
+	});
+}
+#endif
+
+#if ISTUB_PSRLW
+void recPSRLW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PSRLW); }
+#else
+void recPSRLW()
+{
+	const int sa = _Sa_;
+	armMMIUnaryOp([sa]() {
+		if (sa != 0)
+			armAsm->Ushr(a64::v0.V4S(), a64::v0.V4S(), sa);
+	});
+}
+#endif
+
+#if ISTUB_PSRAW
+void recPSRAW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PSRAW); }
+#else
+void recPSRAW()
+{
+	const int sa = _Sa_;
+	armMMIUnaryOp([sa]() {
+		if (sa != 0)
+			armAsm->Sshr(a64::v0.V4S(), a64::v0.V4S(), sa);
+	});
+}
+#endif
+
+// ============================================================================
+//  MMI0 — PADDW/H/B, PSUBW/H/B, saturating, unsigned-sat, compare, pack/interleave
+// ============================================================================
+
+#if ISTUB_PADDW
+void recPADDW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PADDW); }
+#else
+void recPADDW() { armMMIBinOp([]() { armAsm->Add(a64::v0.V4S(), a64::v0.V4S(), a64::v1.V4S()); }); }
+#endif
+
+#if ISTUB_PSUBW
+void recPSUBW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PSUBW); }
+#else
+void recPSUBW() { armMMIBinOp([]() { armAsm->Sub(a64::v0.V4S(), a64::v0.V4S(), a64::v1.V4S()); }); }
+#endif
+
+#if ISTUB_PCGTW
+void recPCGTW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PCGTW); }
+#else
+void recPCGTW() { armMMIBinOp([]() { armAsm->Cmgt(a64::v0.V4S(), a64::v0.V4S(), a64::v1.V4S()); }); }
+#endif
+
+#if ISTUB_PMAXW
+void recPMAXW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMAXW); }
+#else
+void recPMAXW() { armMMIBinOp([]() { armAsm->Smax(a64::v0.V4S(), a64::v0.V4S(), a64::v1.V4S()); }); }
+#endif
+
+#if ISTUB_PADDH
+void recPADDH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PADDH); }
+#else
+void recPADDH() { armMMIBinOp([]() { armAsm->Add(a64::v0.V8H(), a64::v0.V8H(), a64::v1.V8H()); }); }
+#endif
+
+#if ISTUB_PSUBH
+void recPSUBH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PSUBH); }
+#else
+void recPSUBH() { armMMIBinOp([]() { armAsm->Sub(a64::v0.V8H(), a64::v0.V8H(), a64::v1.V8H()); }); }
+#endif
+
+#if ISTUB_PCGTH
+void recPCGTH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PCGTH); }
+#else
+void recPCGTH() { armMMIBinOp([]() { armAsm->Cmgt(a64::v0.V8H(), a64::v0.V8H(), a64::v1.V8H()); }); }
+#endif
+
+#if ISTUB_PMAXH
+void recPMAXH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMAXH); }
+#else
+void recPMAXH() { armMMIBinOp([]() { armAsm->Smax(a64::v0.V8H(), a64::v0.V8H(), a64::v1.V8H()); }); }
+#endif
+
+#if ISTUB_PADDB
+void recPADDB() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PADDB); }
+#else
+void recPADDB() { armMMIBinOp([]() { armAsm->Add(a64::v0.V16B(), a64::v0.V16B(), a64::v1.V16B()); }); }
+#endif
+
+#if ISTUB_PSUBB
+void recPSUBB() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PSUBB); }
+#else
+void recPSUBB() { armMMIBinOp([]() { armAsm->Sub(a64::v0.V16B(), a64::v0.V16B(), a64::v1.V16B()); }); }
+#endif
+
+#if ISTUB_PCGTB
+void recPCGTB() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PCGTB); }
+#else
+void recPCGTB() { armMMIBinOp([]() { armAsm->Cmgt(a64::v0.V16B(), a64::v0.V16B(), a64::v1.V16B()); }); }
+#endif
+
+#if ISTUB_PADDSW
+void recPADDSW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PADDSW); }
+#else
+void recPADDSW() { armMMIBinOp([]() { armAsm->Sqadd(a64::v0.V4S(), a64::v0.V4S(), a64::v1.V4S()); }); }
+#endif
+
+#if ISTUB_PSUBSW
+void recPSUBSW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PSUBSW); }
+#else
+void recPSUBSW() { armMMIBinOp([]() { armAsm->Sqsub(a64::v0.V4S(), a64::v0.V4S(), a64::v1.V4S()); }); }
+#endif
+
+#if ISTUB_PEXTLW
+void recPEXTLW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PEXTLW); }
+#else
+void recPEXTLW() { armMMIBinOp([]() { armAsm->Zip1(a64::v0.V4S(), a64::v1.V4S(), a64::v0.V4S()); }); }
+#endif
+
+#if ISTUB_PPACW
+void recPPACW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PPACW); }
+#else
+void recPPACW() { armMMIBinOp([]() { armAsm->Uzp1(a64::v0.V4S(), a64::v1.V4S(), a64::v0.V4S()); }); }
+#endif
+
+#if ISTUB_PADDSH
+void recPADDSH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PADDSH); }
+#else
+void recPADDSH() { armMMIBinOp([]() { armAsm->Sqadd(a64::v0.V8H(), a64::v0.V8H(), a64::v1.V8H()); }); }
+#endif
+
+#if ISTUB_PSUBSH
+void recPSUBSH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PSUBSH); }
+#else
+void recPSUBSH() { armMMIBinOp([]() { armAsm->Sqsub(a64::v0.V8H(), a64::v0.V8H(), a64::v1.V8H()); }); }
+#endif
+
+#if ISTUB_PEXTLH
+void recPEXTLH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PEXTLH); }
+#else
+void recPEXTLH() { armMMIBinOp([]() { armAsm->Zip1(a64::v0.V8H(), a64::v1.V8H(), a64::v0.V8H()); }); }
+#endif
+
+#if ISTUB_PPACH
+void recPPACH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PPACH); }
+#else
+void recPPACH() { armMMIBinOp([]() { armAsm->Uzp1(a64::v0.V8H(), a64::v1.V8H(), a64::v0.V8H()); }); }
+#endif
+
+#if ISTUB_PADDSB
+void recPADDSB() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PADDSB); }
+#else
+void recPADDSB() { armMMIBinOp([]() { armAsm->Sqadd(a64::v0.V16B(), a64::v0.V16B(), a64::v1.V16B()); }); }
+#endif
+
+#if ISTUB_PSUBSB
+void recPSUBSB() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PSUBSB); }
+#else
+void recPSUBSB() { armMMIBinOp([]() { armAsm->Sqsub(a64::v0.V16B(), a64::v0.V16B(), a64::v1.V16B()); }); }
+#endif
+
+#if ISTUB_PEXTLB
+void recPEXTLB() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PEXTLB); }
+#else
+void recPEXTLB() { armMMIBinOp([]() { armAsm->Zip1(a64::v0.V16B(), a64::v1.V16B(), a64::v0.V16B()); }); }
+#endif
+
+#if ISTUB_PPACB
+void recPPACB() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PPACB); }
+#else
+void recPPACB() { armMMIBinOp([]() { armAsm->Uzp1(a64::v0.V16B(), a64::v1.V16B(), a64::v0.V16B()); }); }
+#endif
+
+#if ISTUB_PEXT5
+void recPEXT5() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PEXT5); }
+#else
+// RGB5A1 (5+5+5+1 packed per 32-bit word) → RGBA8888 expansion.  Direct port
+// of x86 recPEXT5 shift/mask chain (iMMI.cpp:548-578) — per 32-bit lane:
+//   out.bit[  0.. 4] = in.bit[ 0.. 4] << 3   (R5 → R8 high-5)
+//   out.bit[  8..12] = in.bit[ 5.. 9] << 3   (G5 → G8 high-5)
+//   out.bit[ 16..20] = in.bit[10..14] << 3   (B5 → B8 high-5)
+//   out.bit[     31] = in.bit[    15]        (A1 → A8 MSB)
+// Low 3 bits of each channel and bits 5..7 of alpha are zero (PS2 behaviour).
+void recPEXT5()
+{
+	if (!_Rd_)
 		return;
+	armDelConstReg(_Rd_);
+	armLoadGPR128(a64::q0, _Rt_);
 
-	loadQ(VS, rs);
-	loadQ(VT, rt);
+	// v1 = t0reg (B5 bits + A1 bit pre-position), v2 = t1reg, v3 = D (R5 + G5).
 
-	// Lanes 0-3: subtract (low 4 halfwords)
-	for (int i = 0; i < 4; i++) {
-		armAsm->Smov(a64::w9, VS.V8H(), i);
-		armAsm->Smov(a64::w10, VT.V8H(), i);
-		armAsm->Sub(a64::w11, a64::w9, a64::w10);
-		armAsm->Ins(VD.V8H(), i, a64::w11); // insert low 16 bits (w11 -> halfword lane i)
-	}
-	// Lanes 4-7: add (high 4 halfwords)
-	for (int i = 4; i < 8; i++) {
-		armAsm->Smov(a64::w9, VS.V8H(), i);
-		armAsm->Smov(a64::w10, VT.V8H(), i);
-		armAsm->Add(a64::w11, a64::w9, a64::w10);
-		armAsm->Ins(VD.V8H(), i, a64::w11);
-	}
+	// Extract G5 (bits 5..9) → bits 0..4 of v1.
+	armAsm->Shl(a64::v1.V4S(), a64::v0.V4S(), 22);
+	// Extract A1 (bit 15 of each halfword) → bit 0 of each halfword in v2.
+	armAsm->Ushr(a64::v2.V8H(), a64::v0.V8H(), 15);
+	armAsm->Ushr(a64::v1.V4S(), a64::v1.V4S(), 27);
+	// A1 → bit 20 of each 32b lane (so final shift<<11 puts it at bit 31).
+	armAsm->Shl(a64::v2.V4S(), a64::v2.V4S(), 20);
+	armAsm->Orr(a64::v1.V16B(), a64::v1.V16B(), a64::v2.V16B());
 
-	storeQ(VD, rd);
+	// Extract B5 (bits 10..14) → bits 0..4 of high halfword of each 32b lane
+	// (via dword shift 17 then word shift 11).
+	armAsm->Shl(a64::v2.V4S(), a64::v0.V4S(), 17);
+	// Extract R5 (bits 0..4) → bits 0..4 of v3.
+	armAsm->Shl(a64::v3.V4S(), a64::v0.V4S(), 27);
+	armAsm->Ushr(a64::v3.V4S(), a64::v3.V4S(), 27);
+	armAsm->Ushr(a64::v2.V8H(), a64::v2.V8H(), 11);
+	armAsm->Orr(a64::v3.V16B(), a64::v3.V16B(), a64::v2.V16B());
+
+	// Final assembly: low halfword of each 32b contains R5 (bits 0..4) + B5
+	// (bits 16..20 after the halfword shift).  << 3 places them at RGBA8
+	// positions.  t0reg holds G5 at bits 0..4 and A1 at bit 20; << 11 puts
+	// G5 at bit 11 (wait, matches PS2 RGB5→RGBA8 per x86 shift chain).
+	armAsm->Shl(a64::v3.V8H(), a64::v3.V8H(), 3);
+	armAsm->Shl(a64::v1.V8H(), a64::v1.V8H(), 11);
+	armAsm->Orr(a64::v3.V16B(), a64::v3.V16B(), a64::v1.V16B());
+
+	armStoreGPR128(_Rd_, a64::q3);
 }
+#endif
 
-// QFSRV is handled by the interpreter (its shift amount is the runtime SA
-// register cpuRegs.sa, not an instruction immediate), so there is no generator.
-
-// -----------------------------------------------------------------------------
-// PEXT5: Pack 5-bit fields (extract and expand 5-bit fields to 8-bit)
-// -----------------------------------------------------------------------------
-// For each 32-bit lane:
-//   Rd.UL[n] = ((Rt.UL[n] & 0x1F) << 3) | ((Rt.UL[n] & 0x3E0) << 6) |
-//              ((Rt.UL[n] & 0x7C00) << 9) | ((Rt.UL[n] & 0x8000) << 16)
-// This expands four 5-bit fields (at bits 0-4, 5-9, 10-14, 15) to four 8-bit fields
-void armEmitPEXT5(u32 rd, u32 rt)
+#if ISTUB_PPAC5
+void recPPAC5() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PPAC5); }
+#else
+// RGBA8888 → RGB5A1 compression.  Direct port of x86 recPPAC5 (iMMI.cpp:581-613):
+//   out.bit[ 0.. 4] = in.bit[ 3.. 7]   (R high 5)
+//   out.bit[ 5.. 9] = in.bit[11..15]   (G high 5)
+//   out.bit[10..14] = in.bit[19..23]   (B high 5)
+//   out.bit[    15] = in.bit[    31]   (A MSB)
+//   out.bit[16..31] = 0
+// The x86 sequence builds R+G into D, B+A into t0, then uses a 0x3FF mask
+// to merge (keep R+G from D, B+A from t0).  We mirror via NEON Bic.
+void recPPAC5()
 {
-	if (rd == 0)
+	if (!_Rd_)
 		return;
+	armDelConstReg(_Rd_);
+	armLoadGPR128(a64::q0, _Rt_);
 
-	// Load Rt and process each 32-bit lane
-	for (int lane = 0; lane < 4; lane++) {
-		u32 offset = EE_GPR_OFFSET(rt) + lane * 4;
-		u32 outOffset = EE_GPR_OFFSET(rd) + lane * 4;
+	// v1 = t0reg (B5 + A1 bit), v2 = t1reg (scratch + final mask), v3 = D (R5 + G5).
 
-		armAsm->Ldr(WTEMP1, a64::MemOperand(RESTATEPTR, offset));
-		// Extract and expand each 5-bit field
-		// Field 0: bits 0-4 -> bits 0-7 (<< 3)
-		armAsm->And(WTEMP2, WTEMP1, 0x1F);
-		armAsm->Lsl(WTEMP2, WTEMP2, 3);
-		// Field 1: bits 5-9 -> bits 8-15 (<< 6)
-		armAsm->And(WTEMP3, WTEMP1, 0x3E0);
-		armAsm->Lsl(WTEMP3, WTEMP3, 6);
-		armAsm->Orr(WTEMP2, WTEMP2, WTEMP3);
-		// Field 2: bits 10-14 -> bits 16-23 (<< 9)
-		armAsm->And(WTEMP3, WTEMP1, 0x7C00);
-		armAsm->Lsl(WTEMP3, WTEMP3, 9);
-		armAsm->Orr(WTEMP2, WTEMP2, WTEMP3);
-		// Field 3: bit 15 -> bits 24-31 (<< 16)
-		armAsm->And(WTEMP3, WTEMP1, 0x8000);
-		armAsm->Lsl(WTEMP3, WTEMP3, 16);
-		armAsm->Orr(WTEMP2, WTEMP2, WTEMP3);
+	// t0 = (in << 8) >> 17  → bits 10..14 of T at bits 0..4 of v1.
+	armAsm->Shl(a64::v1.V4S(), a64::v0.V4S(), 8);
+	// t1 = (in >> 31) << 15 → bit 31 of T at bit 15 of v2.
+	armAsm->Ushr(a64::v2.V4S(), a64::v0.V4S(), 31);
+	armAsm->Ushr(a64::v1.V4S(), a64::v1.V4S(), 17);
+	armAsm->Shl(a64::v2.V4S(), a64::v2.V4S(), 15);
+	armAsm->Orr(a64::v1.V16B(), a64::v1.V16B(), a64::v2.V16B());
 
-		armAsm->Str(WTEMP2, a64::MemOperand(RESTATEPTR, outOffset));
-	}
+	// D = (in << 24) >> 27 | (in >> 11) << 5  → R5 at bits 0..4, G5 at bits 5..9.
+	armAsm->Ushr(a64::v2.V4S(), a64::v0.V4S(), 11);
+	armAsm->Shl(a64::v3.V4S(), a64::v0.V4S(), 24);
+	armAsm->Ushr(a64::v3.V4S(), a64::v3.V4S(), 27);
+	armAsm->Shl(a64::v2.V4S(), a64::v2.V4S(), 5);
+	armAsm->Orr(a64::v3.V16B(), a64::v3.V16B(), a64::v2.V16B());
+
+	// Build 0x3FF mask per 32b lane (all-ones >> 22) to keep only R+G bits of D,
+	// then OR in B+A from t0 (via Bic for PANDN semantics).
+	armAsm->Movi(a64::v2.V16B(), 0xFF);
+	armAsm->Ushr(a64::v2.V4S(), a64::v2.V4S(), 22);
+	armAsm->And(a64::v3.V16B(), a64::v3.V16B(), a64::v2.V16B());
+	// PANDN(t1, t0) → t1 = (~t1) & t0.  NEON Bic(Vd, Vn, Vm) = Vn AND NOT Vm,
+	// so Bic(v2, v1, v2) = v1 AND NOT v2.
+	armAsm->Bic(a64::v2.V16B(), a64::v1.V16B(), a64::v2.V16B());
+	armAsm->Orr(a64::v3.V16B(), a64::v3.V16B(), a64::v2.V16B());
+
+	armStoreGPR128(_Rd_, a64::q3);
 }
+#endif
 
-// -----------------------------------------------------------------------------
-// PPAC5: Unpack 5-bit fields (compress 8-bit fields to 5-bit)
-// -----------------------------------------------------------------------------
-// For each 32-bit lane:
-//   Rd.UL[n] = ((Rt.UL[n] >> 3) & 0x1F) | ((Rt.UL[n] >> 6) & 0x3E0) |
-//              ((Rt.UL[n] >> 9) & 0x7C00) | ((Rt.UL[n] >> 16) & 0x8000)
-void armEmitPPAC5(u32 rd, u32 rt)
+#if ISTUB_PADDUW
+void recPADDUW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PADDUW); }
+#else
+void recPADDUW() { armMMIBinOp([]() { armAsm->Uqadd(a64::v0.V4S(), a64::v0.V4S(), a64::v1.V4S()); }); }
+#endif
+
+#if ISTUB_PSUBUW
+void recPSUBUW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PSUBUW); }
+#else
+void recPSUBUW() { armMMIBinOp([]() { armAsm->Uqsub(a64::v0.V4S(), a64::v0.V4S(), a64::v1.V4S()); }); }
+#endif
+
+#if ISTUB_PEXTUW
+void recPEXTUW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PEXTUW); }
+#else
+void recPEXTUW() { armMMIBinOp([]() { armAsm->Zip2(a64::v0.V4S(), a64::v1.V4S(), a64::v0.V4S()); }); }
+#endif
+
+#if ISTUB_PADDUH
+void recPADDUH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PADDUH); }
+#else
+void recPADDUH() { armMMIBinOp([]() { armAsm->Uqadd(a64::v0.V8H(), a64::v0.V8H(), a64::v1.V8H()); }); }
+#endif
+
+#if ISTUB_PSUBUH
+void recPSUBUH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PSUBUH); }
+#else
+void recPSUBUH() { armMMIBinOp([]() { armAsm->Uqsub(a64::v0.V8H(), a64::v0.V8H(), a64::v1.V8H()); }); }
+#endif
+
+#if ISTUB_PEXTUH
+void recPEXTUH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PEXTUH); }
+#else
+void recPEXTUH() { armMMIBinOp([]() { armAsm->Zip2(a64::v0.V8H(), a64::v1.V8H(), a64::v0.V8H()); }); }
+#endif
+
+#if ISTUB_PADDUB
+void recPADDUB() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PADDUB); }
+#else
+void recPADDUB() { armMMIBinOp([]() { armAsm->Uqadd(a64::v0.V16B(), a64::v0.V16B(), a64::v1.V16B()); }); }
+#endif
+
+#if ISTUB_PSUBUB
+void recPSUBUB() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PSUBUB); }
+#else
+void recPSUBUB() { armMMIBinOp([]() { armAsm->Uqsub(a64::v0.V16B(), a64::v0.V16B(), a64::v1.V16B()); }); }
+#endif
+
+#if ISTUB_PEXTUB
+void recPEXTUB() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PEXTUB); }
+#else
+void recPEXTUB() { armMMIBinOp([]() { armAsm->Zip2(a64::v0.V16B(), a64::v1.V16B(), a64::v0.V16B()); }); }
+#endif
+
+// ============================================================================
+//  MMI1 — PABSW/H, PCEQW/H/B, PMIN/MAX, PADSBH, QFSRV
+// ============================================================================
+
+#if ISTUB_PABSW
+void recPABSW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PABSW); }
+#else
+void recPABSW() { armMMIUnaryOp([]() { armAsm->Sqabs(a64::v0.V4S(), a64::v0.V4S()); }); }
+#endif
+
+#if ISTUB_PCEQW
+void recPCEQW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PCEQW); }
+#else
+void recPCEQW() { armMMIBinOp([]() { armAsm->Cmeq(a64::v0.V4S(), a64::v0.V4S(), a64::v1.V4S()); }); }
+#endif
+
+#if ISTUB_PMINW
+void recPMINW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMINW); }
+#else
+void recPMINW() { armMMIBinOp([]() { armAsm->Smin(a64::v0.V4S(), a64::v0.V4S(), a64::v1.V4S()); }); }
+#endif
+
+#if ISTUB_PADSBH
+void recPADSBH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PADSBH); }
+#else
+void recPADSBH()
 {
-	if (rd == 0)
+	if (!_Rd_) return;
+	armDelConstReg(_Rd_);
+	armLoadGPR128(RVMMI0, _Rs_);
+	armLoadGPR128(RVMMI1, _Rt_);
+	armAsm->Sub(a64::v2.V8H(), a64::v0.V8H(), a64::v1.V8H());
+	armAsm->Add(a64::v0.V8H(), a64::v0.V8H(), a64::v1.V8H());
+	armAsm->Ins(a64::v2.D(), 1, a64::v0.D(), 1);
+	armStoreGPR128(_Rd_, RVMMI2);
+}
+#endif
+
+#if ISTUB_PABSH
+void recPABSH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PABSH); }
+#else
+void recPABSH() { armMMIUnaryOp([]() { armAsm->Sqabs(a64::v0.V8H(), a64::v0.V8H()); }); }
+#endif
+
+#if ISTUB_PCEQH
+void recPCEQH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PCEQH); }
+#else
+void recPCEQH() { armMMIBinOp([]() { armAsm->Cmeq(a64::v0.V8H(), a64::v0.V8H(), a64::v1.V8H()); }); }
+#endif
+
+#if ISTUB_PMINH
+void recPMINH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMINH); }
+#else
+void recPMINH() { armMMIBinOp([]() { armAsm->Smin(a64::v0.V8H(), a64::v0.V8H(), a64::v1.V8H()); }); }
+#endif
+
+#if ISTUB_PCEQB
+void recPCEQB() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PCEQB); }
+#else
+void recPCEQB() { armMMIBinOp([]() { armAsm->Cmeq(a64::v0.V16B(), a64::v0.V16B(), a64::v1.V16B()); }); }
+#endif
+
+#if ISTUB_PSLLVW
+void recPSLLVW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PSLLVW); }
+#else
+void recPSLLVW()
+{
+	if (!_Rd_) return;
+	armDelConstReg(_Rd_);
+	armLoadGPR128(RVMMI0, _Rt_);
+	armLoadGPR128(RVMMI1, _Rs_);
+	armAsm->Movi(a64::v2.V4S(), 31);
+	armAsm->And(a64::v1.V16B(), a64::v1.V16B(), a64::v2.V16B());
+	armAsm->Ushl(a64::v0.V4S(), a64::v0.V4S(), a64::v1.V4S());
+	armAsm->Ins(a64::v0.S(), 1, a64::v0.S(), 2);
+	armAsm->Sxtl(a64::v0.V2D(), a64::v0.V2S());
+	armStoreGPR128(_Rd_, RVMMI0);
+}
+#endif
+
+#if ISTUB_PSRLVW
+void recPSRLVW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PSRLVW); }
+#else
+void recPSRLVW()
+{
+	if (!_Rd_) return;
+	armDelConstReg(_Rd_);
+	armLoadGPR128(RVMMI0, _Rt_);
+	armLoadGPR128(RVMMI1, _Rs_);
+	armAsm->Movi(a64::v2.V4S(), 31);
+	armAsm->And(a64::v1.V16B(), a64::v1.V16B(), a64::v2.V16B());
+	armAsm->Neg(a64::v1.V4S(), a64::v1.V4S());
+	armAsm->Ushl(a64::v0.V4S(), a64::v0.V4S(), a64::v1.V4S());
+	armAsm->Ins(a64::v0.S(), 1, a64::v0.S(), 2);
+	armAsm->Sxtl(a64::v0.V2D(), a64::v0.V2S());
+	armStoreGPR128(_Rd_, RVMMI0);
+}
+#endif
+
+#if ISTUB_QFSRV
+void recQFSRV() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::QFSRV); }
+#else
+// 32-byte staging buffer for QFSRV's "concatenate Rt||Rs, extract 16B at +sa".
+// File-local static: EE JIT dispatches single-threaded so no synchronisation
+// is needed (same assumption as the XGKICK scratch in iVU1Lower_arm64.cpp).
+alignas(16) static u32 qfsrv_tempqw[8];
+
+// QFSRV: Rd = bytes[sa..sa+15] of the 32-byte concatenation {Rt, Rs},
+// where `sa` is a runtime value in cpuRegs.sa (0..15 per PS2 spec).
+// Mirrors x86 recQFSRV (iMMI.cpp:1268-1297) including the "_Rs_ == _Rt_ + 1"
+// fast path that avoids the staging buffer when the two GPRs are already
+// contiguous in cpuRegs.GPR.r[].
+void recQFSRV()
+{
+	if (!_Rd_)
 		return;
+	armDelConstReg(_Rd_);
 
-	// Load Rt and process each 32-bit lane
-	for (int lane = 0; lane < 4; lane++) {
-		u32 offset = EE_GPR_OFFSET(rt) + lane * 4;
-		u32 outOffset = EE_GPR_OFFSET(rd) + lane * 4;
-
-		armAsm->Ldr(WTEMP1, a64::MemOperand(RESTATEPTR, offset));
-		// Compress each 8-bit field to 5 bits
-		// Field 0: bits 0-7 -> bits 0-4 (>> 3)
-		armAsm->Lsr(WTEMP2, WTEMP1, 3);
-		armAsm->And(WTEMP2, WTEMP2, 0x1F);
-		// Field 1: bits 8-15 -> bits 5-9 (>> 6)
-		armAsm->Lsr(WTEMP3, WTEMP1, 6);
-		armAsm->And(WTEMP3, WTEMP3, 0x3E0);
-		armAsm->Orr(WTEMP2, WTEMP2, WTEMP3);
-		// Field 2: bits 16-23 -> bits 10-14 (>> 9)
-		armAsm->Lsr(WTEMP3, WTEMP1, 9);
-		armAsm->And(WTEMP3, WTEMP3, 0x7C00);
-		armAsm->Orr(WTEMP2, WTEMP2, WTEMP3);
-		// Field 3: bits 24-31 -> bit 15 (>> 16)
-		armAsm->Lsr(WTEMP3, WTEMP1, 16);
-		armAsm->And(WTEMP3, WTEMP3, 0x8000);
-		armAsm->Orr(WTEMP2, WTEMP2, WTEMP3);
-
-		armAsm->Str(WTEMP2, a64::MemOperand(RESTATEPTR, outOffset));
-	}
-}
-
-// -----------------------------------------------------------------------------
-// PMFHL: Move from HI/LO (multiple variants based on sa field)
-// -----------------------------------------------------------------------------
-// sa=0x00 (LW):  Rd = {LO.UL[0], HI.UL[0], LO.UL[2], HI.UL[2]}
-// sa=0x01 (UW):  Rd = {LO.UL[1], HI.UL[1], LO.UL[3], HI.UL[3]}
-// sa=0x02 (SLW): Rd = sign-clamp 64-bit from HI/LO pairs
-// sa=0x03 (LH):  Rd = {LO.US[0], LO.US[2], HI.US[0], HI.US[2], LO.US[4], LO.US[6], HI.US[4], HI.US[6]}
-// sa=0x04 (SH):  Rd = signed-saturate 16-bit from HI/LO
-bool armEmitPMFHL(u32 rd, u32 sa)
-{
-	if (rd == 0)
-		return true; // interpreter also no-ops when rd==0
-
-	switch (sa)
+	if (_Rs_ == _Rt_ + 1)
 	{
-	case 0x00: // LW: Rd = {LO.UL[0], HI.UL[0], LO.UL[2], HI.UL[2]}
-		armAsm->Ldr(a64::x9, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET));
-		armAsm->Ldr(a64::x10, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET));
-		armAsm->Bfi(a64::x9, a64::x10, 32, 32);
-		armAsm->Str(a64::x9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd)));
-		armAsm->Ldr(a64::x11, a64::MemOperand(RESTATEPTR, EE_LO1_OFFSET));
-		armAsm->Ldr(a64::x12, a64::MemOperand(RESTATEPTR, EE_HI1_OFFSET));
-		armAsm->Bfi(a64::x11, a64::x12, 32, 32);
-		armAsm->Str(a64::x11, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd) + 8));
-		return true;
+		// Fast path: adjacent GPRs are contiguous in memory.  Flush any
+		// cached/const state on Rt and Rs (matches x86 _flushEEreg), then
+		// load directly from &cpuRegs.GPR.r[_Rt_] + sa.
+		armFlushConstReg(_Rt_);
+		armGprFlush(_Rt_);
+		armFlushConstReg(_Rs_);
+		armGprFlush(_Rs_);
 
-	case 0x01: // UW: Rd = {LO.UL[1], HI.UL[1], LO.UL[3], HI.UL[3]}
-		armAsm->Ldr(a64::w9, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET + 4));
-		armAsm->Ldr(a64::w10, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET + 4));
-		armAsm->Bfi(a64::x9, a64::x10, 32, 32);
-		armAsm->Str(a64::x9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd)));
-		armAsm->Ldr(a64::w11, a64::MemOperand(RESTATEPTR, EE_LO1_OFFSET + 4));
-		armAsm->Ldr(a64::w12, a64::MemOperand(RESTATEPTR, EE_HI1_OFFSET + 4));
-		armAsm->Bfi(a64::x11, a64::x12, 32, 32);
-		armAsm->Str(a64::x11, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd) + 8));
-		return true;
-
-	case 0x02: // SLW: clamp each 64-bit {HI.UL[2k]:LO.UL[2k]} to signed 32-bit range
-	{
-		static const u32 loOff[2] = {EE_LO_OFFSET, EE_LO1_OFFSET};
-		static const u32 hiOff[2] = {EE_HI_OFFSET, EE_HI1_OFFSET};
-		for (int k = 0; k < 2; k++)
-		{
-			armAsm->Ldr(a64::w9, a64::MemOperand(RESTATEPTR, loOff[k]));  // LO.UL
-			armAsm->Ldr(a64::w10, a64::MemOperand(RESTATEPTR, hiOff[k])); // HI.UL
-			armAsm->Mov(a64::w11, a64::w9);          // zero-extend LO
-			armAsm->Bfi(a64::x11, a64::x10, 32, 32); // TempS64 = LO | (HI<<32)
-			armAsm->Sxtw(a64::x13, a64::w9);         // default: (s64)LO.SL
-			armAsm->Mov(a64::x12, 0x7fffffff);
-			armAsm->Cmp(a64::x11, a64::x12);
-			armAsm->Csel(a64::x13, a64::x12, a64::x13, a64::ge); // >= 0x7fffffff
-			armAsm->Mov(a64::x12, 0xffffffff80000000);
-			armAsm->Cmp(a64::x11, a64::x12);
-			armAsm->Csel(a64::x13, a64::x12, a64::x13, a64::le); // <= -0x80000000
-			armAsm->Str(a64::x13, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd) + k * 8));
-		}
-		return true;
+		armAsm->Add(RSCRATCHGPR, RCPUSTATE, GPR_OFFSET(_Rt_));
+		armAsm->Ldr(RWSCRATCH2, a64::MemOperand(RCPUSTATE, SA_OFFSET));
+		armAsm->Add(RSCRATCHGPR, RSCRATCHGPR, RSCRATCHGPR2);
+		armAsm->Ldr(a64::q0, a64::MemOperand(RSCRATCHGPR));
+		armStoreGPR128(_Rd_, a64::q0);
+		return;
 	}
 
-	case 0x03: // LH: pack the even halfwords of LO/HI (kHalfwordMacOff order)
-		for (int i = 0; i < 8; i++)
-		{
-			armAsm->Ldrh(WTEMP1, a64::MemOperand(RESTATEPTR, kHalfwordMacOff[i]));
-			armAsm->Strh(WTEMP1, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd) + i * 2));
-		}
-		return true;
+	// General path: stage Rt and Rs contiguously in qfsrv_tempqw, then do
+	// unaligned 128b load from [tempqw + sa].  ARM64 LDR Q supports unaligned
+	// access by default.
+	armLoadGPR128(a64::q0, _Rt_);
+	armLoadGPR128(a64::q1, _Rs_);
 
-	case 0x04: // SH: signed-saturate each LO/HI word to 16 bits (kHalfwordMacOff order)
-		for (int i = 0; i < 8; i++)
-		{
-			armAsm->Ldr(a64::w9, a64::MemOperand(RESTATEPTR, kHalfwordMacOff[i]));
-			armAsm->Mov(a64::w10, 0x7fff);
-			armAsm->Cmp(a64::w9, a64::w10);
-			armAsm->Csel(a64::w9, a64::w10, a64::w9, a64::gt); // > 0x7fff -> 0x7fff
-			armAsm->Mov(a64::w10, 0xffff8000);
-			armAsm->Cmp(a64::w9, a64::w10);
-			armAsm->Csel(a64::w9, a64::w10, a64::w9, a64::lt); // < -0x8000 -> 0x8000
-			armAsm->Strh(a64::w9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rd) + i * 2));
-		}
-		return true;
+	armAsm->Mov(RSCRATCHGPR, reinterpret_cast<uintptr_t>(qfsrv_tempqw));
+	armAsm->Str(a64::q0, a64::MemOperand(RSCRATCHGPR));
+	armAsm->Str(a64::q1, a64::MemOperand(RSCRATCHGPR, 16));
 
-	default:
-		return false; // unknown variant -> interpreter
-	}
+	armAsm->Ldr(RWSCRATCH2, a64::MemOperand(RCPUSTATE, SA_OFFSET));
+	armAsm->Add(RSCRATCHGPR, RSCRATCHGPR, RSCRATCHGPR2);
+	armAsm->Ldr(a64::q0, a64::MemOperand(RSCRATCHGPR));
+
+	armStoreGPR128(_Rd_, a64::q0);
 }
+#endif
 
-// -----------------------------------------------------------------------------
-// PMTHL: Move to HI/LO (sa=0 only)
-// -----------------------------------------------------------------------------
-// sa=0: LO = {Rs.UL[0], Rs.UL[1], Rs.UL[2], Rs.UL[3]}
-//       HI = {Rs.UL[1], Rs.UL[0], Rs.UL[3], Rs.UL[2]}
-// Actually per interpreter: LO.UL[0]=Rs.UL[0], HI.UL[0]=Rs.UL[1], LO.UL[2]=Rs.UL[2], HI.UL[2]=Rs.UL[3]
-void armEmitPMTHL(u32 rs, u32 sa)
+// ============================================================================
+//  MMI2 — PMADDW, PSLLVW, PMFHI/LO, PINTH, PMULTW, PDIVW, PCPYLD, PAND, PXOR,
+//          PMADDH, PHMADH, PMSUBH, PHMSBH, PMULTH, PDIVBW, PEXEW, PROT3W
+// ============================================================================
+
+#if ISTUB_PMADDW
+void recPMADDW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMADDW); }
+#else
+void recPMADDW()
 {
-	if (sa != 0)
-		return; // only PMTHL.LW (sa=0) is defined; interpreter no-ops otherwise
-
-	// The interpreter writes only the even words, leaving LO/HI.UL[1] and [3]
-	// untouched — so use 32-bit stores, not 64-bit (which would clobber them).
-	//   LO.UL[0]=Rs.UL[0]  HI.UL[0]=Rs.UL[1]  LO.UL[2]=Rs.UL[2]  HI.UL[2]=Rs.UL[3]
-	armAsm->Ldr(a64::w9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs)));
-	armAsm->Str(a64::w9, a64::MemOperand(RESTATEPTR, EE_LO_OFFSET));
-	armAsm->Ldr(a64::w9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs) + 4));
-	armAsm->Str(a64::w9, a64::MemOperand(RESTATEPTR, EE_HI_OFFSET));
-	armAsm->Ldr(a64::w9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs) + 8));
-	armAsm->Str(a64::w9, a64::MemOperand(RESTATEPTR, EE_LO1_OFFSET));
-	armAsm->Ldr(a64::w9, a64::MemOperand(RESTATEPTR, EE_GPR_OFFSET(rs) + 12));
-	armAsm->Str(a64::w9, a64::MemOperand(RESTATEPTR, EE_HI1_OFFSET));
+	// LO/HI are 128-bit accumulators, treated as two 64-bit slots (UD[0] and UD[1]).
+	// acc = { (s64)HI.SL[0]<<32 | (u32)LO.SL[0],  (s64)HI.SL[2]<<32 | (u32)LO.SL[2] }
+	// prod = { (s64)Rs.SL[0] * (s64)Rt.SL[0],  (s64)Rs.SL[2] * (s64)Rt.SL[2] }
+	// result = acc + prod
+	// new LO.SD[i] = sext32(result[i] & 0xFFFFFFFF)
+	// new HI.SD[i] = sext32(result[i] >> 32)
+	// Rd.SD[i]     = result[i]   (if Rd)
+	armDelConstReg(_Rd_);
+	armLoadGPR128(a64::q0, _Rs_);
+	armLoadGPR128(a64::q1, _Rt_);
+	// Extract words 0 and 2 into the lower 2×32 lanes
+	armAsm->Uzp1(a64::v0.V4S(), a64::v0.V4S(), a64::v0.V4S()); // {Rs[0],Rs[2],Rs[0],Rs[2]}
+	armAsm->Uzp1(a64::v1.V4S(), a64::v1.V4S(), a64::v1.V4S()); // {Rt[0],Rt[2],Rt[0],Rt[2]}
+	armAsm->Smull(a64::v2.V2D(), a64::v0.V2S(), a64::v1.V2S()); // prod = {Rs[0]*Rt[0], Rs[2]*Rt[2]}
+	// Build 64-bit accumulator from LO and HI
+	armAsm->Ldr(a64::q3, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+	armAsm->Ldr(a64::q4, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+	armAsm->Uzp1(a64::v3.V4S(), a64::v3.V4S(), a64::v3.V4S()); // {LO[0],LO[2],...}
+	armAsm->Uzp1(a64::v4.V4S(), a64::v4.V4S(), a64::v4.V4S()); // {HI[0],HI[2],...}
+	armAsm->Uxtl(a64::v3.V2D(), a64::v3.V2S());                 // zero-extend LO elements
+	armAsm->Sxtl(a64::v4.V2D(), a64::v4.V2S());                 // sign-extend HI elements
+	armAsm->Shl(a64::v4.V2D(), a64::v4.V2D(), 32);              // shift HI to upper 32 bits
+	armAsm->Orr(a64::v3.V16B(), a64::v3.V16B(), a64::v4.V16B()); // acc = HI<<32|LO
+	armAsm->Add(a64::v2.V2D(), a64::v2.V2D(), a64::v3.V2D());   // result = prod + acc
+	// Split result: LO = sext32(low32), HI = sext32(high32)
+	armAsm->Xtn(a64::v3.V2S(), a64::v2.V2D());
+	armAsm->Sxtl(a64::v3.V2D(), a64::v3.V2S());
+	armAsm->Str(a64::q3, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+	armAsm->Sshr(a64::v4.V2D(), a64::v2.V2D(), 32);
+	armAsm->Str(a64::q4, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+	if (_Rd_) armStoreGPR128(_Rd_, a64::q2);
 }
+#endif
+
+#if ISTUB_PMSUBW
+void recPMSUBW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMSUBW); }
+#else
+void recPMSUBW()
+{
+	// Same as PMADDW but result = acc - prod
+	armDelConstReg(_Rd_);
+	armLoadGPR128(a64::q0, _Rs_);
+	armLoadGPR128(a64::q1, _Rt_);
+	armAsm->Uzp1(a64::v0.V4S(), a64::v0.V4S(), a64::v0.V4S());
+	armAsm->Uzp1(a64::v1.V4S(), a64::v1.V4S(), a64::v1.V4S());
+	armAsm->Smull(a64::v2.V2D(), a64::v0.V2S(), a64::v1.V2S());
+	armAsm->Ldr(a64::q3, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+	armAsm->Ldr(a64::q4, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+	armAsm->Uzp1(a64::v3.V4S(), a64::v3.V4S(), a64::v3.V4S());
+	armAsm->Uzp1(a64::v4.V4S(), a64::v4.V4S(), a64::v4.V4S());
+	armAsm->Uxtl(a64::v3.V2D(), a64::v3.V2S());
+	armAsm->Sxtl(a64::v4.V2D(), a64::v4.V2S());
+	armAsm->Shl(a64::v4.V2D(), a64::v4.V2D(), 32);
+	armAsm->Orr(a64::v3.V16B(), a64::v3.V16B(), a64::v4.V16B());
+	armAsm->Sub(a64::v2.V2D(), a64::v3.V2D(), a64::v2.V2D());   // result = acc - prod
+	armAsm->Xtn(a64::v3.V2S(), a64::v2.V2D());
+	armAsm->Sxtl(a64::v3.V2D(), a64::v3.V2S());
+	armAsm->Str(a64::q3, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+	armAsm->Sshr(a64::v4.V2D(), a64::v2.V2D(), 32);
+	armAsm->Str(a64::q4, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+	if (_Rd_) armStoreGPR128(_Rd_, a64::q2);
+}
+#endif
+
+#if ISTUB_PMFHI
+void recPMFHI() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMFHI); }
+#else
+void recPMFHI()
+{
+	if (!_Rd_) return;
+	armDelConstReg(_Rd_);
+	armAsm->Ldr(RVMMI0, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+	armStoreGPR128(_Rd_, RVMMI0);
+}
+#endif
+
+#if ISTUB_PMFLO
+void recPMFLO() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMFLO); }
+#else
+void recPMFLO()
+{
+	if (!_Rd_) return;
+	armDelConstReg(_Rd_);
+	armAsm->Ldr(RVMMI0, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+	armStoreGPR128(_Rd_, RVMMI0);
+}
+#endif
+
+#if ISTUB_PINTH
+void recPINTH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PINTH); }
+#else
+void recPINTH()
+{
+	if (!_Rd_) return;
+	armDelConstReg(_Rd_);
+	armLoadGPR128(RVMMI0, _Rt_);
+	armLoadGPR128(RVMMI1, _Rs_);
+	armAsm->Ext(a64::v2.V16B(), a64::v1.V16B(), a64::v1.V16B(), 8);
+	armAsm->Zip1(a64::v0.V8H(), a64::v0.V8H(), a64::v2.V8H());
+	armStoreGPR128(_Rd_, RVMMI0);
+}
+#endif
+
+#if ISTUB_PMULTW
+void recPMULTW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMULTW); }
+#else
+void recPMULTW()
+{
+	// prod = { (s64)Rs.SL[0]*(s64)Rt.SL[0], (s64)Rs.SL[2]*(s64)Rt.SL[2] }
+	// LO.SD[i] = sext32(prod[i] & 0xFFFFFFFF)
+	// HI.SD[i] = sext32(prod[i] >> 32)
+	// Rd.SD[i] = prod[i]  (if Rd)
+	armDelConstReg(_Rd_);
+	armLoadGPR128(a64::q0, _Rs_);
+	armLoadGPR128(a64::q1, _Rt_);
+	armAsm->Uzp1(a64::v0.V4S(), a64::v0.V4S(), a64::v0.V4S()); // {Rs[0],Rs[2],Rs[0],Rs[2]}
+	armAsm->Uzp1(a64::v1.V4S(), a64::v1.V4S(), a64::v1.V4S()); // {Rt[0],Rt[2],Rt[0],Rt[2]}
+	armAsm->Smull(a64::v2.V2D(), a64::v0.V2S(), a64::v1.V2S()); // {prod0, prod1}
+	armAsm->Xtn(a64::v3.V2S(), a64::v2.V2D());
+	armAsm->Sxtl(a64::v3.V2D(), a64::v3.V2S());
+	armAsm->Str(a64::q3, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+	armAsm->Sshr(a64::v4.V2D(), a64::v2.V2D(), 32);
+	armAsm->Str(a64::q4, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+	if (_Rd_) armStoreGPR128(_Rd_, a64::q2);
+}
+#endif
+
+#if ISTUB_PDIVW
+void recPDIVW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PDIVW); }
+#else
+void recPDIVW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PDIVW); }
+#endif
+
+#if ISTUB_PCPYLD
+void recPCPYLD() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PCPYLD); }
+#else
+void recPCPYLD()
+{
+	if (!_Rd_) return;
+	armDelConstReg(_Rd_);
+	armLoadGPR128(RVMMI0, _Rt_);
+	armLoadGPR128(RVMMI1, _Rs_);
+	armAsm->Ins(a64::v0.D(), 1, a64::v1.D(), 0);
+	armStoreGPR128(_Rd_, RVMMI0);
+}
+#endif
+
+#if ISTUB_PMADDH
+void recPMADDH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMADDH); }
+#else
+void recPMADDH()
+{
+	// p[i] = Rs.SS[i] * Rt.SS[i]  (signed 16×16→32, 8 products)
+	// LO += {p0,p1,p4,p5}  (32-bit wrapping add per element)
+	// HI += {p2,p3,p6,p7}
+	// Rd = {new_LO[0], new_HI[0], new_LO[2], new_HI[2]}  (if Rd)
+	armDelConstReg(_Rd_);
+	armLoadGPR128(a64::q0, _Rs_);
+	armLoadGPR128(a64::q1, _Rt_);
+	armAsm->Smull(a64::v2.V4S(), a64::v0.V4H(), a64::v1.V4H());  // {p0,p1,p2,p3}
+	armAsm->Smull2(a64::v3.V4S(), a64::v0.V8H(), a64::v1.V8H()); // {p4,p5,p6,p7}
+	armAsm->Ldr(a64::q4, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+	armAsm->Ldr(a64::q5, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+	// lo_add={p0,p1,p4,p5} = {v2.D[0],v3.D[0]}, hi_add={p2,p3,p6,p7} = {v2.D[1],v3.D[1]}
+	armAsm->Uzp1(a64::v6.V2D(), a64::v2.V2D(), a64::v3.V2D()); // lo_add
+	armAsm->Uzp2(a64::v7.V2D(), a64::v2.V2D(), a64::v3.V2D()); // hi_add
+	armAsm->Add(a64::v4.V4S(), a64::v4.V4S(), a64::v6.V4S());  // new LO
+	armAsm->Add(a64::v5.V4S(), a64::v5.V4S(), a64::v7.V4S());  // new HI
+	armAsm->Str(a64::q4, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+	armAsm->Str(a64::q5, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+	if (_Rd_) {
+		// Rd = {LO[0],HI[0],LO[2],HI[2]}: interleave even elements of LO and HI
+		armAsm->Uzp1(a64::v0.V4S(), a64::v4.V4S(), a64::v4.V4S()); // {LO[0],LO[2],LO[0],LO[2]}
+		armAsm->Uzp1(a64::v1.V4S(), a64::v5.V4S(), a64::v5.V4S()); // {HI[0],HI[2],HI[0],HI[2]}
+		armAsm->Zip1(a64::v0.V4S(), a64::v0.V4S(), a64::v1.V4S()); // {LO[0],HI[0],LO[2],HI[2]}
+		armStoreGPR128(_Rd_, a64::q0);
+	}
+}
+#endif
+
+#if ISTUB_PHMADH
+void recPHMADH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PHMADH); }
+#else
+void recPHMADH()
+{
+	// p[i] = Rs.SS[i] * Rt.SS[i];  pairs (0,1), (2,3), (4,5), (6,7)
+	// LO = {p0+p1, p1, p4+p5, p5}
+	// HI = {p2+p3, p3, p6+p7, p7}
+	// Rd = {p0+p1, p2+p3, p4+p5, p6+p7}  (if Rd)
+	armDelConstReg(_Rd_);
+	armLoadGPR128(a64::q0, _Rs_);
+	armLoadGPR128(a64::q1, _Rt_);
+	armAsm->Smull(a64::v2.V4S(), a64::v0.V4H(), a64::v1.V4H());  // {p0,p1,p2,p3}
+	armAsm->Smull2(a64::v3.V4S(), a64::v0.V8H(), a64::v1.V8H()); // {p4,p5,p6,p7}
+	// even={p0,p2,p4,p6}, odd={p1,p3,p5,p7}
+	armAsm->Uzp1(a64::v4.V4S(), a64::v2.V4S(), a64::v3.V4S());
+	armAsm->Uzp2(a64::v5.V4S(), a64::v2.V4S(), a64::v3.V4S());
+	armAsm->Add(a64::v2.V4S(), a64::v4.V4S(), a64::v5.V4S());    // sums (= Rd)
+	// Interleave sums and odds to build LO/HI halves
+	armAsm->Zip1(a64::v6.V4S(), a64::v2.V4S(), a64::v5.V4S()); // {p01,p1,p23,p3}
+	armAsm->Zip2(a64::v7.V4S(), a64::v2.V4S(), a64::v5.V4S()); // {p45,p5,p67,p7}
+	armAsm->Uzp1(a64::v3.V2D(), a64::v6.V2D(), a64::v7.V2D()); // LO = {p01,p1, p45,p5}
+	armAsm->Str(a64::q3, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+	armAsm->Uzp2(a64::v4.V2D(), a64::v6.V2D(), a64::v7.V2D()); // HI = {p23,p3, p67,p7}
+	armAsm->Str(a64::q4, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+	if (_Rd_) armStoreGPR128(_Rd_, a64::q2); // sums = {p01,p23,p45,p67}
+}
+#endif
+
+#if ISTUB_PAND
+void recPAND() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PAND); }
+#else
+void recPAND() { armMMIBinOp([]() { armAsm->And(a64::v0.V16B(), a64::v0.V16B(), a64::v1.V16B()); }); }
+#endif
+
+#if ISTUB_PXOR
+void recPXOR() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PXOR); }
+#else
+void recPXOR()
+{
+	if (!_Rd_) return;
+	armDelConstReg(_Rd_);
+	if (_Rs_ == _Rt_)
+	{
+		// Direct 128-bit zero store bypasses armStoreGPR128 — drop any
+		// cached lower-64 for _Rd_ first (it'd otherwise be flushed over
+		// our zero on the next invalidate).
+		armGprInvalidate(_Rd_);
+		armAsm->Stp(a64::xzr, a64::xzr, a64::MemOperand(RCPUSTATE, GPR_OFFSET(_Rd_)));
+		return;
+	}
+	armMMIBinOp([]() { armAsm->Eor(a64::v0.V16B(), a64::v0.V16B(), a64::v1.V16B()); });
+}
+#endif
+
+#if ISTUB_PMSUBH
+void recPMSUBH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMSUBH); }
+#else
+void recPMSUBH()
+{
+	// Same as PMADDH but subtracts: LO -= {p0,p1,p4,p5}, HI -= {p2,p3,p6,p7}
+	armDelConstReg(_Rd_);
+	armLoadGPR128(a64::q0, _Rs_);
+	armLoadGPR128(a64::q1, _Rt_);
+	armAsm->Smull(a64::v2.V4S(), a64::v0.V4H(), a64::v1.V4H());
+	armAsm->Smull2(a64::v3.V4S(), a64::v0.V8H(), a64::v1.V8H());
+	armAsm->Ldr(a64::q4, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+	armAsm->Ldr(a64::q5, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+	armAsm->Uzp1(a64::v6.V2D(), a64::v2.V2D(), a64::v3.V2D()); // lo_sub={p0,p1,p4,p5}
+	armAsm->Uzp2(a64::v7.V2D(), a64::v2.V2D(), a64::v3.V2D()); // hi_sub={p2,p3,p6,p7}
+	armAsm->Sub(a64::v4.V4S(), a64::v4.V4S(), a64::v6.V4S());  // new LO
+	armAsm->Sub(a64::v5.V4S(), a64::v5.V4S(), a64::v7.V4S());  // new HI
+	armAsm->Str(a64::q4, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+	armAsm->Str(a64::q5, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+	if (_Rd_) {
+		armAsm->Uzp1(a64::v0.V4S(), a64::v4.V4S(), a64::v4.V4S());
+		armAsm->Uzp1(a64::v1.V4S(), a64::v5.V4S(), a64::v5.V4S());
+		armAsm->Zip1(a64::v0.V4S(), a64::v0.V4S(), a64::v1.V4S());
+		armStoreGPR128(_Rd_, a64::q0);
+	}
+}
+#endif
+
+#if ISTUB_PHMSBH
+void recPHMSBH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PHMSBH); }
+#else
+void recPHMSBH()
+{
+	// p[i] = Rs.SS[i] * Rt.SS[i];  odd products minus even products per pair
+	// LO = {p1-p0, ~p1, p5-p4, ~p5}
+	// HI = {p3-p2, ~p3, p7-p6, ~p7}
+	// Rd = {p1-p0, p3-p2, p5-p4, p7-p6}  (if Rd)
+	armDelConstReg(_Rd_);
+	armLoadGPR128(a64::q0, _Rs_);
+	armLoadGPR128(a64::q1, _Rt_);
+	armAsm->Smull(a64::v2.V4S(), a64::v0.V4H(), a64::v1.V4H());  // {p0,p1,p2,p3}
+	armAsm->Smull2(a64::v3.V4S(), a64::v0.V8H(), a64::v1.V8H()); // {p4,p5,p6,p7}
+	armAsm->Uzp1(a64::v4.V4S(), a64::v2.V4S(), a64::v3.V4S());   // even: {p0,p2,p4,p6}
+	armAsm->Uzp2(a64::v5.V4S(), a64::v2.V4S(), a64::v3.V4S());   // odd:  {p1,p3,p5,p7}
+	armAsm->Sub(a64::v2.V4S(), a64::v5.V4S(), a64::v4.V4S());    // diff: {p1-p0,p3-p2,p5-p4,p7-p6} = Rd
+	armAsm->Mvn(a64::v3.V16B(), a64::v5.V16B());                  // ~odd: {~p1,~p3,~p5,~p7}
+	// Interleave diff and ~odd to build LO/HI halves
+	armAsm->Zip1(a64::v6.V4S(), a64::v2.V4S(), a64::v3.V4S()); // {p1-p0,~p1, p3-p2,~p3}
+	armAsm->Zip2(a64::v7.V4S(), a64::v2.V4S(), a64::v3.V4S()); // {p5-p4,~p5, p7-p6,~p7}
+	armAsm->Uzp1(a64::v4.V2D(), a64::v6.V2D(), a64::v7.V2D()); // LO = {p1-p0,~p1, p5-p4,~p5}
+	armAsm->Str(a64::q4, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+	armAsm->Uzp2(a64::v5.V2D(), a64::v6.V2D(), a64::v7.V2D()); // HI = {p3-p2,~p3, p7-p6,~p7}
+	armAsm->Str(a64::q5, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+	if (_Rd_) armStoreGPR128(_Rd_, a64::q2);
+}
+#endif
+
+#if ISTUB_PEXEH
+void recPEXEH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PEXEH); }
+#else
+void recPEXEH()
+{
+	armMMIUnaryOp([]() {
+		armAsm->Mov(a64::v1.V16B(), a64::v0.V16B());
+		armAsm->Ins(a64::v1.H(), 0, a64::v0.H(), 2);
+		armAsm->Ins(a64::v1.H(), 2, a64::v0.H(), 0);
+		armAsm->Ins(a64::v1.H(), 4, a64::v0.H(), 6);
+		armAsm->Ins(a64::v1.H(), 6, a64::v0.H(), 4);
+		armAsm->Mov(a64::v0.V16B(), a64::v1.V16B());
+	});
+}
+#endif
+
+#if ISTUB_PREVH
+void recPREVH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PREVH); }
+#else
+void recPREVH() { armMMIUnaryOp([]() { armAsm->Rev64(a64::v0.V8H(), a64::v0.V8H()); }); }
+#endif
+
+#if ISTUB_PMULTH
+void recPMULTH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMULTH); }
+#else
+void recPMULTH()
+{
+	// p[i] = Rs.SS[i] * Rt.SS[i]  (signed 16×16→32, 8 products)
+	// LO = {p0,p1,p4,p5},  HI = {p2,p3,p6,p7}
+	// Rd = {p0,p2,p4,p6}  (if Rd)
+	armDelConstReg(_Rd_);
+	armLoadGPR128(a64::q0, _Rs_);
+	armLoadGPR128(a64::q1, _Rt_);
+	armAsm->Smull(a64::v2.V4S(), a64::v0.V4H(), a64::v1.V4H());  // {p0,p1,p2,p3}
+	armAsm->Smull2(a64::v3.V4S(), a64::v0.V8H(), a64::v1.V8H()); // {p4,p5,p6,p7}
+	// LO = {v2.D[0], v3.D[0]} = {p0,p1,p4,p5}
+	armAsm->Uzp1(a64::v4.V2D(), a64::v2.V2D(), a64::v3.V2D());
+	armAsm->Str(a64::q4, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+	// HI = {v2.D[1], v3.D[1]} = {p2,p3,p6,p7}
+	armAsm->Uzp2(a64::v5.V2D(), a64::v2.V2D(), a64::v3.V2D());
+	armAsm->Str(a64::q5, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+	if (_Rd_) {
+		// Rd = {p0,p2,p4,p6} = even elements from v2 and v3
+		armAsm->Uzp1(a64::v2.V4S(), a64::v2.V4S(), a64::v3.V4S());
+		armStoreGPR128(_Rd_, a64::q2);
+	}
+}
+#endif
+
+#if ISTUB_PDIVBW
+void recPDIVBW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PDIVBW); }
+#else
+void recPDIVBW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PDIVBW); }
+#endif
+
+#if ISTUB_PEXEW
+void recPEXEW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PEXEW); }
+#else
+void recPEXEW()
+{
+	armMMIUnaryOp([]() {
+		armAsm->Mov(a64::v1.V16B(), a64::v0.V16B());
+		armAsm->Ins(a64::v1.S(), 0, a64::v0.S(), 2);
+		armAsm->Ins(a64::v1.S(), 2, a64::v0.S(), 0);
+		armAsm->Mov(a64::v0.V16B(), a64::v1.V16B());
+	});
+}
+#endif
+
+#if ISTUB_PROT3W
+void recPROT3W() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PROT3W); }
+#else
+void recPROT3W()
+{
+	armMMIUnaryOp([]() {
+		armAsm->Mov(a64::v1.V16B(), a64::v0.V16B());
+		armAsm->Ins(a64::v1.S(), 0, a64::v0.S(), 1);
+		armAsm->Ins(a64::v1.S(), 1, a64::v0.S(), 2);
+		armAsm->Ins(a64::v1.S(), 2, a64::v0.S(), 0);
+		armAsm->Mov(a64::v0.V16B(), a64::v1.V16B());
+	});
+}
+#endif
+
+// ============================================================================
+//  MMI3 — PMADDUW, PSRAVW, PMTHI/LO, PINTEH, PCPYUD, POR, PNOR,
+//          PMULTUW, PDIVUW, PEXCH, PCPYH, PEXCW
+// ============================================================================
+
+#if ISTUB_PMADDUW
+void recPMADDUW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMADDUW); }
+#else
+void recPMADDUW()
+{
+	// Unsigned: acc = {(u64)HI.UL[0]<<32|(u64)LO.UL[0], (u64)HI.UL[2]<<32|(u64)LO.UL[2]}
+	// prod     = {(u64)Rs.UL[0]*(u64)Rt.UL[0], (u64)Rs.UL[2]*(u64)Rt.UL[2]}
+	// result   = acc + prod
+	// new LO.SD[i] = sext32(result[i] & 0xFFFFFFFF)
+	// new HI.SD[i] = sext32(result[i] >> 32)
+	// Rd.UD[i] = result[i]  (if Rd)
+	armDelConstReg(_Rd_);
+	armLoadGPR128(a64::q0, _Rs_);
+	armLoadGPR128(a64::q1, _Rt_);
+	armAsm->Uzp1(a64::v0.V4S(), a64::v0.V4S(), a64::v0.V4S());
+	armAsm->Uzp1(a64::v1.V4S(), a64::v1.V4S(), a64::v1.V4S());
+	armAsm->Umull(a64::v2.V2D(), a64::v0.V2S(), a64::v1.V2S()); // unsigned prod
+	armAsm->Ldr(a64::q3, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+	armAsm->Ldr(a64::q4, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+	armAsm->Uzp1(a64::v3.V4S(), a64::v3.V4S(), a64::v3.V4S());
+	armAsm->Uzp1(a64::v4.V4S(), a64::v4.V4S(), a64::v4.V4S());
+	armAsm->Uxtl(a64::v3.V2D(), a64::v3.V2S()); // zero-extend LO elements
+	armAsm->Uxtl(a64::v4.V2D(), a64::v4.V2S()); // zero-extend HI elements (unsigned acc)
+	armAsm->Shl(a64::v4.V2D(), a64::v4.V2D(), 32);
+	armAsm->Orr(a64::v3.V16B(), a64::v3.V16B(), a64::v4.V16B());
+	armAsm->Add(a64::v2.V2D(), a64::v2.V2D(), a64::v3.V2D());
+	armAsm->Xtn(a64::v3.V2S(), a64::v2.V2D());
+	armAsm->Sxtl(a64::v3.V2D(), a64::v3.V2S());
+	armAsm->Str(a64::q3, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+	armAsm->Sshr(a64::v4.V2D(), a64::v2.V2D(), 32);
+	armAsm->Str(a64::q4, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+	if (_Rd_) armStoreGPR128(_Rd_, a64::q2);
+}
+#endif
+
+#if ISTUB_PSRAVW
+void recPSRAVW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PSRAVW); }
+#else
+void recPSRAVW()
+{
+	if (!_Rd_) return;
+	armDelConstReg(_Rd_);
+	armLoadGPR128(RVMMI0, _Rt_);
+	armLoadGPR128(RVMMI1, _Rs_);
+	armAsm->Movi(a64::v2.V4S(), 31);
+	armAsm->And(a64::v1.V16B(), a64::v1.V16B(), a64::v2.V16B());
+	armAsm->Neg(a64::v1.V4S(), a64::v1.V4S());
+	armAsm->Sshl(a64::v0.V4S(), a64::v0.V4S(), a64::v1.V4S());
+	armAsm->Ins(a64::v0.S(), 1, a64::v0.S(), 2);
+	armAsm->Sxtl(a64::v0.V2D(), a64::v0.V2S());
+	armStoreGPR128(_Rd_, RVMMI0);
+}
+#endif
+
+#if ISTUB_PMTHI
+void recPMTHI() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMTHI); }
+#else
+void recPMTHI()
+{
+	armLoadGPR128(RVMMI0, _Rs_);
+	armAsm->Str(RVMMI0, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+}
+#endif
+
+#if ISTUB_PMTLO
+void recPMTLO() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMTLO); }
+#else
+void recPMTLO()
+{
+	armLoadGPR128(RVMMI0, _Rs_);
+	armAsm->Str(RVMMI0, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+}
+#endif
+
+#if ISTUB_PINTEH
+void recPINTEH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PINTEH); }
+#else
+void recPINTEH()
+{
+	if (!_Rd_) return;
+	armDelConstReg(_Rd_);
+	armLoadGPR128(RVMMI0, _Rt_);
+	armLoadGPR128(RVMMI1, _Rs_);
+	armAsm->Uzp1(a64::v2.V8H(), a64::v0.V8H(), a64::v1.V8H());
+	armAsm->Ext(a64::v1.V16B(), a64::v2.V16B(), a64::v2.V16B(), 8);
+	armAsm->Zip1(a64::v0.V8H(), a64::v2.V8H(), a64::v1.V8H());
+	armStoreGPR128(_Rd_, RVMMI0);
+}
+#endif
+
+#if ISTUB_PCPYUD
+void recPCPYUD() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PCPYUD); }
+#else
+void recPCPYUD()
+{
+	if (!_Rd_) return;
+	armDelConstReg(_Rd_);
+	armLoadGPR128(RVMMI0, _Rs_);
+	armLoadGPR128(RVMMI1, _Rt_);
+	armAsm->Ins(a64::v0.D(), 0, a64::v0.D(), 1);
+	armAsm->Ins(a64::v0.D(), 1, a64::v1.D(), 1);
+	armStoreGPR128(_Rd_, RVMMI0);
+}
+#endif
+
+#if ISTUB_POR
+void recPOR() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::POR); }
+#else
+void recPOR() { armMMIBinOp([]() { armAsm->Orr(a64::v0.V16B(), a64::v0.V16B(), a64::v1.V16B()); }); }
+#endif
+
+#if ISTUB_PNOR
+void recPNOR() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PNOR); }
+#else
+void recPNOR()
+{
+	armMMIBinOp([]() {
+		armAsm->Orr(a64::v0.V16B(), a64::v0.V16B(), a64::v1.V16B());
+		armAsm->Mvn(a64::v0.V16B(), a64::v0.V16B());
+	});
+}
+#endif
+
+#if ISTUB_PMULTUW
+void recPMULTUW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PMULTUW); }
+#else
+void recPMULTUW()
+{
+	// Unsigned: prod = {(u64)Rs.UL[0]*(u64)Rt.UL[0], (u64)Rs.UL[2]*(u64)Rt.UL[2]}
+	// LO.SD[i] = sext32(prod[i] & 0xFFFFFFFF)
+	// HI.SD[i] = sext32(prod[i] >> 32)
+	// Rd.UD[i] = prod[i]  (if Rd)
+	armDelConstReg(_Rd_);
+	armLoadGPR128(a64::q0, _Rs_);
+	armLoadGPR128(a64::q1, _Rt_);
+	armAsm->Uzp1(a64::v0.V4S(), a64::v0.V4S(), a64::v0.V4S());
+	armAsm->Uzp1(a64::v1.V4S(), a64::v1.V4S(), a64::v1.V4S());
+	armAsm->Umull(a64::v2.V2D(), a64::v0.V2S(), a64::v1.V2S());
+	armAsm->Xtn(a64::v3.V2S(), a64::v2.V2D());
+	armAsm->Sxtl(a64::v3.V2D(), a64::v3.V2S());
+	armAsm->Str(a64::q3, a64::MemOperand(RCPUSTATE, LO_OFFSET));
+	armAsm->Sshr(a64::v4.V2D(), a64::v2.V2D(), 32);
+	armAsm->Str(a64::q4, a64::MemOperand(RCPUSTATE, HI_OFFSET));
+	if (_Rd_) armStoreGPR128(_Rd_, a64::q2);
+}
+#endif
+
+#if ISTUB_PDIVUW
+void recPDIVUW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PDIVUW); }
+#else
+void recPDIVUW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PDIVUW); }
+#endif
+
+#if ISTUB_PEXCH
+void recPEXCH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PEXCH); }
+#else
+void recPEXCH()
+{
+	armMMIUnaryOp([]() {
+		armAsm->Mov(a64::v1.V16B(), a64::v0.V16B());
+		armAsm->Ins(a64::v1.H(), 1, a64::v0.H(), 2);
+		armAsm->Ins(a64::v1.H(), 2, a64::v0.H(), 1);
+		armAsm->Ins(a64::v1.H(), 5, a64::v0.H(), 6);
+		armAsm->Ins(a64::v1.H(), 6, a64::v0.H(), 5);
+		armAsm->Mov(a64::v0.V16B(), a64::v1.V16B());
+	});
+}
+#endif
+
+#if ISTUB_PCPYH
+void recPCPYH() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PCPYH); }
+#else
+void recPCPYH()
+{
+	armMMIUnaryOp([]() {
+		armAsm->Dup(a64::v1.V8H(), a64::v0.H(), 0);
+		armAsm->Dup(a64::v2.V8H(), a64::v0.H(), 4);
+		armAsm->Ins(a64::v1.D(), 1, a64::v2.D(), 0);
+		armAsm->Mov(a64::v0.V16B(), a64::v1.V16B());
+	});
+}
+#endif
+
+#if ISTUB_PEXCW
+void recPEXCW() { armCallInterpreter(R5900::Interpreter::OpcodeImpl::MMI::PEXCW); }
+#else
+void recPEXCW()
+{
+	armMMIUnaryOp([]() {
+		armAsm->Mov(a64::v1.V16B(), a64::v0.V16B());
+		armAsm->Ins(a64::v1.S(), 1, a64::v0.S(), 2);
+		armAsm->Ins(a64::v1.S(), 2, a64::v0.S(), 1);
+		armAsm->Mov(a64::v0.V16B(), a64::v1.V16B());
+	});
+}
+#endif
+
+#endif // !INTERP_MMI
+
+} // namespace MMI
+} // namespace OpcodeImpl
+} // namespace Dynarec
+} // namespace R5900

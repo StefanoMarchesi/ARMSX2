@@ -661,7 +661,11 @@ struct Pcsx2Config
 		bool
 			EnableFastmem : 1;
 		bool
-			PauseOnTLBMiss : 1;
+			PauseOnTLBMiss : 1,
+			Vu1InlineFmacStall : 1,
+			Vu1CrossBlockPState : 1,
+			Vu1InlineDrainTestPipes : 1,
+			Vu1FmacInstanceRouting : 1;
 		BITFIELD_END
 
 		RecompilerOptions();
@@ -1149,7 +1153,10 @@ struct Pcsx2Config
 			WaitLoop : 1, // enables constant loop detection and fast-forwarding
 			vuFlagHack : 1, // microVU specific flag hack
 			vuThread : 1, // Enable Threaded VU1
-			vu1Instant : 1; // Enable Instant VU1 (Without MTVU only)
+			vu1Instant : 1, // Enable Instant VU1 (Without MTVU only)
+			vuNeonFusions : 1,
+			vuDeferredWrites : 1,
+			vuSkipStallSim : 1;
 		BITFIELD_END
 
 		s8 EECycleRate; // EE cycle rate selector (1.0, 1.5, 2.0)

@@ -1062,53 +1062,43 @@ set(pcsx2x86Headers
 	x86/R5900_Profiler.h
 	)
 
-# ARM64
-#
-# EE recompiler (aR5900*): a SINGLE canonical Phase-7 backend for every arm64 target
-# (PC macOS/Linux/Windows + Android). The Android mac-port graft fork was dropped after a
-# device A/B (canonical EE+VU + force-float, PGO tuned for the mac-port so rigged against
-# canonical) showed canonical EE at refresh parity on Android — GoW2 combat EE ~12.8ms,
-# 100% speed / 60fps. The real Android perf lever is the force-float in
-# VMManager::SetEmuThreadAffinities, not the recompiler backend. See REFACTOR_STATUS.md.
-set(pcsx2arm64EESources
-	arm64/aR5900.cpp
-	arm64/aR5900Analysis.cpp
-	arm64/aR5900LoadStore.cpp
-	arm64/aR5900Arith.cpp
-	arm64/aR5900MultDiv.cpp
-	arm64/aR5900Branch.cpp
-	arm64/aR5900FPU.cpp
-	arm64/aR5900MMI.cpp
-	)
-
+# ARM64: retain the Pi-proven original EE/IOP recompilers, while keeping the
+# namespaced Phase-7 microVU used by the stable Pi configuration.
 set(pcsx2arm64Sources
 	arm64/AsmHelpers.cpp
 	arm64/Vif_Dynarec.cpp
 	arm64/Vif_UnpackNEON.cpp
 	arm64/RecStubs.cpp
 	arm64/aR3000A.cpp
-	${pcsx2arm64EESources}
-	arm64/aVU.cpp
+	arm64/aR3000Atables.cpp
+	arm64/aR5900.cpp
+	arm64/aR5900Arith.cpp
+	arm64/aR5900Backprop.cpp
+	arm64/aR5900Branch.cpp
+	arm64/aR5900COP0.cpp
+	arm64/aR5900COP2.cpp
+	arm64/aR5900FPU.cpp
+	arm64/aR5900LoadStore.cpp
+	arm64/aR5900Misc.cpp
+	arm64/aR5900MMI.cpp
+	arm64/aR5900MultDiv.cpp
+	arm64/aR5900Trap.cpp
+	arm64/aVTLB.cpp
+	arm64/mac/AsmHelpers.cpp
+	arm64/mac/RecStubs.cpp
+	arm64/mac/aVU.cpp
+	x86/BaseblockEx.cpp
 	)
 
 set(pcsx2arm64Headers
 	arm64/AsmHelpers.h
-	arm64/aR5900.h
-	arm64/aR5900Analysis.h
-	arm64/aVU.h
-	arm64/aVU_IR.h
-	arm64/aVU_Misc.h
-	arm64/aVU_Analyze.inl
-	arm64/aVU_Alloc.inl
-	arm64/aVU_Clamp.inl
-	arm64/aVU_Misc.inl
-	arm64/aVU_Upper.inl
-	arm64/aVU_Lower.inl
-	arm64/aVU_Tables.inl
-	arm64/aVU_Flags.inl
-	arm64/aVU_Branch.inl
-	arm64/aVU_Compile.inl
-)
+	arm64/arm64Emitter.h
+	arm64/mac/AsmHelpers.h
+	arm64/mac/aVU.h
+	arm64/mac/aVU_IR.h
+	arm64/mac/aVU_Upper.inl
+	arm64/mac/aVU_Lower.inl
+	)
 
 # Mobile (arm64) platform sources, relocated from the former android/iOS core
 # forks (refresh-experimental / iOS-refresh). Source wiring only: real NDK /

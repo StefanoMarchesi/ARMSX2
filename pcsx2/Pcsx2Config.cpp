@@ -384,6 +384,7 @@ Pcsx2Config::SpeedhackOptions::SpeedhackOptions()
 	IntcStat = true;
 	vuFlagHack = true;
 	vu1Instant = true;
+	vuNeonFusions = true;
 }
 
 Pcsx2Config::SpeedhackOptions& Pcsx2Config::SpeedhackOptions::DisableAll()
@@ -407,6 +408,9 @@ void Pcsx2Config::SpeedhackOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBool(vuFlagHack);
 	SettingsWrapBitBool(vuThread);
 	SettingsWrapBitBool(vu1Instant);
+	SettingsWrapBitBool(vuNeonFusions);
+	SettingsWrapBitBool(vuDeferredWrites);
+	SettingsWrapBitBool(vuSkipStallSim);
 
 	EECycleRate = std::clamp(EECycleRate, MIN_EE_CYCLE_RATE, MAX_EE_CYCLE_RATE);
 	EECycleSkip = std::min(EECycleSkip, MAX_EE_CYCLE_SKIP);
@@ -532,6 +536,10 @@ void Pcsx2Config::RecompilerOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBool(EnableVU1);
 	SettingsWrapBitBool(EnableFastmem);
 	SettingsWrapBitBool(PauseOnTLBMiss);
+	SettingsWrapBitBool(Vu1InlineFmacStall);
+	SettingsWrapBitBool(Vu1CrossBlockPState);
+	SettingsWrapBitBool(Vu1InlineDrainTestPipes);
+	SettingsWrapBitBool(Vu1FmacInstanceRouting);
 
 	SettingsWrapBitBool(vu0Overflow);
 	SettingsWrapBitBool(vu0ExtraOverflow);
