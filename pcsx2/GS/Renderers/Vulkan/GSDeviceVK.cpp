@@ -7091,7 +7091,6 @@ void GSDeviceVK::RenderHW(GSHWDrawConfig& config)
 		// depth buffer. Preserve the backend-only selector bits which are not part
 		// of the high-level AlphaPass snapshot.
 		pipe.ps.mrt = pipe.mrt;
-		pipe.ps.mrt_index = pipe.mrt_index;
 		pipe.cms = config.alpha_second_pass.colormask;
 		pipe.dss = config.alpha_second_pass.depth;
 		pipe.bs = config.blend;
