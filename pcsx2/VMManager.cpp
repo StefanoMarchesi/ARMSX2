@@ -2810,8 +2810,13 @@ void VMManager::Internal::ClearCPUExecutionCaches()
 	if (CHECK_EEREC && !EmuConfig.Cpu.Recompiler.EnableVU0)
 		CpuMicroVU0.Reset();
 #else
-	recCpu.Reset();
-	psxRec.Reset();
+	// Cpu/psxCpu have already been reset above. The legacy ARM64 recompilers are
+	// not idempotent across a second immediate reset while restoring a state, so
+	// only clear an inactive recompiler here.
+	if (Cpu != &recCpu)
+		recCpu.Reset();
+	if (psxCpu != &psxRec)
+		psxRec.Reset();
 
 	if (CHECK_EEREC && !EmuConfig.Cpu.Recompiler.EnableVU0)
 		pcsx2_macrec::CpuMicroVU0.Reset();
