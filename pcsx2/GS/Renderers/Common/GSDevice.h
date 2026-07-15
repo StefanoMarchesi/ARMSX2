@@ -799,6 +799,7 @@ struct alignas(16) GSHWDrawConfig
 				u32 rov_color : 1;
 				PS_ROV_DEPTH rov_depth : 2;
 				u32 mrt : 1; // Vulkan-only dual render-target fast path.
+				u32 mrt_index : 1; // Active MRT color/input attachment.
 			};
 
 			struct

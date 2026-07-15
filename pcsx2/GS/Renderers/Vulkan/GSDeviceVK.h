@@ -450,6 +450,7 @@ public:
 		TFX_TEXTURE_DEPTH,
 		TFX_TEXTURE_RT_ROV,
 		TFX_TEXTURE_DEPTH_ROV,
+		TFX_TEXTURE_MRT_RT,
 
 		NUM_TFX_TEXTURES
 	};
@@ -521,7 +522,7 @@ private:
 	VkRenderPass m_swap_chain_render_pass = VK_NULL_HANDLE;
 
 	VkRenderPass m_tfx_render_pass[2][2][2][3][2][2][3][3] = {}; // [rt][ds][colclip][date][fbl][dsp][rt_op][ds_op]
-	VkRenderPass m_tfx_mrt_render_pass[2] = {}; // [ds], LOAD/STORE only, two color attachments.
+	VkRenderPass m_tfx_mrt_render_pass[2][2] = {}; // [feedback][ds], LOAD/STORE, two color attachments.
 
 	VkDescriptorSetLayout m_cas_ds_layout = VK_NULL_HANDLE;
 	VkPipelineLayout m_cas_pipeline_layout = VK_NULL_HANDLE;
@@ -603,7 +604,10 @@ public:
 	{
 		return m_tfx_render_pass[rt][ds][colclip][stencil][fbl][dsp][rt_op][ds_op];
 	}
-	__fi VkRenderPass GetTFXMRTRenderPass(bool ds) const { return m_tfx_mrt_render_pass[ds]; }
+	__fi VkRenderPass GetTFXMRTRenderPass(bool ds, bool feedback = false) const
+	{
+		return m_tfx_mrt_render_pass[feedback][ds];
+	}
 	__fi VkSampler GetPointSampler() const { return m_point_sampler; }
 	__fi VkSampler GetLinearSampler() const { return m_linear_sampler; }
 
@@ -684,7 +688,7 @@ public:
 	void OMSetRenderTargets(GSTexture* rt, GSTexture* ds, const GSVector4i& scissor,
 		FeedbackLoopFlag feedback_loop = FeedbackLoopFlag_None, const GSVector2i& viewport_size = {});
 	bool OMSetRenderTargetsMRT(GSTextureVK* active_rt, GSTextureVK* other_rt, GSTextureVK* ds,
-		const GSVector4i& scissor, u8 active_index);
+		const GSVector4i& scissor, u8 active_index, bool feedback);
 
 	void SetVSConstantBuffer(const GSHWDrawConfig::VSConstantBuffer& cb);
 	void SetPSConstantBuffer(const GSHWDrawConfig::PSConstantBuffer& cb);
@@ -748,18 +752,18 @@ public:
 private:
 	enum DIRTY_FLAG : u32
 	{
-		DIRTY_FLAG_TFX_TEXTURE_0 = (1 << 0), // 0, 1, 2, 3, 4, 5, 6
-		DIRTY_FLAG_TFX_UBO = (1 << 7),
-		DIRTY_FLAG_UTILITY_TEXTURE = (1 << 8),
-		DIRTY_FLAG_BLEND_CONSTANTS = (1 << 9),
-		DIRTY_FLAG_LINE_WIDTH = (1 << 10),
-		DIRTY_FLAG_INDEX_BUFFER = (1 << 11),
-		DIRTY_FLAG_VIEWPORT = (1 << 12),
-		DIRTY_FLAG_SCISSOR = (1 << 13),
-		DIRTY_FLAG_PIPELINE = (1 << 14),
-		DIRTY_FLAG_VS_CONSTANT_BUFFER = (1 << 15),
-		DIRTY_FLAG_PS_CONSTANT_BUFFER = (1 << 16),
-		DIRTY_FLAG_VS_PUSH_CONSTANTS = (1 << 17),
+		DIRTY_FLAG_TFX_TEXTURE_0 = (1 << 0), // 0, 1, 2, 3, 4, 5, 6, 7
+		DIRTY_FLAG_TFX_UBO = (1 << 8),
+		DIRTY_FLAG_UTILITY_TEXTURE = (1 << 9),
+		DIRTY_FLAG_BLEND_CONSTANTS = (1 << 10),
+		DIRTY_FLAG_LINE_WIDTH = (1 << 11),
+		DIRTY_FLAG_INDEX_BUFFER = (1 << 12),
+		DIRTY_FLAG_VIEWPORT = (1 << 13),
+		DIRTY_FLAG_SCISSOR = (1 << 14),
+		DIRTY_FLAG_PIPELINE = (1 << 15),
+		DIRTY_FLAG_VS_CONSTANT_BUFFER = (1 << 16),
+		DIRTY_FLAG_PS_CONSTANT_BUFFER = (1 << 17),
+		DIRTY_FLAG_VS_PUSH_CONSTANTS = (1 << 18),
 
 		DIRTY_FLAG_TFX_TEXTURE_TEX = (DIRTY_FLAG_TFX_TEXTURE_0 << 0),
 		DIRTY_FLAG_TFX_TEXTURE_PALETTE = (DIRTY_FLAG_TFX_TEXTURE_0 << 1),
@@ -768,10 +772,11 @@ private:
 		DIRTY_FLAG_TFX_TEXTURE_DEPTH = (DIRTY_FLAG_TFX_TEXTURE_0 << 4),
 		DIRTY_FLAG_TFX_TEXTURE_RT_ROV = (DIRTY_FLAG_TFX_TEXTURE_0 << 5),
 		DIRTY_FLAG_TFX_TEXTURE_DEPTH_ROV = (DIRTY_FLAG_TFX_TEXTURE_0 << 6),
+		DIRTY_FLAG_TFX_TEXTURE_MRT_RT = (DIRTY_FLAG_TFX_TEXTURE_0 << 7),
 
 		DIRTY_FLAG_TFX_TEXTURES = DIRTY_FLAG_TFX_TEXTURE_TEX | DIRTY_FLAG_TFX_TEXTURE_PALETTE |
 		                          DIRTY_FLAG_TFX_TEXTURE_RT | DIRTY_FLAG_TFX_TEXTURE_PRIMID |
-		                          DIRTY_FLAG_TFX_TEXTURE_DEPTH | DIRTY_FLAG_TFX_TEXTURE_RT_ROV |
+		                          DIRTY_FLAG_TFX_TEXTURE_DEPTH | DIRTY_FLAG_TFX_TEXTURE_MRT_RT | DIRTY_FLAG_TFX_TEXTURE_RT_ROV |
 		                          DIRTY_FLAG_TFX_TEXTURE_DEPTH_ROV,
 
 		DIRTY_BASE_STATE = DIRTY_FLAG_INDEX_BUFFER | DIRTY_FLAG_PIPELINE | DIRTY_FLAG_VIEWPORT | DIRTY_FLAG_SCISSOR |
@@ -807,6 +812,7 @@ private:
 	std::array<GSTextureVK*, 2> m_mrt_render_targets{};
 	GSTextureVK* m_mrt_depth_target = nullptr;
 	VkFramebuffer m_mrt_framebuffer = VK_NULL_HANDLE;
+	bool m_mrt_framebuffer_feedback = false;
 	bool m_current_framebuffer_is_mrt = false;
 	VkFramebuffer m_current_framebuffer = VK_NULL_HANDLE;
 	VkRenderPass m_current_render_pass = VK_NULL_HANDLE;
