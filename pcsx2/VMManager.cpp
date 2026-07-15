@@ -43,6 +43,8 @@
 #include "VMManager.h"
 #if defined(ARCH_ARM64)
 #include "arm64/arm64Emitter.h"
+#include "arm64/aVU0.h"
+#include "arm64/aVU.h"
 #include "arm64/mac/aVU.h"
 #endif
 #include "ps2/BiosTools.h"
@@ -2742,6 +2744,8 @@ void VMManager::InitializeCPUProviders()
 #else
 	recCpu.Reserve();
 	psxRec.Reserve();
+	CpuArmVU0.Reserve();
+	CpuArmVU1.Reserve();
 	pcsx2_macrec::CpuMicroVU0.Reserve();
 	pcsx2_macrec::CpuMicroVU1.Reserve();
 	vu1Thread.Open();
@@ -2765,6 +2769,8 @@ void VMManager::ShutdownCPUProviders()
 	psxRec.Shutdown();
 	recCpu.Shutdown();
 #else
+	CpuArmVU1.Shutdown();
+	CpuArmVU0.Shutdown();
 	pcsx2_macrec::CpuMicroVU1.Shutdown();
 	pcsx2_macrec::CpuMicroVU0.Shutdown();
 	psxRec.Shutdown();
@@ -2781,7 +2787,7 @@ void VMManager::UpdateCPUImplementations()
 		Cpu = &GSDumpReplayerCpu;
 		psxCpu = &psxInt;
 		CpuVU0 = &CpuIntVU0;
-		CpuVU1 = &CpuIntVU1;
+		CpuVU1 = &CpuArmVU1;
 		return;
 	}
 
@@ -2795,8 +2801,12 @@ void VMManager::UpdateCPUImplementations()
 	Cpu = CHECK_EEREC ? &recCpu : &intCpu;
 	psxCpu = CHECK_IOPREC ? &psxRec : &psxInt;
 
-	CpuVU0 = EmuConfig.Cpu.Recompiler.EnableVU0 ? static_cast<BaseVUmicroCPU*>(&pcsx2_macrec::CpuMicroVU0) : static_cast<BaseVUmicroCPU*>(&CpuIntVU0);
-	CpuVU1 = EmuConfig.Cpu.Recompiler.EnableVU1 ? static_cast<BaseVUmicroCPU*>(&pcsx2_macrec::CpuMicroVU1) : static_cast<BaseVUmicroCPU*>(&CpuIntVU1);
+	CpuVU0 = EmuConfig.Cpu.Recompiler.EnableVU0
+		? static_cast<BaseVUmicroCPU*>(&CpuArmVU0)
+		: static_cast<BaseVUmicroCPU*>(&CpuIntVU0);
+	CpuVU1 = EmuConfig.Cpu.Recompiler.EnableVU1
+		? static_cast<BaseVUmicroCPU*>(&CpuArmVU1)
+		: static_cast<BaseVUmicroCPU*>(&CpuIntVU1);
 #endif
 }
 
@@ -2819,7 +2829,7 @@ void VMManager::Internal::ClearCPUExecutionCaches()
 		psxRec.Reset();
 
 	if (CHECK_EEREC && !EmuConfig.Cpu.Recompiler.EnableVU0)
-		pcsx2_macrec::CpuMicroVU0.Reset();
+		CpuArmVU0.Reset();
 #endif
 
 	CpuVU0->Reset();

@@ -1085,6 +1085,8 @@ set(pcsx2arm64Sources
 	arm64/aR5900MultDiv.cpp
 	arm64/aR5900Trap.cpp
 	arm64/aVTLB.cpp
+	arm64/aVU0.cpp
+	arm64/aVU.cpp
 	arm64/mac/AsmHelpers.cpp
 	arm64/mac/RecStubs.cpp
 	arm64/mac/aVU.cpp
@@ -1095,6 +1097,13 @@ set(pcsx2arm64Headers
 	arm64/AsmHelpers.h
 	arm64/arm64Emitter.h
 	arm64/aDMAC.h
+	arm64/aVU0.h
+	arm64/aVU0_Lower.inl
+	arm64/aVU0_Upper.inl
+	arm64/aVU.h
+	arm64/aVU_IR.h
+	arm64/aVU_Lower.inl
+	arm64/aVU_Upper.inl
 	arm64/mac/AsmHelpers.h
 	arm64/mac/aVU.h
 	arm64/mac/aVU_IR.h

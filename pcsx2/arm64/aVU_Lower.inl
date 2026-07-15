@@ -1,2371 +1,2875 @@
-// SPDX-FileCopyrightText: 2026 isztld <https://isztld.com/>
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
-// SPDX-License-Identifier: GPL-3.0+
-
-#pragma once
-
-// ARM64 microVU — Lower opcode handlers (Phase 7, task 7.5b).
+// SPDX-License-Identifier: GPL-3.0
 //
-// VIXL port of pcsx2/x86/microVU_Lower.inl. The Lower pipe is the VU's integer /
-// load-store / EFU / flag-register / branch ISA:
-//   * VI integer ALU      — IADD/IADDI/IADDIU/IAND/IOR/ISUB/ISUBIU
-//   * load/store          — LQ/LQD/LQI, SQ/SQD/SQI, ILW/ILWR, ISW/ISWR
-//   * EFU estimates        — DIV/SQRT/RSQRT, EATAN*/EEXP/ELENG/ERCPR/ERLENG/
-//                            ERSADD/ERSQRT/ESADD/ESIN/ESQRT/ESUM, WAITP/WAITQ
-//   * register moves       — MFIR/MFP/MOVE/MR32/MTIR
-//   * random generator     — RINIT/RGET/RNEXT/RXOR
-//   * flag-register ops    — FCxxx / FMxxx / FSxxx
-//   * VIF window           — XTOP/XITOP, XGKICK
-//   * branches/jumps       — B/BAL, IBEQ/IBNE/IBLTZ/IBGTZ/IBLEZ/IBGEZ, JR/JALR
-//                            (the branch *drivers* normBranch/normJump/condBranch
-//                             live in aVU_Branch.inl)
-//
-// Key x86->NEON translations (in addition to the Upper-file set):
-//   * xMOVD(gpr, xmm) / xMOVDZX(xmm, gpr)  -> Fmov(gpr.W(), xmm.S()) / Fmov(xmm.S(), gpr.W())
-//   * xMOVSS(d, s)                          -> Ins(d.V4S(), 0, s.V4S(), 0)
-//   * xMOVSSZX(xmm, ptr32[c])               -> Ldr(xmm.S(), [c])  (zeroes upper lanes)
-//   * xMOVAPS(d, s)                         -> Mov(d.V16B(), s.V16B())
-//   * xSQRT.SS(d, s)                        -> Fsqrt(d.S(), s.S())
-//   * xMUL/xADD/xSUB.SS(r, ptr32[c])        -> load c into scratch S, F{mul,add,sub}
-//   * xCMPEQ.SS(0, r) + xPTEST              -> Fcmeq(.S) + Fmov->W + Cmp (testZero)
-//   * xMOVMSKPS                             -> mVUmovemask (aVU_Upper.inl)
-//   * absolute ptr16/ptr32 mem ops          -> mvuLdr*/mvuStr* (aVU_Misc.inl)
-//   * xComplexAddress(tmp, base, idx)       -> materialize base, Add idx, base+off MemOperand
-//
-// The constant-VU-address fast path (mVUoptimizeConstantAddr, aVU_Misc.inl)
-// returns an absolute host pointer; the runtime path computes the byte offset in
-// gprT1 and runs it through mVUaddrFix (VU0/VU1 wrap + window remap).
+// ARM64 VU1 Recompiler — Lower Instruction Stubs
+// Integer ALU, load/store, branches, FDIV, flag ops,
+// move/transfer, random, EFU, special (XITOP/XTOP/XGKICK)
 
-// 64-bit views of the two emit scratch GPRs (x86: gprT1q/gprT2q). mVUaddrFix and
-// the complex-address arithmetic need the full 64-bit register.
-#define gprT1q a64::x9
-#define gprT2q a64::x10
+// Included from aVU.cpp. All headers and `using namespace vixl::aarch64;` are
+// already in effect there. VU1_BASE_REG / VU1_STATUSFLAG_REG / VU1_CLIPFLAG_REG
+// / vfOff / viOff come from the parent.
 
-//------------------------------------------------------------------
-// Base+offset load/store helpers (LQ/SQ family — arbitrary VU-mem base reg)
-//------------------------------------------------------------------
-// mVUloadReg/mVUsaveReg (aVU_IR.h) are hard-wired to the RVUSTATE base; the VU
-// data-memory pointer (mVU.regs().Mem) is a separate allocation, so LQ/SQ need
-// versions that take an already-materialized 64-bit base register. Same lane
-// semantics + modXYZW convention as mVUsaveReg.
-static void mvuLoadRegBase(const a64::VRegister& reg, const a64::Register& base, int xyzw)
+extern void _vuXGKICKTransfer(s32 cycles, bool flush);
+
+// ============================================================================
+//  Native codegen helpers
+// ============================================================================
+
+// Compile-time current pair PC. Set by the per-pair dispatch loop in
+// iVU1micro_arm64.cpp before each lower-op emit. Used by native branch
+// emitters to resolve PC-relative targets at compile time (since step 2
+// of the dispatch loop has already stored (pair_pc+8) & VU1_PROGMASK into
+// VI[REG_TPC], runtime TPC is compile-time predictable here).
+u32 g_vu1CurrentPC = 0;
+
+// analyzeBranchVI gate (audit item #12). Set per-pair from
+// ir.info[i].needs_vi_backup before emitVU1Lower dispatch. When false,
+// emitBackupVI early-returns — no Ldrb/Strb/cmp dance, no VIOldValue
+// snapshot. Default true so any direct call from non-Pass-1-driven paths
+// stays correct.
+bool g_vu1NeedsVIBackup = true;
+
+// vfOff / viOff are provided by the parent aVU.cpp.
+
+// Non-inline VI backup wrapper — retained for the vu1_*-prefixed C wrappers
+// below (used by the REC_VU1_LOWER_CALL interp path when the per-op ISTUB is
+// enabled for LQD/LQI/SQD/SQI). Mirrors _vuBackupVI() in VUops.cpp.
+static void vu1BackupVI(VURegs* VU, u32 reg)
 {
-	switch (xyzw)
+	if (VU->VIBackupCycles && reg == VU->VIRegNumber)
 	{
-		case 8:  armAsm->Ldr(reg.S(), a64::MemOperand(base, 0));  break; // X
-		case 4:  armAsm->Ldr(reg.S(), a64::MemOperand(base, 4));  break; // Y
-		case 2:  armAsm->Ldr(reg.S(), a64::MemOperand(base, 8));  break; // Z
-		case 1:  armAsm->Ldr(reg.S(), a64::MemOperand(base, 12)); break; // W
-		default: armAsm->Ldr(reg.Q(), a64::MemOperand(base));     break;
-	}
-}
-
-static void mvuSaveRegBase(const a64::VRegister& reg, const a64::Register& base, int xyzw, bool modXYZW)
-{
-	if (xyzw == 0xf)
-	{
-		armAsm->Str(reg.Q(), a64::MemOperand(base));
+		VU->VIBackupCycles = 2;
 		return;
 	}
-	if (modXYZW && (xyzw == 4 || xyzw == 2 || xyzw == 1))
+	VU->VIBackupCycles = 2;
+	VU->VIRegNumber = reg;
+	VU->VIOldValue = VU->VI[reg].US[0];
+}
+
+// Inline VI backup emitter. Same semantics as vu1BackupVI above, but emitted
+// directly into the JIT buffer instead of a BL. Observation: VIBackupCycles
+// is set to 2 unconditionally in both branches, so we do that first, then
+// conditionally skip the regnum/oldvalue update when the prior state said
+// "same reg, backup still live".
+//
+// reg is a compile-time constant (VI index 0-15).
+// Must be emitted before any VI write (so VIOldValue captures pre-write state).
+// Scratch: w4, w5 (caller-saved; all emitBackupVI call sites avoid these).
+//
+// analyzeBranchVI gate: when g_vu1NeedsVIBackup is false, no in-block branch
+// within 4 pairs reads this VI AND we're not in the cross-block conservative
+// tail (last 4 pairs). The branch evaluation will read live VI directly, so
+// snapshotting the OLD value is dead work — early return.
+static void emitBackupVI(u32 reg)
+{
+	if (!g_vu1NeedsVIBackup)
+		return;
+
+	const int64_t vibackup_off = static_cast<int64_t>(offsetof(VURegs, VIBackupCycles));
+	const int64_t viregnum_off = static_cast<int64_t>(offsetof(VURegs, VIRegNumber));
+	const int64_t violdval_off = static_cast<int64_t>(offsetof(VURegs, VIOldValue));
+
+	a64::Label do_update, done;
+
+	// w4 = prior VIBackupCycles (u8, zero-extended).
+	armAsm->Ldrb(w4, MemOperand(VU1_BASE_REG, vibackup_off));
+	// Set VIBackupCycles = 2 unconditionally.
+	armAsm->Mov(w5, 2);
+	armAsm->Strb(w5, MemOperand(VU1_BASE_REG, vibackup_off));
+
+	// Fast-skip regnum/oldvalue update when prior backup was live AND the
+	// tracked reg matches: the existing oldvalue still reflects the correct
+	// pre-write state (the interpreter's _vuBackupVI does the same skip).
+	armAsm->Cbz(w4, &do_update);
+	armAsm->Ldr(w4, MemOperand(VU1_BASE_REG, viregnum_off));
+	armAsm->Cmp(w4, reg);
+	armAsm->B(&done, a64::eq);
+
+	armAsm->Bind(&do_update);
+	armAsm->Mov(w4, reg);
+	armAsm->Str(w4, MemOperand(VU1_BASE_REG, viregnum_off));
+	// VIOldValue is u32 but holds the u16 in its low halfword (matches
+	// `VIOldValue = VI[reg].US[0]` in the interpreter: u16→u32 zero-extend).
+	armAsm->Ldrh(w4, MemOperand(VU1_BASE_REG, viOff(reg)));
+	armAsm->Str(w4, MemOperand(VU1_BASE_REG, violdval_off));
+
+	armAsm->Bind(&done);
+}
+
+// ============================================================================
+//  C wrapper helpers — replicate interpreter logic for JIT-called functions.
+//  These use the same field-extraction macros as VUops.cpp, but take VURegs*.
+// ============================================================================
+
+// Field extraction (mirrors VUops.cpp macros, but parameter-based)
+#define W_Ft(VU) (((VU)->code >> 16) & 0x1F)
+#define W_Fs(VU) (((VU)->code >> 11) & 0x1F)
+#define W_Fd(VU) (((VU)->code >>  6) & 0x1F)
+#define W_It(VU) (W_Ft(VU) & 0xF)
+#define W_Is(VU) (W_Fs(VU) & 0xF)
+#define W_Id(VU) (W_Fd(VU) & 0xF)
+#define W_X(VU)  (((VU)->code >> 24) & 0x1)
+#define W_Y(VU)  (((VU)->code >> 23) & 0x1)
+#define W_Z(VU)  (((VU)->code >> 22) & 0x1)
+#define W_W(VU)  (((VU)->code >> 21) & 0x1)
+#define W_XYZW(VU) (((VU)->code >> 21) & 0xF)
+#define W_Fsf(VU)   (((VU)->code >> 21) & 0x03)
+#define W_Ftf(VU)   (((VU)->code >> 23) & 0x03)
+#define W_Imm11(VU) ((s32)((VU)->code & 0x400 ? 0xfffffc00 | ((VU)->code & 0x3ff) : (VU)->code & 0x3ff))
+
+// Type aliases to avoid vixl namespace clashes (vixl defines s16/u16 as registers)
+using vu_s16 = int16_t;
+using vu_u16 = uint16_t;
+using vu_s32 = int32_t;
+using vu_u32 = uint32_t;
+
+// Emit inline ARM64 for vuDouble clamping on a W register.
+// Flushes denormals to ±0, clamps inf/NaN to ±max if vu1SignOverflow is set.
+// INTENTIONAL DIVERGENCE FROM UPSTREAM x86 JIT: the port uses
+// CHECK_VU_SIGN_OVERFLOW here (not CHECK_VU_OVERFLOW as upstream does) as
+// the signal for an event-test optimization. Reverting to CHECK_VU_OVERFLOW
+// breaks event testing on this port — keep SIGN_OVERFLOW.
+// wreg: u32 float bits (modified in place)
+// wtmp: scratch register (clobbered)
+static void emitVuDouble(const Register& wreg, const Register& wtmp)
+{
+	a64::Label done;
+	armAsm->Ubfx(wtmp, wreg, 23, 8); // extract 8-bit exponent
+
+	if (CHECK_VU_SIGN_OVERFLOW(1))
 	{
-		const u32 coff = (xyzw == 4) ? 4u : (xyzw == 2) ? 8u : 12u;
-		armAsm->Str(reg.S(), a64::MemOperand(base, coff));
+		a64::Label denormal;
+		armAsm->Cbz(wtmp, &denormal);           // exp==0 -> denormal
+		armAsm->Cmp(wtmp, 0xFF);
+		armAsm->B(&done, a64::ne);               // normal -> done
+		// Infinity/NaN: clamp to ±max
+		armAsm->And(wtmp, wreg, 0x80000000u);
+		armAsm->Mov(wreg, 0x7f7fffff);
+		armAsm->Orr(wreg, wreg, wtmp);
+		armAsm->B(&done);
+		armAsm->Bind(&denormal);
+		armAsm->And(wreg, wreg, 0x80000000u);    // flush to ±0
+	}
+	else
+	{
+		armAsm->Cbnz(wtmp, &done);               // exp!=0 -> done
+		armAsm->And(wreg, wreg, 0x80000000u);    // flush to ±0
+	}
+	armAsm->Bind(&done);
+}
+
+// Float denormal/overflow clamping — mirrors the port's local VUops.cpp
+// vuDouble() (gated on CHECK_VU_SIGN_OVERFLOW, not CHECK_VU_OVERFLOW as
+// upstream). See emitVuDouble comment — SIGN_OVERFLOW is the event-test
+// optimization signal on this port; do not flip to OVERFLOW.
+static float vu1Double(vu_u32 f)
+{
+	switch (f & 0x7f800000)
+	{
+		case 0x0:
+			f &= 0x80000000;
+			return *(float*)&f;
+		case 0x7f800000:
+			if (CHECK_VU_SIGN_OVERFLOW(1))
+			{
+				u32 d = (f & 0x80000000) | 0x7f7fffff;
+				return *(float*)&d;
+			}
+			break;
+	}
+	return *(float*)&f;
+}
+
+// LFSR advance — mirrors AdvanceLFSR() in VUops.cpp
+static void vu1AdvanceLFSR(VURegs* VU)
+{
+	int x = (VU->VI[REG_R].UL >> 4) & 1;
+	int y = (VU->VI[REG_R].UL >> 22) & 1;
+	VU->VI[REG_R].UL <<= 1;
+	VU->VI[REG_R].UL ^= x ^ y;
+	VU->VI[REG_R].UL = (VU->VI[REG_R].UL & 0x7fffff) | 0x3f800000;
+}
+
+// EATAN polynomial — mirrors _vuCalculateEATAN() in VUops.cpp
+static float vu1CalculateEATAN(float inputvalue)
+{
+	float eatanconst[9] = { 0.999999344348907f, -0.333298563957214f, 0.199465364217758f, -0.13085337519646f,
+							0.096420042216778f, -0.055909886956215f, 0.021861229091883f, -0.004054057877511f,
+							0.785398185253143f };
+	float result = (eatanconst[0] * inputvalue) + (eatanconst[1] * pow(inputvalue, 3)) + (eatanconst[2] * pow(inputvalue, 5))
+					+ (eatanconst[3] * pow(inputvalue, 7)) + (eatanconst[4] * pow(inputvalue, 9)) + (eatanconst[5] * pow(inputvalue, 11))
+					+ (eatanconst[6] * pow(inputvalue, 13)) + (eatanconst[7] * pow(inputvalue, 15));
+	result += eatanconst[8];
+	result = vu1Double(*(u32*)&result);
+	return result;
+}
+
+// ============================================================================
+//  C wrapper functions — called from JIT via BL.
+//  Each takes VURegs* VU (passed in x0 = VU1_BASE_REG).
+// ============================================================================
+
+// Macro to generate rec function that calls a C wrapper
+#define REC_VU1_LOWER_CALL(name) \
+	void recVU1_##name() { \
+		armAsm->Mov(x0, VU1_BASE_REG); \
+		emitVu1Call(reinterpret_cast<const void*>(vu1_##name)); \
+	}
+
+// --- Load/Store wrappers ---
+static void vu1_LQ(VURegs* VU)
+{
+	if (W_Ft(VU) == 0) return;
+	vu_s16 imm = (VU->code & 0x400) ? (VU->code & 0x3ff) | 0xfc00 : (VU->code & 0x3ff);
+	vu_u16 addr = ((imm + VU->VI[W_Is(VU)].SS[0]) * 16);
+	u32* ptr = (u32*)GET_VU_MEM(VU, addr);
+	if (W_X(VU)) VU->VF[W_Ft(VU)].UL[0] = ptr[0];
+	if (W_Y(VU)) VU->VF[W_Ft(VU)].UL[1] = ptr[1];
+	if (W_Z(VU)) VU->VF[W_Ft(VU)].UL[2] = ptr[2];
+	if (W_W(VU)) VU->VF[W_Ft(VU)].UL[3] = ptr[3];
+}
+
+static void vu1_LQD(VURegs* VU)
+{
+	vu1BackupVI(VU, W_Is(VU));
+	if (W_Is(VU) != 0) VU->VI[W_Is(VU)].US[0]--;
+	if (W_Ft(VU) == 0) return;
+	u32 addr = (VU->VI[W_Is(VU)].US[0] * 16);
+	u32* ptr = (u32*)GET_VU_MEM(VU, addr);
+	if (W_X(VU)) VU->VF[W_Ft(VU)].UL[0] = ptr[0];
+	if (W_Y(VU)) VU->VF[W_Ft(VU)].UL[1] = ptr[1];
+	if (W_Z(VU)) VU->VF[W_Ft(VU)].UL[2] = ptr[2];
+	if (W_W(VU)) VU->VF[W_Ft(VU)].UL[3] = ptr[3];
+}
+
+static void vu1_LQI(VURegs* VU)
+{
+	vu1BackupVI(VU, W_Is(VU));
+	if (W_Ft(VU))
+	{
+		u32 addr = (VU->VI[W_Is(VU)].US[0] * 16);
+		u32* ptr = (u32*)GET_VU_MEM(VU, addr);
+		if (W_X(VU)) VU->VF[W_Ft(VU)].UL[0] = ptr[0];
+		if (W_Y(VU)) VU->VF[W_Ft(VU)].UL[1] = ptr[1];
+		if (W_Z(VU)) VU->VF[W_Ft(VU)].UL[2] = ptr[2];
+		if (W_W(VU)) VU->VF[W_Ft(VU)].UL[3] = ptr[3];
+	}
+	if (W_Fs(VU) != 0) VU->VI[W_Is(VU)].US[0]++;
+}
+
+static void vu1_SQ(VURegs* VU)
+{
+	vu_s16 imm = (VU->code & 0x400) ? (VU->code & 0x3ff) | 0xfc00 : (VU->code & 0x3ff);
+	vu_u16 addr = ((imm + VU->VI[W_It(VU)].SS[0]) * 16);
+	u32* ptr = (u32*)GET_VU_MEM(VU, addr);
+	if (W_X(VU)) ptr[0] = VU->VF[W_Fs(VU)].UL[0];
+	if (W_Y(VU)) ptr[1] = VU->VF[W_Fs(VU)].UL[1];
+	if (W_Z(VU)) ptr[2] = VU->VF[W_Fs(VU)].UL[2];
+	if (W_W(VU)) ptr[3] = VU->VF[W_Fs(VU)].UL[3];
+}
+
+static void vu1_SQD(VURegs* VU)
+{
+	vu1BackupVI(VU, W_It(VU));
+	if (W_Ft(VU) != 0) VU->VI[W_It(VU)].US[0]--;
+	u32 addr = (VU->VI[W_It(VU)].US[0] * 16);
+	u32* ptr = (u32*)GET_VU_MEM(VU, addr);
+	if (W_X(VU)) ptr[0] = VU->VF[W_Fs(VU)].UL[0];
+	if (W_Y(VU)) ptr[1] = VU->VF[W_Fs(VU)].UL[1];
+	if (W_Z(VU)) ptr[2] = VU->VF[W_Fs(VU)].UL[2];
+	if (W_W(VU)) ptr[3] = VU->VF[W_Fs(VU)].UL[3];
+}
+
+static void vu1_SQI(VURegs* VU)
+{
+	vu1BackupVI(VU, W_It(VU));
+	u32 addr = (VU->VI[W_It(VU)].US[0] * 16);
+	u32* ptr = (u32*)GET_VU_MEM(VU, addr);
+	if (W_X(VU)) ptr[0] = VU->VF[W_Fs(VU)].UL[0];
+	if (W_Y(VU)) ptr[1] = VU->VF[W_Fs(VU)].UL[1];
+	if (W_Z(VU)) ptr[2] = VU->VF[W_Fs(VU)].UL[2];
+	if (W_W(VU)) ptr[3] = VU->VF[W_Fs(VU)].UL[3];
+	if (W_Ft(VU) != 0) VU->VI[W_It(VU)].US[0]++;
+}
+
+static void vu1_ILW(VURegs* VU)
+{
+	if (W_It(VU) == 0) return;
+	vu_s16 imm = (VU->code & 0x400) ? (VU->code & 0x3ff) | 0xfc00 : (VU->code & 0x3ff);
+	vu_u16 addr = ((imm + VU->VI[W_Is(VU)].SS[0]) * 16);
+	vu_u16* ptr = (vu_u16*)GET_VU_MEM(VU, addr);
+	if (W_X(VU)) VU->VI[W_It(VU)].US[0] = ptr[0];
+	if (W_Y(VU)) VU->VI[W_It(VU)].US[0] = ptr[2];
+	if (W_Z(VU)) VU->VI[W_It(VU)].US[0] = ptr[4];
+	if (W_W(VU)) VU->VI[W_It(VU)].US[0] = ptr[6];
+}
+
+static void vu1_ISW(VURegs* VU)
+{
+	vu_s16 imm = (VU->code & 0x400) ? (VU->code & 0x3ff) | 0xfc00 : (VU->code & 0x3ff);
+	vu_u16 addr = ((imm + VU->VI[W_Is(VU)].SS[0]) * 16);
+	vu_u16* ptr = (vu_u16*)GET_VU_MEM(VU, addr);
+	if (W_X(VU)) { ptr[0] = VU->VI[W_It(VU)].US[0]; ptr[1] = 0; }
+	if (W_Y(VU)) { ptr[2] = VU->VI[W_It(VU)].US[0]; ptr[3] = 0; }
+	if (W_Z(VU)) { ptr[4] = VU->VI[W_It(VU)].US[0]; ptr[5] = 0; }
+	if (W_W(VU)) { ptr[6] = VU->VI[W_It(VU)].US[0]; ptr[7] = 0; }
+}
+
+static void vu1_ILWR(VURegs* VU)
+{
+	if (W_It(VU) == 0) return;
+	u32 addr = (VU->VI[W_Is(VU)].US[0] * 16);
+	vu_u16* ptr = (vu_u16*)GET_VU_MEM(VU, addr);
+	if (W_X(VU)) VU->VI[W_It(VU)].US[0] = ptr[0];
+	if (W_Y(VU)) VU->VI[W_It(VU)].US[0] = ptr[2];
+	if (W_Z(VU)) VU->VI[W_It(VU)].US[0] = ptr[4];
+	if (W_W(VU)) VU->VI[W_It(VU)].US[0] = ptr[6];
+}
+
+static void vu1_ISWR(VURegs* VU)
+{
+	u32 addr = (VU->VI[W_Is(VU)].US[0] * 16);
+	vu_u16* ptr = (vu_u16*)GET_VU_MEM(VU, addr);
+	if (W_X(VU)) { ptr[0] = VU->VI[W_It(VU)].US[0]; ptr[1] = 0; }
+	if (W_Y(VU)) { ptr[2] = VU->VI[W_It(VU)].US[0]; ptr[3] = 0; }
+	if (W_Z(VU)) { ptr[4] = VU->VI[W_It(VU)].US[0]; ptr[5] = 0; }
+	if (W_W(VU)) { ptr[6] = VU->VI[W_It(VU)].US[0]; ptr[7] = 0; }
+}
+
+// --- Flag operation wrappers ---
+static void vu1_FSAND(VURegs* VU)
+{
+	vu_u16 imm = (((VU->code >> 21) & 0x1) << 11) | (VU->code & 0x7ff);
+	if (W_It(VU) == 0) return;
+	VU->VI[W_It(VU)].US[0] = (VU->VI[REG_STATUS_FLAG].US[0] & 0xFFF) & imm;
+}
+
+static void vu1_FSEQ(VURegs* VU)
+{
+	vu_u16 imm = (((VU->code >> 21) & 0x1) << 11) | (VU->code & 0x7ff);
+	if (W_It(VU) == 0) return;
+	if ((VU->VI[REG_STATUS_FLAG].US[0] & 0xFFF) == imm)
+		VU->VI[W_It(VU)].US[0] = 1;
+	else
+		VU->VI[W_It(VU)].US[0] = 0;
+}
+
+static void vu1_FSOR(VURegs* VU)
+{
+	vu_u16 imm = (((VU->code >> 21) & 0x1) << 11) | (VU->code & 0x7ff);
+	if (W_It(VU) == 0) return;
+	VU->VI[W_It(VU)].US[0] = (VU->VI[REG_STATUS_FLAG].US[0] & 0xFFF) | imm;
+}
+
+static void vu1_FSSET(VURegs* VU)
+{
+	vu_u16 imm = (((VU->code >> 21) & 0x1) << 11) | (VU->code & 0x7FF);
+	VU->statusflag = (imm & 0xFC0) | (VU->statusflag & 0x3F);
+}
+
+static void vu1_FMAND(VURegs* VU)
+{
+	if (W_It(VU) == 0) return;
+	VU->VI[W_It(VU)].US[0] = VU->VI[W_Is(VU)].US[0] & (VU->VI[REG_MAC_FLAG].UL & 0xFFFF);
+}
+
+static void vu1_FMEQ(VURegs* VU)
+{
+	if (W_It(VU) == 0) return;
+	if ((VU->VI[REG_MAC_FLAG].UL & 0xFFFF) == VU->VI[W_Is(VU)].US[0])
+		VU->VI[W_It(VU)].US[0] = 1;
+	else
+		VU->VI[W_It(VU)].US[0] = 0;
+}
+
+static void vu1_FMOR(VURegs* VU)
+{
+	if (W_It(VU) == 0) return;
+	VU->VI[W_It(VU)].US[0] = (VU->VI[REG_MAC_FLAG].UL & 0xFFFF) | VU->VI[W_Is(VU)].US[0];
+}
+
+static void vu1_FCAND(VURegs* VU)
+{
+	if ((VU->VI[REG_CLIP_FLAG].UL & 0xFFFFFF) & (VU->code & 0xFFFFFF))
+		VU->VI[1].US[0] = 1;
+	else
+		VU->VI[1].US[0] = 0;
+}
+
+static void vu1_FCEQ(VURegs* VU)
+{
+	if ((VU->VI[REG_CLIP_FLAG].UL & 0xFFFFFF) == (VU->code & 0xFFFFFF))
+		VU->VI[1].US[0] = 1;
+	else
+		VU->VI[1].US[0] = 0;
+}
+
+static void vu1_FCOR(VURegs* VU)
+{
+	u32 hold = (VU->VI[REG_CLIP_FLAG].UL & 0xFFFFFF) | (VU->code & 0xFFFFFF);
+	if (hold == 0xFFFFFF)
+		VU->VI[1].US[0] = 1;
+	else
+		VU->VI[1].US[0] = 0;
+}
+
+static void vu1_FCSET(VURegs* VU)
+{
+	VU->clipflag = (u32)(VU->code & 0xFFFFFF);
+}
+
+static void vu1_FCGET(VURegs* VU)
+{
+	if (W_It(VU) == 0) return;
+	VU->VI[W_It(VU)].US[0] = VU->VI[REG_CLIP_FLAG].UL & 0x0FFF;
+}
+
+// --- Random number generator wrappers ---
+static void vu1_RINIT(VURegs* VU)
+{
+	VU->VI[REG_R].UL = 0x3F800000 | (VU->VF[W_Fs(VU)].UL[W_Fsf(VU)] & 0x007FFFFF);
+}
+
+static void vu1_RGET(VURegs* VU)
+{
+	if (W_Ft(VU) == 0) return;
+	if (W_X(VU)) VU->VF[W_Ft(VU)].UL[0] = VU->VI[REG_R].UL;
+	if (W_Y(VU)) VU->VF[W_Ft(VU)].UL[1] = VU->VI[REG_R].UL;
+	if (W_Z(VU)) VU->VF[W_Ft(VU)].UL[2] = VU->VI[REG_R].UL;
+	if (W_W(VU)) VU->VF[W_Ft(VU)].UL[3] = VU->VI[REG_R].UL;
+}
+
+static void vu1_RNEXT(VURegs* VU)
+{
+	if (W_Ft(VU) == 0) return;
+	vu1AdvanceLFSR(VU);
+	if (W_X(VU)) VU->VF[W_Ft(VU)].UL[0] = VU->VI[REG_R].UL;
+	if (W_Y(VU)) VU->VF[W_Ft(VU)].UL[1] = VU->VI[REG_R].UL;
+	if (W_Z(VU)) VU->VF[W_Ft(VU)].UL[2] = VU->VI[REG_R].UL;
+	if (W_W(VU)) VU->VF[W_Ft(VU)].UL[3] = VU->VI[REG_R].UL;
+}
+
+static void vu1_RXOR(VURegs* VU)
+{
+	VU->VI[REG_R].UL = 0x3F800000 | ((VU->VI[REG_R].UL ^ VU->VF[W_Fs(VU)].UL[W_Fsf(VU)]) & 0x007FFFFF);
+}
+
+// --- EFU wrappers (transcendentals only — ESADD/ERSADD/ELENG/ERLENG/ESUM/
+//     ERCPR/ESQRT/ERSQRT are native; see recVU1_ESADD et al. below). ---
+static void vu1_EATANxy(VURegs* VU)
+{
+	float x = vu1Double(VU->VF[W_Fs(VU)].i.x);
+	float y = vu1Double(VU->VF[W_Fs(VU)].i.y);
+	// Transform: t = (y-x)/(x+y), then atan(t) + pi/4 = atan(y/x)
+	float t = (y - x) / (x + y);
+	float p = vu1CalculateEATAN(t);
+	VU->p.F = p;
+	VU->VI[REG_P].UL = *(u32*)&p;
+}
+
+static void vu1_EATANxz(VURegs* VU)
+{
+	float x = vu1Double(VU->VF[W_Fs(VU)].i.x);
+	float z = vu1Double(VU->VF[W_Fs(VU)].i.z);
+	// Transform: t = (z-x)/(x+z), then atan(t) + pi/4 = atan(z/x)
+	float t = (z - x) / (x + z);
+	float p = vu1CalculateEATAN(t);
+	VU->p.F = p;
+	VU->VI[REG_P].UL = *(u32*)&p;
+}
+
+static void vu1_ESIN(VURegs* VU)
+{
+	float sinconsts[5] = {1.0f, -0.166666567325592f, 0.008333025500178f, -0.000198074136279f, 0.000002601886990f};
+	float p = vu1Double(VU->VF[W_Fs(VU)].UL[W_Fsf(VU)]);
+	p = (sinconsts[0] * p) + (sinconsts[1] * pow(p, 3)) + (sinconsts[2] * pow(p, 5))
+		+ (sinconsts[3] * pow(p, 7)) + (sinconsts[4] * pow(p, 9));
+	VU->p.F = vu1Double(*(u32*)&p);
+	VU->VI[REG_P].UL = VU->p.UL;
+}
+
+static void vu1_EATAN(VURegs* VU)
+{
+	float x = vu1Double(VU->VF[W_Fs(VU)].UL[W_Fsf(VU)]);
+	// Transform: t = (x-1)/(x+1), then atan(t) + pi/4 = atan(x)
+	float t = (x - 1.0f) / (x + 1.0f);
+	float p = vu1CalculateEATAN(t);
+	VU->p.F = p;
+	VU->VI[REG_P].UL = *(u32*)&p;
+}
+
+static void vu1_EEXP(VURegs* VU)
+{
+	float consts[6] = {0.249998688697815f, 0.031257584691048f, 0.002591371303424f,
+						0.000171562001924f, 0.000005430199963f, 0.000000690600018f};
+	float p = vu1Double(VU->VF[W_Fs(VU)].UL[W_Fsf(VU)]);
+	p = 1.0f + (consts[0] * p) + (consts[1] * pow(p, 2)) + (consts[2] * pow(p, 3))
+		+ (consts[3] * pow(p, 4)) + (consts[4] * pow(p, 5)) + (consts[5] * pow(p, 6));
+	p = pow(p, 4);
+	p = vu1Double(*(u32*)&p);
+	p = 1 / p;
+	VU->p.F = p;
+	VU->VI[REG_P].UL = *(u32*)&p;
+}
+
+// --- Special wrappers ---
+static void vu1_XITOP(VURegs* VU)
+{
+	if (W_It(VU) == 0) return;
+	if (THREAD_VU1)
+		VU->VI[W_It(VU)].US[0] = vu1Thread.vifRegs.itop & 0x3FF;
+	else
+		VU->VI[W_It(VU)].US[0] = VU->GetVifRegs().itop & 0x3FF;
+}
+
+static void vu1_XTOP(VURegs* VU)
+{
+	if (W_It(VU) == 0) return;
+	if (THREAD_VU1)
+		VU->VI[W_It(VU)].US[0] = (vu_u16)vu1Thread.vifRegs.top;
+	else
+		VU->VI[W_It(VU)].US[0] = (vu_u16)VU->GetVifRegs().top;
+}
+
+// XGKICK capture scratch — arm64 analogue of microVU's mVU.VIxgkick. Holds
+// the pending XGKICK's VU1.Mem offset between the capture at pair k and the
+// deferred fire at (end of) pair k+1. Critically, this is NOT VU1.xgkickenable
+// / VU1.xgkickaddr — touching VU1.xgkickenable would trip _vuTestPipes
+// (VUops.cpp:203), which calls _vuXGKICKTransfer whenever xgkickenable is set
+// and xgkickcyclecount >= 2. Under REC_VU1=true that loop walks
+// GetGSPacketSize without the Gif_Unit.h:606 early-exit branch setting the
+// EOP top bit, so xgkickendpacket stays 0 and the loop iterates past the
+// packet, trips the 0x4000 guard, and cancels valid kicks. By stashing the
+// addr in a private static and firing via the direct gifUnit path, the arm64
+// rec avoids _vuTestPipes's xgkick branch entirely (mirroring microVU's
+// non-hack path which only touches mVU.VIxgkick, never VU1.xgkickenable).
+//
+// Safe as a file-local static: every compiled VU1 block drains any pending
+// kick before returning (pair-loop step 15 or the CompileBlock block-end
+// drain), so this never carries state across block boundaries.
+static u32 s_vu1_pending_xgkick_addr;
+
+// Forward decl — defined just below. Fires a pending XGKICK via the direct
+// gifUnit path. Only called when the compile-time pending_xgkick_fire tracker
+// in CompileBlock says a kick is pending, so no runtime pending flag needed.
+void vu1_XGKICK_fire_deferred(VURegs* VU);
+
+static void vu1_XGKICK(VURegs* VU)
+{
+	// Capture only. No VU1.xgkickenable / VU1.xgkickaddr / VPU_STAT writes —
+	// keeping VU1 state untouched is what prevents _vuTestPipes (called at
+	// step 6 of every following pair in CompileBlock) from observing "kick
+	// pending" and walking into the broken _vuXGKICKTransfer loop. Back-to-
+	// back XGKICKs are sequenced at compile time in CompileBlock, so no
+	// flush-prior path here.
+	s_vu1_pending_xgkick_addr = (VU->VI[W_Is(VU)].US[0] & 0x3ff) * 16;
+}
+
+// Deferred XGKICK transfer. Emitted by CompileBlock one pair after an XGKICK
+// (or immediately before a back-to-back XGKICK capture) so any VU store on
+// the intervening pair has committed before the GIF walks VU1.Mem. Arm64
+// analogue of microVU's mVU_XGKICK_ / mVU_XGKICK_DELAY path.
+//
+// IMPORTANT: we deliberately bypass _vuXGKICKTransfer here. That loop is
+// written for the interpreter/REC_VU1=false configuration and relies on
+// GetGSPacketSize returning with the EOP top-bit set (Gif_Unit.h:606 early-
+// exit branch) to know when to stop. With REC_VU1=true the early-exit is
+// disabled and line 612 returns without the top bit, so _vuXGKICKTransfer
+// never sees xgkickendpacket, re-iterates past the packet, walks stale
+// memory, hits the 0x4000 guard and cancels the kick. microVU sidesteps this
+// by calling gifUnit.GetGSPacketSize + TransferGSPacketData directly in
+// mVU_XGKICK_ (microVU_Lower.inl:1698). This function is the arm64 analogue.
+//
+// VU arg is unused (kept for ABI compat with armEmitCall, which loads x0 =
+// VU1_BASE_REG at every call site).
+void vu1_XGKICK_fire_deferred(VURegs* VU)
+{
+	(void)VU;
+
+	const u32 addr = s_vu1_pending_xgkick_addr & 0x3FF0u;
+	const u32 diff = 0x4000u - addr;
+	u32 size = gifUnit.GetGSPacketSize(GIF_PATH_1, VU1.Mem, addr, ~0u, true);
+	size &= 0xFFFFu; // strip the EOP top bit the early-exit path sets when REC_VU1=false
+
+	if (size == 0)
+	{
+		// 0x4000 guard tripped — silently drop the kick, matching microVU's
+		// mVU_XGKICK_ which would TransferGSPacketData(..., 0, ...). BIOS
+		// does this once at boot (see Gif_Unit.h:602 comment).
 		return;
 	}
-	if (xyzw & 8)
-		armAsm->Str(reg.S(), a64::MemOperand(base, 0));
-	if (xyzw & 4)
-	{
-		armAsm->Add(RVUADDR, base, 4);
-		armAsm->St1(reg.V4S(), 1, a64::MemOperand(RVUADDR));
-	}
-	if (xyzw & 2)
-	{
-		armAsm->Add(RVUADDR, base, 8);
-		armAsm->St1(reg.V4S(), 2, a64::MemOperand(RVUADDR));
-	}
-	if (xyzw & 1)
-	{
-		armAsm->Add(RVUADDR, base, 12);
-		armAsm->St1(reg.V4S(), 3, a64::MemOperand(RVUADDR));
-	}
-}
-
-// Materialize host base `p` into baseReg, then baseReg += indexReg (the byte
-// offset from mVUaddrFix). x86: xComplexAddress(tmp, base, idx).
-static inline void mvuComplexAddr(const a64::Register& baseReg, const void* p, const a64::Register& indexReg)
-{
-	armMoveAddressToReg(baseReg, p);
-	armAsm->Add(baseReg, baseReg, indexReg);
-}
-
-// 16-bit zero-extending absolute load (x86: xMOVZX(reg, ptr16[addr])).
-static inline void mvuLdrhZ(const a64::Register& wreg, const void* addr)
-{
-	armMoveAddressToReg(RSCRATCHADDR, addr);
-	armAsm->Ldrh(wreg.W(), a64::MemOperand(RSCRATCHADDR));
-}
-
-//------------------------------------------------------------------
-// Branch-attribute setup (x86: microVU_Lower.inl setBranchA)
-//------------------------------------------------------------------
-// Records the branch type (x) on the lower op + handles the "branch to next
-// instruction" NOP optimization. No emit — pure IR bookkeeping across all passes.
-// Defined here (this .inl is #included before aVU_Tables.inl) so both the Lower
-// branch handlers below and B/BAL in the tables file can call it.
-void setBranchA(mP, int x, int _x_)
-{
-	bool isBranchDelaySlot = false;
-
-	incPC(-2);
-	if (mVUlow.branch)
-		isBranchDelaySlot = true;
-	incPC(2);
-
-	pass1
-	{
-		if (_Imm11_ == 1 && !_x_ && !isBranchDelaySlot)
-		{
-			DevCon.WriteLn(Color_Green, "microVU%d: Branch Optimization", mVU.index);
-			mVUlow.isNOP = true;
-			return;
-		}
-		mVUbranch     = x;
-		mVUlow.branch = x;
-	}
-	pass2 { if (_Imm11_ == 1 && !_x_ && !isBranchDelaySlot) { return; } mVUbranch = x; }
-	pass3 { mVUbranch = x; }
-	pass4 { if (_Imm11_ == 1 && !_x_ && !isBranchDelaySlot) { return; } mVUbranch = x; }
-}
-
-//------------------------------------------------------------------
-// DIV/SQRT/RSQRT
-//------------------------------------------------------------------
-
-// Test if Vector lane0 is +/- Zero. Leaves the result in gprTemp and sets the
-// condition flags (eq == "reg != 0", matching the x86 PTEST+JZ pattern: the
-// caller's B(eq) skips when the value is non-zero).
-static __fi void testZero(const a64::VRegister& xmmReg, const a64::VRegister& xmmTemp, const a64::Register& gprTemp)
-{
-	armAsm->Eor(xmmTemp.V16B(), xmmTemp.V16B(), xmmTemp.V16B());
-	armAsm->Fcmeq(xmmTemp.S(), xmmTemp.S(), xmmReg.S()); // lane0 = (0 == reg) ? ~0 : 0
-	armAsm->Fmov(gprTemp.W(), xmmTemp.S());
-	armAsm->Cmp(gprTemp.W(), 0); // ZF(eq) set when reg != 0
-}
-
-// Test if Vector is Negative (sets I-flag and makes positive).
-static __fi void testNeg(mV, const a64::VRegister& xmmReg, const a64::Register& gprTemp)
-{
-	mVUmovemask(gprTemp, xmmReg);
-	armAsm->Tst(gprTemp.W(), 1);
-	a64::Label skip;
-	armAsm->B(&skip, a64::eq); // bit0 clear -> not negative
-		mvuStrImm32(&mVU.divFlag, divI, gprT2);
-		mvuLdrQ(RQSCRATCH, mVUglob.absclip);
-		armAsm->And(xmmReg.V16B(), xmmReg.V16B(), RQSCRATCH.V16B());
-	armAsm->Bind(&skip);
-}
-
-mVUop(mVU_DIV)
-{
-	pass1 { mVUanalyzeFDIV(mVU, _Fs_, _Fsf_, _Ft_, _Ftf_, 7); }
-	pass2
-	{
-		a64::VRegister Ft;
-		if (_Ftf_) Ft = mVU.regAlloc->allocReg(_Ft_, 0, (1 << (3 - _Ftf_)));
-		else       Ft = mVU.regAlloc->allocReg(_Ft_);
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, 0, (1 << (3 - _Fsf_)));
-		const a64::VRegister t1 = mVU.regAlloc->allocReg();
-
-		a64::Label cjmp, ajmp, bjmp, djmp;
-		testZero(Ft, t1, gprT1); // Test if Ft is zero
-		armAsm->B(&cjmp, a64::eq); // Skip if not zero
-
-			testZero(Fs, t1, gprT1); // Test if Fs is zero
-			armAsm->B(&ajmp, a64::eq);
-				mvuStrImm32(&mVU.divFlag, divI, gprT1); // Set invalid flag (0/0)
-				armAsm->B(&bjmp);
-			armAsm->Bind(&ajmp);
-				mvuStrImm32(&mVU.divFlag, divD, gprT1); // Zero divide (only when not 0/0)
-			armAsm->Bind(&bjmp);
-
-			armAsm->Eor(Fs.V16B(), Fs.V16B(), Ft.V16B());
-			mvuLdrQ(RQSCRATCH, mVUglob.signbit);
-			armAsm->And(Fs.V16B(), Fs.V16B(), RQSCRATCH.V16B());
-			mvuLdrQ(RQSCRATCH, mVUglob.maxvals);
-			armAsm->Orr(Fs.V16B(), Fs.V16B(), RQSCRATCH.V16B()); // If division by zero, then Fs = +/- fmax
-
-			armAsm->B(&djmp);
-		armAsm->Bind(&cjmp);
-			mvuStrImm32(&mVU.divFlag, 0, gprT1); // Clear I/D flags
-			SSE_DIVSS(mVU, Fs, Ft);
-			mVUclamp1(mVU, Fs, t1, 8, true);
-		armAsm->Bind(&djmp);
-
-		writeQreg(Fs, mVUinfo.writeQ);
-
-		if (mVU.cop2)
-		{
-			armAsm->And(gprF0, gprF0, ~0xc0000);
-			mvuLdr32(gprT1, &mVU.divFlag);
-			armAsm->Orr(gprF0, gprF0, gprT1);
-		}
-
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.regAlloc->clearNeeded(Ft);
-		mVU.regAlloc->clearNeeded(t1);
-		mVU.profiler.EmitOp(opDIV);
-	}
-	pass3 { mVUlog("DIV Q, vf%02d%s, vf%02d%s", _Fs_, _Fsf_String, _Ft_, _Ftf_String); }
-}
-
-mVUop(mVU_SQRT)
-{
-	pass1 { mVUanalyzeFDIV(mVU, 0, 0, _Ft_, _Ftf_, 7); }
-	pass2
-	{
-		const a64::VRegister Ft = mVU.regAlloc->allocReg(_Ft_, 0, (1 << (3 - _Ftf_)));
-
-		mvuStrImm32(&mVU.divFlag, 0, gprT1); // Clear I/D flags
-		testNeg(mVU, Ft, gprT1); // Check for negative sqrt
-
-		if (CHECK_VU_OVERFLOW(mVU.index)) // Clamp infinities (only need positive clamp since Ft is positive)
-		{
-			// Fminnm, not Fmin: x86 MIN.SS returns the second operand (fmax) when Ft
-			// is a NaN pattern (a valid huge number on the PS2); Fmin would propagate
-			// the NaN into Fsqrt and poison Q.
-			mvuLdrSS(RQSCRATCH, mVUglob.maxvals);
-			armAsm->Fminnm(Ft.S(), Ft.S(), RQSCRATCH.S());
-		}
-		armAsm->Fsqrt(Ft.S(), Ft.S());
-		writeQreg(Ft, mVUinfo.writeQ);
-
-		if (mVU.cop2)
-		{
-			armAsm->And(gprF0, gprF0, ~0xc0000);
-			mvuLdr32(gprT1, &mVU.divFlag);
-			armAsm->Orr(gprF0, gprF0, gprT1);
-		}
-
-		mVU.regAlloc->clearNeeded(Ft);
-		mVU.profiler.EmitOp(opSQRT);
-	}
-	pass3 { mVUlog("SQRT Q, vf%02d%s", _Ft_, _Ftf_String); }
-}
-
-mVUop(mVU_RSQRT)
-{
-	pass1 { mVUanalyzeFDIV(mVU, _Fs_, _Fsf_, _Ft_, _Ftf_, 13); }
-	pass2
-	{
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, 0, (1 << (3 - _Fsf_)));
-		const a64::VRegister Ft = mVU.regAlloc->allocReg(_Ft_, 0, (1 << (3 - _Ftf_)));
-		const a64::VRegister t1 = mVU.regAlloc->allocReg();
-
-		mvuStrImm32(&mVU.divFlag, 0, gprT1); // Clear I/D flags
-		testNeg(mVU, Ft, gprT1); // Check for negative sqrt
-
-		armAsm->Fsqrt(Ft.S(), Ft.S());
-
-		a64::Label ajmp, bjmp, cjmp, djmp;
-		testZero(Ft, t1, gprT1); // Test if Ft is zero
-		armAsm->B(&ajmp, a64::eq); // Skip if not zero
-
-			testZero(Fs, t1, gprT1); // Test if Fs is zero
-			armAsm->B(&bjmp, a64::eq); // Skip if none are
-				mvuStrImm32(&mVU.divFlag, divI, gprT1); // Set invalid flag (0/0)
-				armAsm->B(&cjmp);
-			armAsm->Bind(&bjmp);
-				mvuStrImm32(&mVU.divFlag, divD, gprT1); // Zero divide flag (only when not 0/0)
-			armAsm->Bind(&cjmp);
-
-			mvuLdrQ(RQSCRATCH, mVUglob.signbit);
-			armAsm->And(Fs.V16B(), Fs.V16B(), RQSCRATCH.V16B());
-			mvuLdrQ(RQSCRATCH, mVUglob.maxvals);
-			armAsm->Orr(Fs.V16B(), Fs.V16B(), RQSCRATCH.V16B()); // Fs = +/-Max
-
-			armAsm->B(&djmp);
-		armAsm->Bind(&ajmp);
-			SSE_DIVSS(mVU, Fs, Ft);
-			mVUclamp1(mVU, Fs, t1, 8, true);
-		armAsm->Bind(&djmp);
-
-		writeQreg(Fs, mVUinfo.writeQ);
-
-		if (mVU.cop2)
-		{
-			armAsm->And(gprF0, gprF0, ~0xc0000);
-			mvuLdr32(gprT1, &mVU.divFlag);
-			armAsm->Orr(gprF0, gprF0, gprT1);
-		}
-
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.regAlloc->clearNeeded(Ft);
-		mVU.regAlloc->clearNeeded(t1);
-		mVU.profiler.EmitOp(opRSQRT);
-	}
-	pass3 { mVUlog("RSQRT Q, vf%02d%s, vf%02d%s", _Fs_, _Fsf_String, _Ft_, _Ftf_String); }
-}
-
-//------------------------------------------------------------------
-// EATAN/EEXP/ELENG/ERCPR/ERLENG/ERSADD/ERSQRT/ESADD/ESIN/ESQRT/ESUM
-//------------------------------------------------------------------
-
-#define EATANhelper(addr) \
-	{ \
-		SSE_MULSS(mVU, t2, Fs); \
-		SSE_MULSS(mVU, t2, Fs); \
-		armAsm->Mov(t1.V16B(), t2.V16B()); \
-		mvuLdrSS(RQSCRATCH, addr); \
-		armAsm->Fmul(t1.S(), t1.S(), RQSCRATCH.S()); \
-		SSE_ADDSS(mVU, PQ, t1); \
-	}
-
-static __fi void mVU_EATAN_(mV, const a64::VRegister& PQ, const a64::VRegister& Fs, const a64::VRegister& t1, const a64::VRegister& t2)
-{
-	armAsm->Ins(PQ.V4S(), 0, Fs.V4S(), 0);
-	mvuLdrSS(RQSCRATCH, mVUglob.T1);
-	mVUscalarMulKeep(PQ, PQ, RQSCRATCH); // keep Q lanes (see aVU_IR.h)
-	armAsm->Mov(t2.V16B(), Fs.V16B());
-	EATANhelper(mVUglob.T2);
-	EATANhelper(mVUglob.T3);
-	EATANhelper(mVUglob.T4);
-	EATANhelper(mVUglob.T5);
-	EATANhelper(mVUglob.T6);
-	EATANhelper(mVUglob.T7);
-	EATANhelper(mVUglob.T8);
-	mvuLdrSS(RQSCRATCH, mVUglob.Pi4);
-	mVUscalarAddKeep(PQ, PQ, RQSCRATCH); // keep Q lanes (see aVU_IR.h)
-	mVUshufflePS(PQ, PQ, mVUinfo.writeP ? 0x27 : 0xC6);
-}
-
-mVUop(mVU_EATAN)
-{
-	pass1
-	{
-		if (isVU0)
-		{
-			mVUlow.isNOP = true;
-			return;
-		}
-		mVUanalyzeEFU1(mVU, _Fs_, _Fsf_, 54);
-	}
-	pass2
-	{
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, 0, (1 << (3 - _Fsf_)));
-		const a64::VRegister t1 = mVU.regAlloc->allocReg();
-		const a64::VRegister t2 = mVU.regAlloc->allocReg();
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip xmmPQ to get Valid P instance
-		armAsm->Ins(mVU_xmmPQ.V4S(), 0, Fs.V4S(), 0);
-		mvuLdrSS(RQSCRATCH, mVUglob.one);
-		armAsm->Fsub(Fs.S(), Fs.S(), RQSCRATCH.S());
-		mVUscalarAddKeep(mVU_xmmPQ, mVU_xmmPQ, RQSCRATCH); // keep Q lanes (see aVU_IR.h)
-		SSE_DIVSS(mVU, Fs, mVU_xmmPQ);
-		mVU_EATAN_(mVU, mVU_xmmPQ, Fs, t1, t2);
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.regAlloc->clearNeeded(t1);
-		mVU.regAlloc->clearNeeded(t2);
-		mVU.profiler.EmitOp(opEATAN);
-	}
-	pass3 { mVUlog("EATAN P"); }
-}
-
-mVUop(mVU_EATANxy)
-{
-	pass1
-	{
-		if (isVU0)
-		{
-			mVUlow.isNOP = true;
-			return;
-		}
-		mVUanalyzeEFU2(mVU, _Fs_, 54);
-	}
-	pass2
-	{
-		const a64::VRegister t1 = mVU.regAlloc->allocReg(_Fs_, 0, 0xf);
-		const a64::VRegister Fs = mVU.regAlloc->allocReg();
-		const a64::VRegister t2 = mVU.regAlloc->allocReg();
-		mVUshufflePS(Fs, t1, 0x01);
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip xmmPQ to get Valid P instance
-		armAsm->Ins(mVU_xmmPQ.V4S(), 0, Fs.V4S(), 0);
-		SSE_SUBSS(mVU, Fs, t1); // y-x, not y-1? ><
-		SSE_ADDSS(mVU, t1, mVU_xmmPQ);
-		SSE_DIVSS(mVU, Fs, t1);
-		mVU_EATAN_(mVU, mVU_xmmPQ, Fs, t1, t2);
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.regAlloc->clearNeeded(t1);
-		mVU.regAlloc->clearNeeded(t2);
-		mVU.profiler.EmitOp(opEATANxy);
-	}
-	pass3 { mVUlog("EATANxy P"); }
-}
-
-mVUop(mVU_EATANxz)
-{
-	pass1
-	{
-		if (isVU0)
-		{
-			mVUlow.isNOP = true;
-			return;
-		}
-		mVUanalyzeEFU2(mVU, _Fs_, 54);
-	}
-	pass2
-	{
-		const a64::VRegister t1 = mVU.regAlloc->allocReg(_Fs_, 0, 0xf);
-		const a64::VRegister Fs = mVU.regAlloc->allocReg();
-		const a64::VRegister t2 = mVU.regAlloc->allocReg();
-		mVUshufflePS(Fs, t1, 0x02);
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip xmmPQ to get Valid P instance
-		armAsm->Ins(mVU_xmmPQ.V4S(), 0, Fs.V4S(), 0);
-		SSE_SUBSS(mVU, Fs, t1);
-		SSE_ADDSS(mVU, t1, mVU_xmmPQ);
-		SSE_DIVSS(mVU, Fs, t1);
-		mVU_EATAN_(mVU, mVU_xmmPQ, Fs, t1, t2);
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.regAlloc->clearNeeded(t1);
-		mVU.regAlloc->clearNeeded(t2);
-		mVU.profiler.EmitOp(opEATANxz);
-	}
-	pass3 { mVUlog("EATANxz P"); }
-}
-
-#define eexpHelper(addr) \
-	{ \
-		SSE_MULSS(mVU, t2, Fs); \
-		armAsm->Mov(t1.V16B(), t2.V16B()); \
-		mvuLdrSS(RQSCRATCH, addr); \
-		armAsm->Fmul(t1.S(), t1.S(), RQSCRATCH.S()); \
-		SSE_ADDSS(mVU, mVU_xmmPQ, t1); \
-	}
-
-mVUop(mVU_EEXP)
-{
-	pass1
-	{
-		if (isVU0)
-		{
-			mVUlow.isNOP = true;
-			return;
-		}
-		mVUanalyzeEFU1(mVU, _Fs_, _Fsf_, 44);
-	}
-	pass2
-	{
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, 0, (1 << (3 - _Fsf_)));
-		const a64::VRegister t1 = mVU.regAlloc->allocReg();
-		const a64::VRegister t2 = mVU.regAlloc->allocReg();
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip xmmPQ to get Valid P instance
-		armAsm->Ins(mVU_xmmPQ.V4S(), 0, Fs.V4S(), 0);
-		mvuLdrSS(RQSCRATCH, mVUglob.E1);
-		mVUscalarMulKeep(mVU_xmmPQ, mVU_xmmPQ, RQSCRATCH); // keep Q lanes (see aVU_IR.h)
-		mvuLdrSS(RQSCRATCH, mVUglob.one);
-		mVUscalarAddKeep(mVU_xmmPQ, mVU_xmmPQ, RQSCRATCH); // keep Q lanes (see aVU_IR.h)
-		armAsm->Mov(t1.V16B(), Fs.V16B());
-		SSE_MULSS(mVU, t1, Fs);
-		armAsm->Mov(t2.V16B(), t1.V16B());
-		mvuLdrSS(RQSCRATCH, mVUglob.E2);
-		armAsm->Fmul(t1.S(), t1.S(), RQSCRATCH.S());
-		SSE_ADDSS(mVU, mVU_xmmPQ, t1);
-		eexpHelper(mVUglob.E3);
-		eexpHelper(mVUglob.E4);
-		eexpHelper(mVUglob.E5);
-		SSE_MULSS(mVU, t2, Fs);
-		mvuLdrSS(RQSCRATCH, mVUglob.E6);
-		armAsm->Fmul(t2.S(), t2.S(), RQSCRATCH.S());
-		SSE_ADDSS(mVU, mVU_xmmPQ, t2);
-		SSE_MULSS(mVU, mVU_xmmPQ, mVU_xmmPQ);
-		SSE_MULSS(mVU, mVU_xmmPQ, mVU_xmmPQ);
-		mvuLdrSS(t2, mVUglob.one);
-		SSE_DIVSS(mVU, t2, mVU_xmmPQ);
-		armAsm->Ins(mVU_xmmPQ.V4S(), 0, t2.V4S(), 0);
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip back
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.regAlloc->clearNeeded(t1);
-		mVU.regAlloc->clearNeeded(t2);
-		mVU.profiler.EmitOp(opEEXP);
-	}
-	pass3 { mVUlog("EEXP P"); }
-}
-
-// sumXYZ(): PQ.x = x^2 + y^2 + z^2
-static __fi void mVU_sumXYZ(mV, const a64::VRegister& PQ, const a64::VRegister& Fs)
-{
-	armAsm->Fmul(Fs.V4S(), Fs.V4S(), Fs.V4S());      // x^2, y^2, z^2, w^2
-	armAsm->Eor(RQSCRATCH.V16B(), RQSCRATCH.V16B(), RQSCRATCH.V16B());
-	armAsm->Ins(Fs.V4S(), 3, RQSCRATCH.V4S(), 0);    // drop w^2
-	armAsm->Faddp(Fs.V4S(), Fs.V4S(), Fs.V4S());     // [x^2+y^2, z^2, ...]
-	armAsm->Faddp(Fs.S(), Fs.V2S());                 // x^2+y^2+z^2 in lane0
-	armAsm->Ins(PQ.V4S(), 0, Fs.V4S(), 0);
-}
-
-mVUop(mVU_ELENG)
-{
-	pass1
-	{
-		if (isVU0)
-		{
-			mVUlow.isNOP = true;
-			return;
-		}
-		mVUanalyzeEFU2(mVU, _Fs_, 18);
-	}
-	pass2
-	{
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, 0, _X_Y_Z_W);
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip xmmPQ to get Valid P instance
-		mVU_sumXYZ(mVU, mVU_xmmPQ, Fs);
-		mVUscalarSqrtKeep(mVU_xmmPQ, mVU_xmmPQ); // keep Q lanes (see aVU_IR.h)
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip back
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.profiler.EmitOp(opELENG);
-	}
-	pass3 { mVUlog("ELENG P"); }
-}
-
-mVUop(mVU_ERCPR)
-{
-	pass1
-	{
-		if (isVU0)
-		{
-			mVUlow.isNOP = true;
-			return;
-		}
-		mVUanalyzeEFU1(mVU, _Fs_, _Fsf_, 12);
-	}
-	pass2
-	{
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, 0, (1 << (3 - _Fsf_)));
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip xmmPQ to get Valid P instance
-		armAsm->Ins(mVU_xmmPQ.V4S(), 0, Fs.V4S(), 0);
-		mvuLdrSS(Fs, mVUglob.one);
-		SSE_DIVSS(mVU, Fs, mVU_xmmPQ);
-		armAsm->Ins(mVU_xmmPQ.V4S(), 0, Fs.V4S(), 0);
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip back
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.profiler.EmitOp(opERCPR);
-	}
-	pass3 { mVUlog("ERCPR P"); }
-}
-
-mVUop(mVU_ERLENG)
-{
-	pass1
-	{
-		if (isVU0)
-		{
-			mVUlow.isNOP = true;
-			return;
-		}
-		mVUanalyzeEFU2(mVU, _Fs_, 24);
-	}
-	pass2
-	{
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, 0, _X_Y_Z_W);
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip xmmPQ to get Valid P instance
-		mVU_sumXYZ(mVU, mVU_xmmPQ, Fs);
-		mVUscalarSqrtKeep(mVU_xmmPQ, mVU_xmmPQ); // keep Q lanes (see aVU_IR.h)
-		mvuLdrSS(Fs, mVUglob.one);
-		SSE_DIVSS(mVU, Fs, mVU_xmmPQ);
-		armAsm->Ins(mVU_xmmPQ.V4S(), 0, Fs.V4S(), 0);
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip back
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.profiler.EmitOp(opERLENG);
-	}
-	pass3 { mVUlog("ERLENG P"); }
-}
-
-mVUop(mVU_ERSADD)
-{
-	pass1
-	{
-		if (isVU0)
-		{
-			mVUlow.isNOP = true;
-			return;
-		}
-		mVUanalyzeEFU2(mVU, _Fs_, 18);
-	}
-	pass2
-	{
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, 0, _X_Y_Z_W);
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip xmmPQ to get Valid P instance
-		mVU_sumXYZ(mVU, mVU_xmmPQ, Fs);
-		mvuLdrSS(Fs, mVUglob.one);
-		SSE_DIVSS(mVU, Fs, mVU_xmmPQ);
-		armAsm->Ins(mVU_xmmPQ.V4S(), 0, Fs.V4S(), 0);
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip back
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.profiler.EmitOp(opERSADD);
-	}
-	pass3 { mVUlog("ERSADD P"); }
-}
-
-mVUop(mVU_ERSQRT)
-{
-	pass1
-	{
-		if (isVU0)
-		{
-			mVUlow.isNOP = true;
-			return;
-		}
-		mVUanalyzeEFU1(mVU, _Fs_, _Fsf_, 18);
-	}
-	pass2
-	{
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, 0, (1 << (3 - _Fsf_)));
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip xmmPQ to get Valid P instance
-		mvuLdrQ(RQSCRATCH, mVUglob.absclip);
-		armAsm->And(Fs.V16B(), Fs.V16B(), RQSCRATCH.V16B());
-		mVUscalarSqrtKeep(mVU_xmmPQ, Fs); // keep Q lanes (see aVU_IR.h)
-		mvuLdrSS(Fs, mVUglob.one);
-		SSE_DIVSS(mVU, Fs, mVU_xmmPQ);
-		armAsm->Ins(mVU_xmmPQ.V4S(), 0, Fs.V4S(), 0);
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip back
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.profiler.EmitOp(opERSQRT);
-	}
-	pass3 { mVUlog("ERSQRT P"); }
-}
-
-mVUop(mVU_ESADD)
-{
-	pass1
-	{
-		if (isVU0)
-		{
-			mVUlow.isNOP = true;
-			return;
-		}
-		mVUanalyzeEFU2(mVU, _Fs_, 11);
-	}
-	pass2
-	{
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, 0, _X_Y_Z_W);
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip xmmPQ to get Valid P instance
-		mVU_sumXYZ(mVU, mVU_xmmPQ, Fs);
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip back
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.profiler.EmitOp(opESADD);
-	}
-	pass3 { mVUlog("ESADD P"); }
-}
-
-mVUop(mVU_ESIN)
-{
-	pass1
-	{
-		if (isVU0)
-		{
-			mVUlow.isNOP = true;
-			return;
-		}
-		mVUanalyzeEFU1(mVU, _Fs_, _Fsf_, 29);
-	}
-	pass2
-	{
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, 0, (1 << (3 - _Fsf_)));
-		const a64::VRegister t1 = mVU.regAlloc->allocReg();
-		const a64::VRegister t2 = mVU.regAlloc->allocReg();
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip xmmPQ to get Valid P instance
-		armAsm->Ins(mVU_xmmPQ.V4S(), 0, Fs.V4S(), 0); // pq = X
-		SSE_MULSS(mVU, Fs, Fs);    // fs = X^2
-		armAsm->Mov(t1.V16B(), Fs.V16B()); // t1 = X^2
-		SSE_MULSS(mVU, Fs, mVU_xmmPQ); // fs = X^3
-		armAsm->Mov(t2.V16B(), Fs.V16B()); // t2 = X^3
-		mvuLdrSS(RQSCRATCH, mVUglob.S2);
-		armAsm->Fmul(Fs.S(), Fs.S(), RQSCRATCH.S()); // fs = s2 * X^3
-		SSE_ADDSS(mVU, mVU_xmmPQ, Fs); // pq = X + s2 * X^3
-
-		SSE_MULSS(mVU, t2, t1);    // t2 = X^3 * X^2
-		mvuLdrSS(RQSCRATCH, mVUglob.S3);
-		armAsm->Fmul(Fs.S(), t2.S(), RQSCRATCH.S()); // ps = s3 * X^5
-		SSE_ADDSS(mVU, mVU_xmmPQ, Fs); // pq = X + s2 * X^3 + s3 * X^5
-
-		SSE_MULSS(mVU, t2, t1);    // t2 = X^5 * X^2
-		mvuLdrSS(RQSCRATCH, mVUglob.S4);
-		armAsm->Fmul(Fs.S(), t2.S(), RQSCRATCH.S()); // fs = s4 * X^7
-		SSE_ADDSS(mVU, mVU_xmmPQ, Fs); // pq = X + s2 * X^3 + s3 * X^5 + s4 * X^7
-
-		SSE_MULSS(mVU, t2, t1);    // t2 = X^7 * X^2
-		mvuLdrSS(RQSCRATCH, mVUglob.S5);
-		armAsm->Fmul(t2.S(), t2.S(), RQSCRATCH.S()); // t2 = s5 * X^9
-		SSE_ADDSS(mVU, mVU_xmmPQ, t2); // pq = X + s2 * X^3 + s3 * X^5 + s4 * X^7 + s5 * X^9
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip back
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.regAlloc->clearNeeded(t1);
-		mVU.regAlloc->clearNeeded(t2);
-		mVU.profiler.EmitOp(opESIN);
-	}
-	pass3 { mVUlog("ESIN P"); }
-}
-
-mVUop(mVU_ESQRT)
-{
-	pass1
-	{
-		if (isVU0)
-		{
-			mVUlow.isNOP = true;
-			return;
-		}
-		mVUanalyzeEFU1(mVU, _Fs_, _Fsf_, 12);
-	}
-	pass2
-	{
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, 0, (1 << (3 - _Fsf_)));
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip xmmPQ to get Valid P instance
-		mvuLdrQ(RQSCRATCH, mVUglob.absclip);
-		armAsm->And(Fs.V16B(), Fs.V16B(), RQSCRATCH.V16B());
-		mVUscalarSqrtKeep(mVU_xmmPQ, Fs); // keep Q lanes (see aVU_IR.h)
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip back
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.profiler.EmitOp(opESQRT);
-	}
-	pass3 { mVUlog("ESQRT P"); }
-}
-
-mVUop(mVU_ESUM)
-{
-	pass1
-	{
-		if (isVU0)
-		{
-			mVUlow.isNOP = true;
-			return;
-		}
-		mVUanalyzeEFU2(mVU, _Fs_, 12);
-	}
-	pass2
-	{
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, 0, _X_Y_Z_W);
-		const a64::VRegister t1 = mVU.regAlloc->allocReg();
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip xmmPQ to get Valid P instance
-		mVUshufflePS(t1, Fs, 0x1b);
-		SSE_ADDPS(mVU, Fs, t1);
-		mVUshufflePS(t1, Fs, 0x01);
-		SSE_ADDSS(mVU, Fs, t1);
-		armAsm->Ins(mVU_xmmPQ.V4S(), 0, Fs.V4S(), 0);
-		mVUshufflePS(mVU_xmmPQ, mVU_xmmPQ, mVUinfo.writeP ? 0x27 : 0xC6); // Flip back
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.regAlloc->clearNeeded(t1);
-		mVU.profiler.EmitOp(opESUM);
-	}
-	pass3 { mVUlog("ESUM P"); }
-}
-
-#undef EATANhelper
-#undef eexpHelper
-
-//------------------------------------------------------------------
-// FCAND/FCEQ/FCGET/FCOR/FCSET
-//------------------------------------------------------------------
-
-mVUop(mVU_FCAND)
-{
-	pass1 { mVUanalyzeCflag(mVU, 1); }
-	pass2
-	{
-		const a64::Register dst = mVU.regAlloc->allocGPR(-1, 1, mVUlow.backupVI);
-		mVUallocCFLAGa(mVU, dst, cFLAG.read);
-		armAsm->And(dst, dst, _Imm24_);
-		armAsm->Add(dst, dst, 0xffffff);
-		armAsm->Lsr(dst, dst, 24);
-		mVU.regAlloc->clearNeeded(dst);
-		mVU.profiler.EmitOp(opFCAND);
-	}
-	pass3 { mVUlog("FCAND vi01, $%x", _Imm24_); }
-	pass4 { mVUregs.needExactMatch |= 4; }
-}
-
-mVUop(mVU_FCEQ)
-{
-	pass1 { mVUanalyzeCflag(mVU, 1); }
-	pass2
-	{
-		const a64::Register dst = mVU.regAlloc->allocGPR(-1, 1, mVUlow.backupVI);
-		mVUallocCFLAGa(mVU, dst, cFLAG.read);
-		armAsm->Eor(dst, dst, _Imm24_);
-		armAsm->Sub(dst, dst, 1);
-		armAsm->Lsr(dst, dst, 31);
-		mVU.regAlloc->clearNeeded(dst);
-		mVU.profiler.EmitOp(opFCEQ);
-	}
-	pass3 { mVUlog("FCEQ vi01, $%x", _Imm24_); }
-	pass4 { mVUregs.needExactMatch |= 4; }
-}
-
-mVUop(mVU_FCGET)
-{
-	pass1 { mVUanalyzeCflag(mVU, _It_); }
-	pass2
-	{
-		const a64::Register regT = mVU.regAlloc->allocGPR(-1, _It_, mVUlow.backupVI);
-		mVUallocCFLAGa(mVU, regT, cFLAG.read);
-		armAsm->And(regT, regT, 0xfff);
-		mVU.regAlloc->clearNeeded(regT);
-		mVU.profiler.EmitOp(opFCGET);
-	}
-	pass3 { mVUlog("FCGET vi%02d", _Ft_); }
-	pass4 { mVUregs.needExactMatch |= 4; }
-}
-
-mVUop(mVU_FCOR)
-{
-	pass1 { mVUanalyzeCflag(mVU, 1); }
-	pass2
-	{
-		const a64::Register dst = mVU.regAlloc->allocGPR(-1, 1, mVUlow.backupVI);
-		mVUallocCFLAGa(mVU, dst, cFLAG.read);
-		armAsm->Orr(dst, dst, _Imm24_);
-		armAsm->Add(dst, dst, 1);  // If 24 1's will make 25th bit 1, else 0
-		armAsm->Lsr(dst, dst, 24); // Get the 25th bit (also clears the rest of the garbage in the reg)
-		mVU.regAlloc->clearNeeded(dst);
-		mVU.profiler.EmitOp(opFCOR);
-	}
-	pass3 { mVUlog("FCOR vi01, $%x", _Imm24_); }
-	pass4 { mVUregs.needExactMatch |= 4; }
-}
-
-mVUop(mVU_FCSET)
-{
-	pass1 { cFLAG.doFlag = true; }
-	pass2
-	{
-		armAsm->Mov(gprT1, _Imm24_);
-		mVUallocCFLAGb(mVU, gprT1, cFLAG.write);
-		mVU.profiler.EmitOp(opFCSET);
-	}
-	pass3 { mVUlog("FCSET $%x", _Imm24_); }
-}
-
-//------------------------------------------------------------------
-// FMAND/FMEQ/FMOR
-//------------------------------------------------------------------
-
-mVUop(mVU_FMAND)
-{
-	pass1 { mVUanalyzeMflag(mVU, _Is_, _It_); }
-	pass2
-	{
-		mVUallocMFLAGa(mVU, gprT1, mFLAG.read);
-		const a64::Register regT = mVU.regAlloc->allocGPR(_Is_, _It_, mVUlow.backupVI);
-		armAsm->And(regT, regT, gprT1);
-		mVU.regAlloc->clearNeeded(regT);
-		mVU.profiler.EmitOp(opFMAND);
-	}
-	pass3 { mVUlog("FMAND vi%02d, vi%02d", _Ft_, _Fs_); }
-	pass4 { mVUregs.needExactMatch |= 2; }
-}
-
-mVUop(mVU_FMEQ)
-{
-	pass1 { mVUanalyzeMflag(mVU, _Is_, _It_); }
-	pass2
-	{
-		mVUallocMFLAGa(mVU, gprT1, mFLAG.read);
-		const a64::Register regT = mVU.regAlloc->allocGPR(_Is_, _It_, mVUlow.backupVI);
-		armAsm->Eor(regT, regT, gprT1);
-		armAsm->Sub(regT, regT, 1);
-		armAsm->Lsr(regT, regT, 31);
-		mVU.regAlloc->clearNeeded(regT);
-		mVU.profiler.EmitOp(opFMEQ);
-	}
-	pass3 { mVUlog("FMEQ vi%02d, vi%02d", _Ft_, _Fs_); }
-	pass4 { mVUregs.needExactMatch |= 2; }
-}
-
-mVUop(mVU_FMOR)
-{
-	pass1 { mVUanalyzeMflag(mVU, _Is_, _It_); }
-	pass2
-	{
-		mVUallocMFLAGa(mVU, gprT1, mFLAG.read);
-		const a64::Register regT = mVU.regAlloc->allocGPR(_Is_, _It_, mVUlow.backupVI);
-		armAsm->Orr(regT, regT, gprT1);
-		mVU.regAlloc->clearNeeded(regT);
-		mVU.profiler.EmitOp(opFMOR);
-	}
-	pass3 { mVUlog("FMOR vi%02d, vi%02d", _Ft_, _Fs_); }
-	pass4 { mVUregs.needExactMatch |= 2; }
-}
-
-//------------------------------------------------------------------
-// FSAND/FSEQ/FSOR/FSSET
-//------------------------------------------------------------------
-
-mVUop(mVU_FSAND)
-{
-	pass1 { mVUanalyzeSflag(mVU, _It_); }
-	pass2
-	{
-		if (_Imm12_ & 0x0c30) DevCon.WriteLn(Color_Green, "mVU_FSAND: Checking I/D/IS/DS Flags");
-		if (_Imm12_ & 0x030c) DevCon.WriteLn(Color_Green, "mVU_FSAND: Checking U/O/US/OS Flags");
-		const a64::Register reg = mVU.regAlloc->allocGPR(-1, _It_, mVUlow.backupVI);
-		mVUallocSFLAGc(reg, gprT1, sFLAG.read);
-		armAsm->And(reg, reg, _Imm12_);
-		mVU.regAlloc->clearNeeded(reg);
-		mVU.profiler.EmitOp(opFSAND);
-	}
-	pass3 { mVUlog("FSAND vi%02d, $%x", _Ft_, _Imm12_); }
-	pass4 { mVUregs.needExactMatch |= 1; }
-}
-
-mVUop(mVU_FSOR)
-{
-	pass1 { mVUanalyzeSflag(mVU, _It_); }
-	pass2
-	{
-		const a64::Register reg = mVU.regAlloc->allocGPR(-1, _It_, mVUlow.backupVI);
-		mVUallocSFLAGc(reg, gprT2, sFLAG.read);
-		armAsm->Orr(reg, reg, _Imm12_);
-		mVU.regAlloc->clearNeeded(reg);
-		mVU.profiler.EmitOp(opFSOR);
-	}
-	pass3 { mVUlog("FSOR vi%02d, $%x", _Ft_, _Imm12_); }
-	pass4 { mVUregs.needExactMatch |= 1; }
-}
-
-mVUop(mVU_FSEQ)
-{
-	pass1 { mVUanalyzeSflag(mVU, _It_); }
-	pass2
-	{
-		int imm = 0;
-		if (_Imm12_ & 0x0c30) DevCon.WriteLn(Color_Green, "mVU_FSEQ: Checking I/D/IS/DS Flags");
-		if (_Imm12_ & 0x030c) DevCon.WriteLn(Color_Green, "mVU_FSEQ: Checking U/O/US/OS Flags");
-		if (_Imm12_ & 0x0001) imm |= 0x0000f00; // Z
-		if (_Imm12_ & 0x0002) imm |= 0x000f000; // S
-		if (_Imm12_ & 0x0004) imm |= 0x0010000; // U
-		if (_Imm12_ & 0x0008) imm |= 0x0020000; // O
-		if (_Imm12_ & 0x0010) imm |= 0x0040000; // I
-		if (_Imm12_ & 0x0020) imm |= 0x0080000; // D
-		if (_Imm12_ & 0x0040) imm |= 0x000000f; // ZS
-		if (_Imm12_ & 0x0080) imm |= 0x00000f0; // SS
-		if (_Imm12_ & 0x0100) imm |= 0x0400000; // US
-		if (_Imm12_ & 0x0200) imm |= 0x0800000; // OS
-		if (_Imm12_ & 0x0400) imm |= 0x1000000; // IS
-		if (_Imm12_ & 0x0800) imm |= 0x2000000; // DS
-
-		const a64::Register reg = mVU.regAlloc->allocGPR(-1, _It_, mVUlow.backupVI);
-		mVUallocSFLAGa(reg, sFLAG.read);
-		setBitFSEQ(reg, 0x0f00); // Z  bit
-		setBitFSEQ(reg, 0xf000); // S  bit
-		setBitFSEQ(reg, 0x000f); // ZS bit
-		setBitFSEQ(reg, 0x00f0); // SS bit
-		armAsm->Eor(reg, reg, imm);
-		armAsm->Sub(reg, reg, 1);
-		armAsm->Lsr(reg, reg, 31);
-		mVU.regAlloc->clearNeeded(reg);
-		mVU.profiler.EmitOp(opFSEQ);
-	}
-	pass3 { mVUlog("FSEQ vi%02d, $%x", _Ft_, _Imm12_); }
-	pass4 { mVUregs.needExactMatch |= 1; }
-}
-
-mVUop(mVU_FSSET)
-{
-	pass1 { mVUanalyzeFSSET(mVU); }
-	pass2
-	{
-		int imm = 0;
-		if (_Imm12_ & 0x0040) imm |= 0x000000f; // ZS
-		if (_Imm12_ & 0x0080) imm |= 0x00000f0; // SS
-		if (_Imm12_ & 0x0100) imm |= 0x0400000; // US
-		if (_Imm12_ & 0x0200) imm |= 0x0800000; // OS
-		if (_Imm12_ & 0x0400) imm |= 0x1000000; // IS
-		if (_Imm12_ & 0x0800) imm |= 0x2000000; // DS
-		if (!(sFLAG.doFlag || mVUinfo.doDivFlag))
-		{
-			mVUallocSFLAGa(getFlagReg(sFLAG.write), sFLAG.lastWrite); // Get Prev Status Flag
-		}
-		armAsm->And(getFlagReg(sFLAG.write), getFlagReg(sFLAG.write), 0xfff00); // Keep Non-Sticky Bits
-		if (imm)
-			armAsm->Orr(getFlagReg(sFLAG.write), getFlagReg(sFLAG.write), imm);
-		mVU.profiler.EmitOp(opFSSET);
-	}
-	pass3 { mVUlog("FSSET $%x", _Imm12_); }
-}
-
-//------------------------------------------------------------------
-// IADD/IADDI/IADDIU/IAND/IOR/ISUB/ISUBIU
-//------------------------------------------------------------------
-
-mVUop(mVU_IADD)
-{
-	pass1 { mVUanalyzeIALU1(mVU, _Id_, _Is_, _It_); }
-	pass2
-	{
-		if (_Is_ == 0 || _It_ == 0)
-		{
-			const a64::Register regS = mVU.regAlloc->allocGPR(_Is_ ? _Is_ : _It_, -1);
-			const a64::Register regD = mVU.regAlloc->allocGPR(-1, _Id_, mVUlow.backupVI);
-			armAsm->Mov(regD.W(), regS.W());
-			mVU.regAlloc->clearNeeded(regD);
-			mVU.regAlloc->clearNeeded(regS);
-		}
-		else
-		{
-			const a64::Register regT = mVU.regAlloc->allocGPR(_It_, -1);
-			const a64::Register regS = mVU.regAlloc->allocGPR(_Is_, _Id_, mVUlow.backupVI);
-			armAsm->Add(regS.W(), regS.W(), regT.W());
-			mVU.regAlloc->clearNeeded(regS);
-			mVU.regAlloc->clearNeeded(regT);
-		}
-		mVU.profiler.EmitOp(opIADD);
-	}
-	pass3 { mVUlog("IADD vi%02d, vi%02d, vi%02d", _Fd_, _Fs_, _Ft_); }
-}
-
-mVUop(mVU_IADDI)
-{
-	pass1 { mVUanalyzeIADDI(mVU, _Is_, _It_, _Imm5_); }
-	pass2
-	{
-		if (_Is_ == 0)
-		{
-			const a64::Register regT = mVU.regAlloc->allocGPR(-1, _It_, mVUlow.backupVI);
-			if (!EmuConfig.Gamefixes.IbitHack)
-			{
-				if (_Imm5_ != 0)
-					armAsm->Mov(regT.W(), _Imm5_);
-				else
-					armAsm->Mov(regT.W(), a64::wzr);
-			}
-			else
-			{
-				mvuLdr32(regT, &curI);
-				armAsm->Lsl(regT.W(), regT.W(), 21);
-				armAsm->Asr(regT.W(), regT.W(), 27);
-			}
-			mVU.regAlloc->clearNeeded(regT);
-		}
-		else
-		{
-			const a64::Register regS = mVU.regAlloc->allocGPR(_Is_, _It_, mVUlow.backupVI);
-			if (!EmuConfig.Gamefixes.IbitHack)
-			{
-				if (_Imm5_ != 0)
-					armAsm->Add(regS.W(), regS.W(), _Imm5_);
-			}
-			else
-			{
-				mvuLdr32(gprT1, &curI);
-				armAsm->Lsl(gprT1.W(), gprT1.W(), 21);
-				armAsm->Asr(gprT1.W(), gprT1.W(), 27);
-				armAsm->Add(regS.W(), regS.W(), gprT1.W());
-			}
-			mVU.regAlloc->clearNeeded(regS);
-		}
-		mVU.profiler.EmitOp(opIADDI);
-	}
-	pass3 { mVUlog("IADDI vi%02d, vi%02d, %d", _Ft_, _Fs_, _Imm5_); }
-}
-
-mVUop(mVU_IADDIU)
-{
-	pass1 { mVUanalyzeIADDI(mVU, _Is_, _It_, _Imm15_); }
-	pass2
-	{
-		if (_Is_ == 0)
-		{
-			const a64::Register regT = mVU.regAlloc->allocGPR(-1, _It_, mVUlow.backupVI);
-			if (!EmuConfig.Gamefixes.IbitHack)
-			{
-				if (_Imm15_ != 0)
-					armAsm->Mov(regT.W(), _Imm15_);
-				else
-					armAsm->Mov(regT.W(), a64::wzr);
-			}
-			else
-			{
-				mvuLdr32(regT, &curI);
-				armAsm->Mov(gprT1.W(), regT.W());
-				armAsm->Lsr(gprT1.W(), gprT1.W(), 10);
-				armAsm->And(gprT1.W(), gprT1.W(), 0x7800);
-				armAsm->And(regT.W(), regT.W(), 0x7FF);
-				armAsm->Orr(regT.W(), regT.W(), gprT1.W());
-			}
-			mVU.regAlloc->clearNeeded(regT);
-		}
-		else
-		{
-			const a64::Register regS = mVU.regAlloc->allocGPR(_Is_, _It_, mVUlow.backupVI);
-			if (!EmuConfig.Gamefixes.IbitHack)
-			{
-				if (_Imm15_ != 0)
-					armAsm->Add(regS.W(), regS.W(), _Imm15_);
-			}
-			else
-			{
-				mvuLdr32(gprT1, &curI);
-				armAsm->Mov(gprT2.W(), gprT1.W());
-				armAsm->Lsr(gprT2.W(), gprT2.W(), 10);
-				armAsm->And(gprT2.W(), gprT2.W(), 0x7800);
-				armAsm->And(gprT1.W(), gprT1.W(), 0x7FF);
-				armAsm->Orr(gprT1.W(), gprT1.W(), gprT2.W());
-				armAsm->Add(regS.W(), regS.W(), gprT1.W());
-			}
-			mVU.regAlloc->clearNeeded(regS);
-		}
-		mVU.profiler.EmitOp(opIADDIU);
-	}
-	pass3 { mVUlog("IADDIU vi%02d, vi%02d, %d", _Ft_, _Fs_, _Imm15_); }
-}
-
-mVUop(mVU_IAND)
-{
-	pass1 { mVUanalyzeIALU1(mVU, _Id_, _Is_, _It_); }
-	pass2
-	{
-		const a64::Register regT = mVU.regAlloc->allocGPR(_It_, -1);
-		const a64::Register regS = mVU.regAlloc->allocGPR(_Is_, _Id_, mVUlow.backupVI);
-		if (_It_ != _Is_)
-			armAsm->And(regS.W(), regS.W(), regT.W());
-		mVU.regAlloc->clearNeeded(regS);
-		mVU.regAlloc->clearNeeded(regT);
-		mVU.profiler.EmitOp(opIAND);
-	}
-	pass3 { mVUlog("IAND vi%02d, vi%02d, vi%02d", _Fd_, _Fs_, _Ft_); }
-}
-
-mVUop(mVU_IOR)
-{
-	pass1 { mVUanalyzeIALU1(mVU, _Id_, _Is_, _It_); }
-	pass2
-	{
-		const a64::Register regT = mVU.regAlloc->allocGPR(_It_, -1);
-		const a64::Register regS = mVU.regAlloc->allocGPR(_Is_, _Id_, mVUlow.backupVI);
-		if (_It_ != _Is_)
-			armAsm->Orr(regS.W(), regS.W(), regT.W());
-		mVU.regAlloc->clearNeeded(regS);
-		mVU.regAlloc->clearNeeded(regT);
-		mVU.profiler.EmitOp(opIOR);
-	}
-	pass3 { mVUlog("IOR vi%02d, vi%02d, vi%02d", _Fd_, _Fs_, _Ft_); }
-}
-
-mVUop(mVU_ISUB)
-{
-	pass1 { mVUanalyzeIALU1(mVU, _Id_, _Is_, _It_); }
-	pass2
-	{
-		if (_It_ != _Is_)
-		{
-			const a64::Register regT = mVU.regAlloc->allocGPR(_It_, -1);
-			const a64::Register regS = mVU.regAlloc->allocGPR(_Is_, _Id_, mVUlow.backupVI);
-			armAsm->Sub(regS.W(), regS.W(), regT.W());
-			mVU.regAlloc->clearNeeded(regS);
-			mVU.regAlloc->clearNeeded(regT);
-		}
-		else
-		{
-			const a64::Register regD = mVU.regAlloc->allocGPR(-1, _Id_, mVUlow.backupVI);
-			armAsm->Mov(regD.W(), a64::wzr);
-			mVU.regAlloc->clearNeeded(regD);
-		}
-		mVU.profiler.EmitOp(opISUB);
-	}
-	pass3 { mVUlog("ISUB vi%02d, vi%02d, vi%02d", _Fd_, _Fs_, _Ft_); }
-}
-
-mVUop(mVU_ISUBIU)
-{
-	pass1 { mVUanalyzeIALU2(mVU, _Is_, _It_); }
-	pass2
-	{
-		const a64::Register regS = mVU.regAlloc->allocGPR(_Is_, _It_, mVUlow.backupVI);
-		if (!EmuConfig.Gamefixes.IbitHack)
-		{
-			if (_Imm15_ != 0)
-				armAsm->Sub(regS.W(), regS.W(), _Imm15_);
-		}
-		else
-		{
-			mvuLdr32(gprT1, &curI);
-			armAsm->Mov(gprT2.W(), gprT1.W());
-			armAsm->Lsr(gprT2.W(), gprT2.W(), 10);
-			armAsm->And(gprT2.W(), gprT2.W(), 0x7800);
-			armAsm->And(gprT1.W(), gprT1.W(), 0x7FF);
-			armAsm->Orr(gprT1.W(), gprT1.W(), gprT2.W());
-			armAsm->Sub(regS.W(), regS.W(), gprT1.W());
-		}
-		mVU.regAlloc->clearNeeded(regS);
-		mVU.profiler.EmitOp(opISUBIU);
-	}
-	pass3 { mVUlog("ISUBIU vi%02d, vi%02d, %d", _Ft_, _Fs_, _Imm15_); }
-}
-
-//------------------------------------------------------------------
-// MFIR/MFP/MOVE/MR32/MTIR
-//------------------------------------------------------------------
-
-mVUop(mVU_MFIR)
-{
-	pass1
-	{
-		if (!_Ft_)
-		{
-			mVUlow.isNOP = true;
-		}
-		analyzeVIreg1(mVU, _Is_, mVUlow.VI_read[0]);
-		analyzeReg2  (mVU, _Ft_, mVUlow.VF_write, 1);
-	}
-	pass2
-	{
-		const a64::VRegister Ft = mVU.regAlloc->allocReg(-1, _Ft_, _X_Y_Z_W);
-		if (_Is_ != 0)
-		{
-			const a64::Register regS = mVU.regAlloc->allocGPR(_Is_, -1);
-			armAsm->Sxth(regS.W(), regS.W());
-			// TODO: Broadcast instead
-			armAsm->Fmov(Ft.S(), regS.W());
-			if (!_XYZW_SS)
-				mVUunpack_xyzw(Ft, Ft, 0);
-			mVU.regAlloc->clearNeeded(regS);
-		}
-		else
-		{
-			armAsm->Eor(Ft.V16B(), Ft.V16B(), Ft.V16B());
-		}
-		mVU.regAlloc->clearNeeded(Ft);
-		mVU.profiler.EmitOp(opMFIR);
-	}
-	pass3 { mVUlog("MFIR.%s vf%02d, vi%02d", _XYZW_String, _Ft_, _Fs_); }
-}
-
-mVUop(mVU_MFP)
-{
-	pass1
-	{
-		if (isVU0)
-		{
-			mVUlow.isNOP = true;
-			return;
-		}
-		mVUanalyzeMFP(mVU, _Ft_);
-	}
-	pass2
-	{
-		const a64::VRegister Ft = mVU.regAlloc->allocReg(-1, _Ft_, _X_Y_Z_W);
-		getPreg(mVU, Ft);
-		mVU.regAlloc->clearNeeded(Ft);
-		mVU.profiler.EmitOp(opMFP);
-	}
-	pass3 { mVUlog("MFP.%s vf%02d, P", _XYZW_String, _Ft_); }
-}
-
-mVUop(mVU_MOVE)
-{
-	pass1 { mVUanalyzeMOVE(mVU, _Fs_, _Ft_); }
-	pass2
-	{
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, _Ft_, _X_Y_Z_W);
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.profiler.EmitOp(opMOVE);
-	}
-	pass3 { mVUlog("MOVE.%s vf%02d, vf%02d", _XYZW_String, _Ft_, _Fs_); }
-}
-
-mVUop(mVU_MR32)
-{
-	pass1 { mVUanalyzeMR32(mVU, _Fs_, _Ft_); }
-	pass2
-	{
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_);
-		const a64::VRegister Ft = mVU.regAlloc->allocReg(-1, _Ft_, _X_Y_Z_W);
-		if (_XYZW_SS)
-			mVUunpack_xyzw(Ft, Fs, (_X ? 1 : (_Y ? 2 : (_Z ? 3 : 0))));
-		else
-			mVUshufflePS(Ft, Fs, 0x39);
-		mVU.regAlloc->clearNeeded(Ft);
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.profiler.EmitOp(opMR32);
-	}
-	pass3 { mVUlog("MR32.%s vf%02d, vf%02d", _XYZW_String, _Ft_, _Fs_); }
-}
-
-mVUop(mVU_MTIR)
-{
-	pass1
-	{
-		if (!_It_)
-			mVUlow.isNOP = true;
-
-		analyzeReg5(mVU, _Fs_, _Fsf_, mVUlow.VF_read[0]);
-		analyzeVIreg2(mVU, _It_, mVUlow.VI_write, 1);
-	}
-	pass2
-	{
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, 0, (1 << (3 - _Fsf_)));
-		const a64::Register regT = mVU.regAlloc->allocGPR(-1, _It_, mVUlow.backupVI);
-		armAsm->Fmov(regT.W(), Fs.S());
-		mVU.regAlloc->clearNeeded(regT);
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.profiler.EmitOp(opMTIR);
-	}
-	pass3 { mVUlog("MTIR vi%02d, vf%02d%s", _Ft_, _Fs_, _Fsf_String); }
-}
-
-//------------------------------------------------------------------
-// ILW/ILWR
-//------------------------------------------------------------------
-
-mVUop(mVU_ILW)
-{
-	pass1
-	{
-		if (!_It_)
-			mVUlow.isNOP = true;
-
-		analyzeVIreg1(mVU, _Is_, mVUlow.VI_read[0]);
-		analyzeVIreg2(mVU, _It_, mVUlow.VI_write, 4);
-	}
-	pass2
-	{
-		void* ptr = (void*)(mVU.regs().Mem + offsetSS);
-		std::optional<const void*> optaddr(EmuConfig.Gamefixes.IbitHack ? std::nullopt : mVUoptimizeConstantAddr(mVU, _Is_, _Imm11_, offsetSS));
-		if (!optaddr.has_value())
-		{
-			mVU.regAlloc->moveVIToGPR(gprT1, _Is_);
-			if (!EmuConfig.Gamefixes.IbitHack)
-			{
-				if (_Imm11_ != 0)
-					armAsm->Add(gprT1.W(), gprT1.W(), _Imm11_);
-			}
-			else
-			{
-				mvuLdr32(gprT2, &curI);
-				armAsm->Lsl(gprT2.W(), gprT2.W(), 21);
-				armAsm->Asr(gprT2.W(), gprT2.W(), 21);
-				armAsm->Add(gprT1.W(), gprT1.W(), gprT2.W());
-			}
-			mVUaddrFix(mVU, gprT1q, gprT2q);
-		}
-
-		const a64::Register regT = mVU.regAlloc->allocGPR(-1, _It_, mVUlow.backupVI);
-		if (optaddr.has_value())
-		{
-			mvuLdrhZ(regT, optaddr.value());
-		}
-		else
-		{
-			mvuComplexAddr(gprT2q, ptr, gprT1q);
-			armAsm->Ldrh(regT.W(), a64::MemOperand(gprT2q));
-		}
-		mVU.regAlloc->clearNeeded(regT);
-		mVU.profiler.EmitOp(opILW);
-	}
-	pass3 { mVUlog("ILW.%s vi%02d, vi%02d + %d", _XYZW_String, _Ft_, _Fs_, _Imm11_); }
-}
-
-mVUop(mVU_ILWR)
-{
-	pass1
-	{
-		if (!_It_)
-			mVUlow.isNOP = true;
-
-		analyzeVIreg1(mVU, _Is_, mVUlow.VI_read[0]);
-		analyzeVIreg2(mVU, _It_, mVUlow.VI_write, 4);
-	}
-	pass2
-	{
-		void* ptr = (void*)(mVU.regs().Mem + offsetSS);
-		if (_Is_)
-		{
-			mVU.regAlloc->moveVIToGPR(gprT1, _Is_);
-			mVUaddrFix(mVU, gprT1q, gprT2q);
-
-			const a64::Register regT = mVU.regAlloc->allocGPR(-1, _It_, mVUlow.backupVI);
-			mvuComplexAddr(gprT2q, ptr, gprT1q);
-			armAsm->Ldrh(regT.W(), a64::MemOperand(gprT2q));
-			mVU.regAlloc->clearNeeded(regT);
-		}
-		else
-		{
-			const a64::Register regT = mVU.regAlloc->allocGPR(-1, _It_, mVUlow.backupVI);
-			mvuLdrhZ(regT, ptr);
-			mVU.regAlloc->clearNeeded(regT);
-		}
-		mVU.profiler.EmitOp(opILWR);
-	}
-	pass3 { mVUlog("ILWR.%s vi%02d, vi%02d", _XYZW_String, _Ft_, _Fs_); }
-}
-
-//------------------------------------------------------------------
-// ISW/ISWR
-//------------------------------------------------------------------
-
-mVUop(mVU_ISW)
-{
-	pass1
-	{
-		mVUlow.isMemWrite = true;
-		analyzeVIreg1(mVU, _Is_, mVUlow.VI_read[0]);
-		analyzeVIreg1(mVU, _It_, mVUlow.VI_read[1]);
-	}
-	pass2
-	{
-		std::optional<const void*> optaddr(EmuConfig.Gamefixes.IbitHack ? std::nullopt : mVUoptimizeConstantAddr(mVU, _Is_, _Imm11_, 0));
-		if (!optaddr.has_value())
-		{
-			mVU.regAlloc->moveVIToGPR(gprT1, _Is_);
-			if (!EmuConfig.Gamefixes.IbitHack)
-			{
-				if (_Imm11_ != 0)
-					armAsm->Add(gprT1.W(), gprT1.W(), _Imm11_);
-			}
-			else
-			{
-				mvuLdr32(gprT2, &curI);
-				armAsm->Lsl(gprT2.W(), gprT2.W(), 21);
-				armAsm->Asr(gprT2.W(), gprT2.W(), 21);
-				armAsm->Add(gprT1.W(), gprT1.W(), gprT2.W());
-			}
-			mVUaddrFix(mVU, gprT1q, gprT2q);
-		}
-
-		// If regT is dirty, the high bits might not be zero.
-		const a64::Register regT = mVU.regAlloc->allocGPR(_It_, -1, false, true);
-		const a64::Register base = gprT2q;
-		if (optaddr.has_value())
-			armMoveAddressToReg(base, optaddr.value());
-		else
-			mvuComplexAddr(base, mVU.regs().Mem, gprT1q);
-		if (_X) armAsm->Str(regT.W(), a64::MemOperand(base, 0));
-		if (_Y) armAsm->Str(regT.W(), a64::MemOperand(base, 4));
-		if (_Z) armAsm->Str(regT.W(), a64::MemOperand(base, 8));
-		if (_W) armAsm->Str(regT.W(), a64::MemOperand(base, 12));
-		mVU.regAlloc->clearNeeded(regT);
-		mVU.profiler.EmitOp(opISW);
-	}
-	pass3 { mVUlog("ISW.%s vi%02d, vi%02d + %d", _XYZW_String, _Ft_, _Fs_, _Imm11_); }
-}
-
-mVUop(mVU_ISWR)
-{
-	pass1
-	{
-		mVUlow.isMemWrite = true;
-		analyzeVIreg1(mVU, _Is_, mVUlow.VI_read[0]);
-		analyzeVIreg1(mVU, _It_, mVUlow.VI_read[1]);
-	}
-	pass2
-	{
-		void* base = (void*)mVU.regs().Mem;
-		bool hasIs = false;
-		if (_Is_)
-		{
-			mVU.regAlloc->moveVIToGPR(gprT1, _Is_);
-			mVUaddrFix(mVU, gprT1q, gprT2q);
-			hasIs = true;
-		}
-		const a64::Register regT = mVU.regAlloc->allocGPR(_It_, -1, false, true);
-		const a64::Register baseR = gprT2q;
-		armMoveAddressToReg(baseR, base);
-		if (hasIs)
-			armAsm->Add(baseR, baseR, gprT1q);
-		if (_X) armAsm->Str(regT.W(), a64::MemOperand(baseR, 0));
-		if (_Y) armAsm->Str(regT.W(), a64::MemOperand(baseR, 4));
-		if (_Z) armAsm->Str(regT.W(), a64::MemOperand(baseR, 8));
-		if (_W) armAsm->Str(regT.W(), a64::MemOperand(baseR, 12));
-		mVU.regAlloc->clearNeeded(regT);
-
-		mVU.profiler.EmitOp(opISWR);
-	}
-	pass3 { mVUlog("ISWR.%s vi%02d, vi%02d", _XYZW_String, _Ft_, _Fs_); }
-}
-
-//------------------------------------------------------------------
-// LQ/LQD/LQI
-//------------------------------------------------------------------
-
-mVUop(mVU_LQ)
-{
-	pass1 { mVUanalyzeLQ(mVU, _Ft_, _Is_, false); }
-	pass2
-	{
-		const std::optional<const void*> optaddr(EmuConfig.Gamefixes.IbitHack ? std::nullopt : mVUoptimizeConstantAddr(mVU, _Is_, _Imm11_, 0));
-		if (!optaddr.has_value())
-		{
-			mVU.regAlloc->moveVIToGPR(gprT1, _Is_);
-			if (!EmuConfig.Gamefixes.IbitHack)
-			{
-				if (_Imm11_ != 0)
-					armAsm->Add(gprT1.W(), gprT1.W(), _Imm11_);
-			}
-			else
-			{
-				mvuLdr32(gprT2, &curI);
-				armAsm->Lsl(gprT2.W(), gprT2.W(), 21);
-				armAsm->Asr(gprT2.W(), gprT2.W(), 21);
-				armAsm->Add(gprT1.W(), gprT1.W(), gprT2.W());
-			}
-			mVUaddrFix(mVU, gprT1q, gprT2q);
-		}
-
-		const a64::VRegister Ft = mVU.regAlloc->allocReg(-1, _Ft_, _X_Y_Z_W);
-		const a64::Register base = gprT2q;
-		if (optaddr.has_value())
-			armMoveAddressToReg(base, optaddr.value());
-		else
-			mvuComplexAddr(base, mVU.regs().Mem, gprT1q);
-		mvuLoadRegBase(Ft, base, _X_Y_Z_W);
-		mVU.regAlloc->clearNeeded(Ft);
-		mVU.profiler.EmitOp(opLQ);
-	}
-	pass3 { mVUlog("LQ.%s vf%02d, vi%02d + %d", _XYZW_String, _Ft_, _Fs_, _Imm11_); }
-}
-
-mVUop(mVU_LQD)
-{
-	pass1 { mVUanalyzeLQ(mVU, _Ft_, _Is_, true); }
-	pass2
-	{
-		void* ptr = (void*)mVU.regs().Mem;
-		bool hasIs = false;
-		if (_Is_ || isVU0) // Access VU1 regs mem-map in !_Is_ case
-		{
-			const a64::Register regS = mVU.regAlloc->allocGPR(_Is_, _Is_, mVUlow.backupVI);
-			armAsm->Sub(regS.W(), regS.W(), 1);
-			armAsm->Sxth(gprT1.W(), regS.W()); // TODO: Confirm
-			mVU.regAlloc->clearNeeded(regS);
-			mVUaddrFix(mVU, gprT1q, gprT2q);
-			hasIs = true;
-		}
-		else
-		{
-			ptr = (void*)((sptr)ptr + (0xffff & (mVU.microMemSize - 8)));
-		}
-		if (!mVUlow.noWriteVF)
-		{
-			const a64::VRegister Ft = mVU.regAlloc->allocReg(-1, _Ft_, _X_Y_Z_W);
-			const a64::Register base = gprT2q;
-			if (!hasIs)
-				armMoveAddressToReg(base, ptr);
-			else
-				mvuComplexAddr(base, ptr, gprT1q);
-			mvuLoadRegBase(Ft, base, _X_Y_Z_W);
-			mVU.regAlloc->clearNeeded(Ft);
-		}
-		mVU.profiler.EmitOp(opLQD);
-	}
-	pass3 { mVUlog("LQD.%s vf%02d, --vi%02d", _XYZW_String, _Ft_, _Is_); }
-}
-
-mVUop(mVU_LQI)
-{
-	pass1 { mVUanalyzeLQ(mVU, _Ft_, _Is_, true); }
-	pass2
-	{
-		void* ptr = (void*)mVU.regs().Mem;
-		bool hasIs = false;
-		if (_Is_)
-		{
-			const a64::Register regS = mVU.regAlloc->allocGPR(_Is_, _Is_, mVUlow.backupVI);
-			armAsm->Sxth(gprT1.W(), regS.W()); // TODO: Confirm
-			armAsm->Add(regS.W(), regS.W(), 1);
-			mVU.regAlloc->clearNeeded(regS);
-			mVUaddrFix(mVU, gprT1q, gprT2q);
-			hasIs = true;
-		}
-		if (!mVUlow.noWriteVF)
-		{
-			const a64::VRegister Ft = mVU.regAlloc->allocReg(-1, _Ft_, _X_Y_Z_W);
-			const a64::Register base = gprT2q;
-			if (!hasIs)
-				armMoveAddressToReg(base, ptr);
-			else
-				mvuComplexAddr(base, ptr, gprT1q);
-			mvuLoadRegBase(Ft, base, _X_Y_Z_W);
-			mVU.regAlloc->clearNeeded(Ft);
-		}
-		mVU.profiler.EmitOp(opLQI);
-	}
-	pass3 { mVUlog("LQI.%s vf%02d, vi%02d++", _XYZW_String, _Ft_, _Fs_); }
-}
-
-//------------------------------------------------------------------
-// SQ/SQD/SQI
-//------------------------------------------------------------------
-
-mVUop(mVU_SQ)
-{
-	pass1 { mVUanalyzeSQ(mVU, _Fs_, _It_, false); }
-	pass2
-	{
-		const std::optional<const void*> optptr(EmuConfig.Gamefixes.IbitHack ? std::nullopt : mVUoptimizeConstantAddr(mVU, _It_, _Imm11_, 0));
-		if (!optptr.has_value())
-		{
-			mVU.regAlloc->moveVIToGPR(gprT1, _It_);
-			if (!EmuConfig.Gamefixes.IbitHack)
-			{
-				if (_Imm11_ != 0)
-					armAsm->Add(gprT1.W(), gprT1.W(), _Imm11_);
-			}
-			else
-			{
-				mvuLdr32(gprT2, &curI);
-				armAsm->Lsl(gprT2.W(), gprT2.W(), 21);
-				armAsm->Asr(gprT2.W(), gprT2.W(), 21);
-				armAsm->Add(gprT1.W(), gprT1.W(), gprT2.W());
-			}
-			mVUaddrFix(mVU, gprT1q, gprT2q);
-		}
-
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, _XYZW_PS ? -1 : 0, _X_Y_Z_W);
-		const a64::Register base = gprT2q;
-		if (optptr.has_value())
-			armMoveAddressToReg(base, optptr.value());
-		else
-			mvuComplexAddr(base, mVU.regs().Mem, gprT1q);
-		mvuSaveRegBase(Fs, base, _X_Y_Z_W, 1);
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.profiler.EmitOp(opSQ);
-	}
-	pass3 { mVUlog("SQ.%s vf%02d, vi%02d + %d", _XYZW_String, _Fs_, _Ft_, _Imm11_); }
-}
-
-mVUop(mVU_SQD)
-{
-	pass1 { mVUanalyzeSQ(mVU, _Fs_, _It_, true); }
-	pass2
-	{
-		void* ptr = (void*)mVU.regs().Mem;
-		bool hasIt = false;
-		if (_It_ || isVU0) // Access VU1 regs mem-map in !_It_ case
-		{
-			const a64::Register regT = mVU.regAlloc->allocGPR(_It_, _It_, mVUlow.backupVI);
-			armAsm->Sub(regT.W(), regT.W(), 1);
-			armAsm->Uxth(gprT1.W(), regT.W());
-			mVU.regAlloc->clearNeeded(regT);
-			mVUaddrFix(mVU, gprT1q, gprT2q);
-			hasIt = true;
-		}
-		else
-		{
-			ptr = (void*)((sptr)ptr + (0xffff & (mVU.microMemSize - 8)));
-		}
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, _XYZW_PS ? -1 : 0, _X_Y_Z_W);
-		const a64::Register base = gprT2q;
-		if (!hasIt)
-			armMoveAddressToReg(base, ptr);
-		else
-			mvuComplexAddr(base, ptr, gprT1q);
-		mvuSaveRegBase(Fs, base, _X_Y_Z_W, 1);
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.profiler.EmitOp(opSQD);
-	}
-	pass3 { mVUlog("SQD.%s vf%02d, --vi%02d", _XYZW_String, _Fs_, _Ft_); }
-}
-
-mVUop(mVU_SQI)
-{
-	pass1 { mVUanalyzeSQ(mVU, _Fs_, _It_, true); }
-	pass2
-	{
-		void* ptr = (void*)mVU.regs().Mem;
-		if (_It_)
-		{
-			const a64::Register regT = mVU.regAlloc->allocGPR(_It_, _It_, mVUlow.backupVI);
-			armAsm->Uxth(gprT1.W(), regT.W());
-			armAsm->Add(regT.W(), regT.W(), 1);
-			mVU.regAlloc->clearNeeded(regT);
-			mVUaddrFix(mVU, gprT1q, gprT2q);
-		}
-		const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, _XYZW_PS ? -1 : 0, _X_Y_Z_W);
-		const a64::Register base = gprT2q;
-		if (_It_)
-			mvuComplexAddr(base, ptr, gprT1q);
-		else
-			armMoveAddressToReg(base, ptr);
-		mvuSaveRegBase(Fs, base, _X_Y_Z_W, 1);
-		mVU.regAlloc->clearNeeded(Fs);
-		mVU.profiler.EmitOp(opSQI);
-	}
-	pass3 { mVUlog("SQI.%s vf%02d, vi%02d++", _XYZW_String, _Fs_, _Ft_); }
-}
-
-//------------------------------------------------------------------
-// RINIT/RGET/RNEXT/RXOR
-//------------------------------------------------------------------
-
-mVUop(mVU_RINIT)
-{
-	pass1 { mVUanalyzeR1(mVU, _Fs_, _Fsf_); }
-	pass2
-	{
-		if (_Fs_ || (_Fsf_ == 3))
-		{
-			const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, 0, (1 << (3 - _Fsf_)));
-			armAsm->Fmov(gprT1.W(), Fs.S());
-			armAsm->And(gprT1.W(), gprT1.W(), 0x007fffff);
-			armAsm->Orr(gprT1.W(), gprT1.W(), 0x3f800000);
-			mvuStr32(Rmem, gprT1);
-			mVU.regAlloc->clearNeeded(Fs);
-		}
-		else
-		{
-			mvuStrImm32(Rmem, 0x3f800000, gprT1);
-		}
-		mVU.profiler.EmitOp(opRINIT);
-	}
-	pass3 { mVUlog("RINIT R, vf%02d%s", _Fs_, _Fsf_String); }
-}
-
-static __fi void mVU_RGET_(mV, const a64::Register& Rreg)
-{
-	if (!mVUlow.noWriteVF)
-	{
-		const a64::VRegister Ft = mVU.regAlloc->allocReg(-1, _Ft_, _X_Y_Z_W);
-		armAsm->Fmov(Ft.S(), Rreg.W());
-		if (!_XYZW_SS)
-			mVUunpack_xyzw(Ft, Ft, 0);
-		mVU.regAlloc->clearNeeded(Ft);
-	}
-}
-
-mVUop(mVU_RGET)
-{
-	pass1 { mVUanalyzeR2(mVU, _Ft_, true); }
-	pass2
-	{
-		mvuLdr32(gprT1, Rmem);
-		mVU_RGET_(mVU, gprT1);
-		mVU.profiler.EmitOp(opRGET);
-	}
-	pass3 { mVUlog("RGET.%s vf%02d, R", _XYZW_String, _Ft_); }
-}
-
-mVUop(mVU_RNEXT)
-{
-	pass1 { mVUanalyzeR2(mVU, _Ft_, false); }
-	pass2
-	{
-		// algorithm from www.project-fao.org
-		const a64::Register temp3 = mVU.regAlloc->allocGPR();
-		mvuLdr32(temp3, Rmem);
-		armAsm->Mov(gprT1.W(), temp3.W());
-		armAsm->Lsr(gprT1.W(), gprT1.W(), 4);
-		armAsm->And(gprT1.W(), gprT1.W(), 1);
-
-		armAsm->Mov(gprT2.W(), temp3.W());
-		armAsm->Lsr(gprT2.W(), gprT2.W(), 22);
-		armAsm->And(gprT2.W(), gprT2.W(), 1);
-
-		armAsm->Lsl(temp3.W(), temp3.W(), 1);
-		armAsm->Eor(gprT1.W(), gprT1.W(), gprT2.W());
-		armAsm->Eor(temp3.W(), temp3.W(), gprT1.W());
-		armAsm->And(temp3.W(), temp3.W(), 0x007fffff);
-		armAsm->Orr(temp3.W(), temp3.W(), 0x3f800000);
-		mvuStr32(Rmem, temp3);
-		mVU_RGET_(mVU, temp3);
-		mVU.regAlloc->clearNeeded(temp3);
-		mVU.profiler.EmitOp(opRNEXT);
-	}
-	pass3 { mVUlog("RNEXT.%s vf%02d, R", _XYZW_String, _Ft_); }
-}
-
-mVUop(mVU_RXOR)
-{
-	pass1 { mVUanalyzeR1(mVU, _Fs_, _Fsf_); }
-	pass2
-	{
-		if (_Fs_ || (_Fsf_ == 3))
-		{
-			const a64::VRegister Fs = mVU.regAlloc->allocReg(_Fs_, 0, (1 << (3 - _Fsf_)));
-			armAsm->Fmov(gprT1.W(), Fs.S());
-			armAsm->And(gprT1.W(), gprT1.W(), 0x7fffff);
-			mvuLdr32(gprT2, Rmem);
-			armAsm->Eor(gprT2.W(), gprT2.W(), gprT1.W());
-			mvuStr32(Rmem, gprT2);
-			mVU.regAlloc->clearNeeded(Fs);
-		}
-		mVU.profiler.EmitOp(opRXOR);
-	}
-	pass3 { mVUlog("RXOR R, vf%02d%s", _Fs_, _Fsf_String); }
-}
-
-//------------------------------------------------------------------
-// WaitP/WaitQ
-//------------------------------------------------------------------
-
-mVUop(mVU_WAITP)
-{
-	pass1
-	{
-		if (isVU0)
-		{
-			mVUlow.isNOP = true;
-			return;
-		}
-		mVUstall = std::max(mVUstall, (u8)((mVUregs.p) ? (mVUregs.p - 1) : 0));
-	}
-	pass2 { mVU.profiler.EmitOp(opWAITP); }
-	pass3 { mVUlog("WAITP"); }
-}
-
-mVUop(mVU_WAITQ)
-{
-	pass1 { mVUstall = std::max(mVUstall, mVUregs.q); }
-	pass2 { mVU.profiler.EmitOp(opWAITQ); }
-	pass3 { mVUlog("WAITQ"); }
-}
-
-//------------------------------------------------------------------
-// XTOP/XITOP
-//------------------------------------------------------------------
-
-mVUop(mVU_XTOP)
-{
-	pass1
-	{
-		if (isVU0)
-		{
-			mVUlow.isNOP = true;
-			return;
-		}
-
-		if (!_It_)
-			mVUlow.isNOP = true;
-
-		analyzeVIreg2(mVU, _It_, mVUlow.VI_write, 1);
-	}
-	pass2
-	{
-		const a64::Register regT = mVU.regAlloc->allocGPR(-1, _It_, mVUlow.backupVI);
-		mvuLdrhZ(regT, &mVU.getVifRegs().top);
-		mVU.regAlloc->clearNeeded(regT);
-		mVU.profiler.EmitOp(opXTOP);
-	}
-	pass3 { mVUlog("XTOP vi%02d", _Ft_); }
-}
-
-mVUop(mVU_XITOP)
-{
-	pass1
-	{
-		if (!_It_)
-			mVUlow.isNOP = true;
-
-		analyzeVIreg2(mVU, _It_, mVUlow.VI_write, 1);
-	}
-	pass2
-	{
-		const a64::Register regT = mVU.regAlloc->allocGPR(-1, _It_, mVUlow.backupVI);
-		mvuLdrhZ(regT, &mVU.getVifRegs().itop);
-		armAsm->And(regT.W(), regT.W(), isVU1 ? 0x3ff : 0xff);
-		mVU.regAlloc->clearNeeded(regT);
-		mVU.profiler.EmitOp(opXITOP);
-	}
-	pass3 { mVUlog("XITOP vi%02d", _Ft_); }
-}
-
-//------------------------------------------------------------------
-// XGkick
-//------------------------------------------------------------------
-
-void mVU_XGKICK_(u32 addr)
-{
-	if (g_mvuShadowRun) // DEBUG shadow run: don't transfer to GS (see MVU_DIFF)
-		return;
-	addr = (addr & 0x3ff) * 16;
-	u32 diff = 0x4000 - addr;
-	u32 size = gifUnit.GetGSPacketSize(GIF_PATH_1, vuRegs[1].Mem, addr, ~0u, true);
 
 	if (size > diff)
 	{
-		gifUnit.gifPath[GIF_PATH_1].CopyGSPacketData(&vuRegs[1].Mem[addr], diff, true);
-		gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, &vuRegs[1].Mem[0], size - diff, true);
+		// Wrap: tail of VU memory + wraparound prefix. CopyGSPacketData for
+		// the tail so PATH3 arbitration stays sane (mVU_XGKICK_ does the same).
+		gifUnit.gifPath[GIF_PATH_1].CopyGSPacketData(&VU1.Mem[addr], diff, true);
+		gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, &VU1.Mem[0], size - diff, true);
 	}
 	else
 	{
-		gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, &vuRegs[1].Mem[addr], size, true);
+		gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, &VU1.Mem[addr], size, true);
 	}
+
+	// VGW release is handled by gifUnit.Execute on the EE thread (Gif_Unit.h:825).
+	// We intentionally do NOT touch vif1Regs.stat.VGW or CPU_INT here — under
+	// THREAD_VU1 this runs on the MTVU thread and any write to cpuRegs /
+	// vif1Regs from here is a cross-thread race. microVU's mVU_XGKICK_
+	// (microVU_Lower.inl:1698) takes the same approach: it never touches VGW,
+	// leaving that to the GIF arbitration loop on the EE thread.
 }
 
-void _vuXGKICKTransfermVU(bool flush)
+// Hazard-fallback XGKICK bridge. CompileBlock's vi_hazard path
+// (iVU1micro_arm64.cpp:1256) runs vu1Exec for the current pair when upper
+// writes CLIP and lower reads/writes CLIP. XGKICK's _vuRegsXGKICK sets
+// VIread = (1 << _Is_); if a program issues `XGKICK vi18` (vi18 ==
+// REG_CLIP_FLAG — unusual but legal) while the paired upper writes CLIP,
+// the hazard fires and the interpreter's _vuXGKICK runs (VUops.cpp:1918).
+// That leaves VU1.xgkickenable=true, xgkickaddr=<captured>,
+// xgkickcyclecount=1, and VPU_STAT bit 12 set. The JIT's normal paths
+// never manage xgkickenable (the whole point of the
+// s_vu1_pending_xgkick_addr scratch design — see line 501 above), so
+// leaving it set leaks into a later hazard fallback's vu1Exec →
+// _vuTestPipes → _vuXGKICKTransfer, which is the broken loop this file
+// goes to lengths to avoid (line 540-548).
+//
+// This helper translates the interp's captured addr into the JIT's
+// pending-fire scratch and clears the interp-side state so the JIT's
+// "xgkickenable is never true under the rec" invariant is restored.
+// Emitted by CompileBlock right after vu1Exec when isXgkickOp(lower).
+//
+// VU arg is unused (kept for ABI compat with armEmitCall, which loads
+// x0 = VU1_BASE_REG at every call site).
+void vu1_XGKICK_capture_from_interp(VURegs* VU)
 {
-	if (g_mvuShadowRun) // DEBUG shadow run: don't transfer to GS (see MVU_DIFF)
+	(void)VU;
+	// Defensive: call site gates on isXgkickOp(lower), so xgkickenable
+	// will always be true here under normal flow. Bail out if the interp
+	// short-circuited _vuXGKICK for any reason rather than overwriting
+	// the scratch with stale VU1.xgkickaddr.
+	if (!VU1.xgkickenable)
 		return;
-	while (VU1.xgkickenable && (flush || VU1.xgkickcyclecount >= 2))
-	{
-		u32 transfersize = 0;
-
-		if (VU1.xgkicksizeremaining == 0)
-		{
-			u32 size = gifUnit.GetGSPacketSize(GIF_PATH_1, vuRegs[1].Mem, VU1.xgkickaddr, ~0u, flush);
-			VU1.xgkicksizeremaining = size & 0xFFFF;
-			VU1.xgkickendpacket = size >> 31;
-			VU1.xgkickdiff = 0x4000 - VU1.xgkickaddr;
-
-			if (VU1.xgkicksizeremaining == 0)
-			{
-				VU1.xgkickenable = false;
-				break;
-			}
-		}
-
-		if (!flush)
-		{
-			transfersize = std::min(VU1.xgkicksizeremaining, VU1.xgkickcyclecount * 8);
-			transfersize = std::min(transfersize, VU1.xgkickdiff);
-		}
-		else
-		{
-			transfersize = VU1.xgkicksizeremaining;
-			transfersize = std::min(transfersize, VU1.xgkickdiff);
-		}
-
-		// Would be "nicer" to do the copy until it's all up, however this really screws up PATH3 masking stuff
-		// So lets just do it the other way :)
-		if (THREAD_VU1)
-		{
-			if (transfersize < VU1.xgkicksizeremaining)
-				gifUnit.gifPath[GIF_PATH_1].CopyGSPacketData(&VU1.Mem[VU1.xgkickaddr], transfersize, true);
-			else
-				gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, &vuRegs[1].Mem[VU1.xgkickaddr], transfersize, true);
-		}
-		else
-		{
-			gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, &vuRegs[1].Mem[VU1.xgkickaddr], transfersize, true);
-		}
-
-		if (flush)
-			VU1.cycle += transfersize / 8;
-
-		VU1.xgkickcyclecount -= transfersize / 8;
-
-		VU1.xgkickaddr = (VU1.xgkickaddr + transfersize) & 0x3FFF;
-		VU1.xgkicksizeremaining -= transfersize;
-		VU1.xgkickdiff = 0x4000 - VU1.xgkickaddr;
-
-		if (VU1.xgkickendpacket && !VU1.xgkicksizeremaining)
-		{
-			VU1.xgkickenable = false;
-		}
-	}
+	s_vu1_pending_xgkick_addr = VU1.xgkickaddr;
+	VU1.xgkickenable        = false;
+	VU1.xgkicksizeremaining = 0;
+	VU1.xgkickcyclecount    = 0;
+	VU0.VI[REG_VPU_STAT].UL &= ~(1u << 12);
 }
 
-static __fi void mVU_XGKICK_SYNC(mV, bool flush)
+// ============================================================================
+//  CHECK_XGKICKHACK path (C-1) — cycle-paced XGKICK for games needing
+//  accurate GIF-busy emulation (Erementar Gerad and a small set of other
+//  titles with crowd/water/particle shaders).
+//
+//  Model: VU1.xgkick{enable,addr,sizeremaining,cyclecount,diff,endpacket}
+//  are managed directly (matching the interpreter's _vuXGKICK model). The
+//  paced transfer advances via _vuXGKICKTransfer(cycles, flush=false) —
+//  8 bytes per cycle, stops when xgkickcyclecount < 2. Under
+//  CHECK_XGKICKHACK, Gif_Unit.h:606's early-exit branch returns packet
+//  sizes with the EOP top bit set, which keeps _vuXGKICKTransfer's loop
+//  termination working (the bug this file's default path avoids via the
+//  scratch-based direct-fire — see line 540-548).
+//
+//  These helpers are the arm64 equivalents of microVU's mVU_XGKICK_SYNC
+//  (microVU_Lower.inl:1788) and the inline state setup in mVU_XGKICK's
+//  pass2 hack branch (microVU_Lower.inl:1841-1866).
+//
+//  The capture-from-interp bridge above and the s_vu1_pending_xgkick_addr
+//  scratch are NOT used under hack mode — both interp (hazard fallbacks)
+//  and JIT agree on VU1.xgkick* state management, so no translation is
+//  needed.
+// ============================================================================
+
+// Hack-mode XGKICK op body. Flushes any prior kick (drains remaining bytes,
+// advancing VU1.cycle by the transfer time), then sets up a new kick whose
+// paced transfer will be advanced by vu1_XGKICK_hack_sync calls emitted
+// at memwrite pairs. Mirrors the interpreter's _vuXGKICK (VUops.cpp:1918).
+//
+// Callers in CompileBlock flush x21 (cached VU1.cycle) + x24/x25 (cached
+// fmac/ialu wpos) before the BL and reload them after, because
+// _vuXGKICKTransfer(0, true) writes VU1.cycle and the trailing
+// _vuTestPipes reads/writes fmacwritepos/ialuwritepos.
+static void vu1_XGKICK_hack_capture(VURegs* VU)
 {
-	mVU.regAlloc->flushCallerSavedRegisters();
+	if (VU1.xgkickenable)
+		_vuXGKICKTransfer(0, true);
 
-	// Add the single cycle remainder after this instruction, some games do the store
-	// on the second instruction after the kick and that needs to go through first
-	// but that's VERY close..
-	a64::Label skipxgkick;
-	mvuLdr32(gprT1, &VU1.xgkickenable);
-	armAsm->Tst(gprT1.W(), 0x1);
-	armAsm->B(&skipxgkick, a64::eq);
-
-	mvuLdr32(gprT1, &VU1.xgkickcyclecount);
-	armAsm->Add(gprT1.W(), gprT1.W(), mVUlow.kickcycles - 1);
-	mvuStr32(&VU1.xgkickcyclecount, gprT1);
-	armAsm->Cmp(gprT1.W(), 2);
-	a64::Label needcycles;
-	armAsm->B(&needcycles, a64::lt);
-	mVUbackupRegs(mVU, true, true);
-	armAsm->Mov(RWARG1.W(), flush ? 1 : 0);
-	armEmitCall(reinterpret_cast<const void*>(&_vuXGKICKTransfermVU));
-	mVUrestoreRegs(mVU, true, true);
-	armAsm->Bind(&needcycles);
-	mvuLdr32(gprT1, &VU1.xgkickcyclecount);
-	armAsm->Add(gprT1.W(), gprT1.W(), 1);
-	mvuStr32(&VU1.xgkickcyclecount, gprT1);
-	armAsm->Bind(&skipxgkick);
+	const u32 addr = (VU->VI[W_Is(VU)].US[0] & 0x3ffu) * 16u;
+	VU1.xgkickenable        = true;
+	VU1.xgkickaddr          = addr;
+	VU1.xgkicksizeremaining = 0;
+	VU1.xgkickendpacket     = false;
+	VU1.xgkicklastcycle     = VU1.cycle;
+	VU1.xgkickcyclecount    = 1; // XGKICK itself counts as 1 cycle (see VUops.cpp:1934)
+	VU1.xgkickdiff          = 0x4000u - addr;
+	VU0.VI[REG_VPU_STAT].UL |= (1u << 12);
 }
 
-static __fi void mVU_XGKICK_DELAY(mV)
+// Hack-mode periodic sync tick. Advances the paced transfer by `cycles`
+// without flushing. No-op if xgkickenable=false (early return inside
+// _vuXGKICKTransfer). Emitted by CompileBlock at memwrite pairs —
+// matches mVU_XGKICK_SYNC(mVU, false) at microVU_Compile.inl:895.
+//
+// Caller does NOT need to flush x21/x24/x25: with flush=false,
+// _vuXGKICKTransfer touches only VU1.xgkick{cyclecount,addr,sizeremaining,
+// diff,enable,endpacket} — none of which the JIT caches.
+void vu1_XGKICK_hack_sync(VURegs* VU, u32 cycles)
 {
-	mVU.regAlloc->flushCallerSavedRegisters();
-
-	mVUbackupRegs(mVU, true, true);
-	mvuLdr32(RWARG1, &mVU.VIxgkick);
-	armEmitCall(reinterpret_cast<const void*>(&mVU_XGKICK_));
-	mVUrestoreRegs(mVU, true, true);
+	(void)VU;
+	_vuXGKICKTransfer(static_cast<s32>(cycles), false);
 }
 
-mVUop(mVU_XGKICK)
-{
-	pass1
-	{
-		if (isVU0)
-		{
-			mVUlow.isNOP = true;
-			return;
-		}
-		mVUanalyzeXGkick(mVU, _Is_, 1);
-	}
-	pass2
-	{
-		if (CHECK_XGKICKHACK)
-		{
-			mVUlow.kickcycles = 99;
-			mVU_XGKICK_SYNC(mVU, true);
-			mVUlow.kickcycles = 0;
-		}
-		if (mVUinfo.doXGKICK) // check for XGkick Transfer
-		{
-			mVU_XGKICK_DELAY(mVU);
-			mVUinfo.doXGKICK = false;
-		}
+// ============================================================================
+//  Per-instruction interp stub toggles (1 = interp, 0 = native)
+// ============================================================================
 
-		const a64::Register regS = mVU.regAlloc->allocGPR(_Is_, -1);
-		if (!CHECK_XGKICKHACK)
-		{
-			mvuStr32(&mVU.VIxgkick, regS);
-		}
-		else
-		{
-			mvuStrImm32(&VU1.xgkickenable, 1, gprT1);
-			mvuStrImm32(&VU1.xgkickendpacket, 0, gprT1);
-			mvuStrImm32(&VU1.xgkicksizeremaining, 0, gprT1);
-			mvuStrImm32(&VU1.xgkickcyclecount, 0, gprT1);
-			mvuLdr32(gprT2, &mVU.totalCycles);
-			mvuLdr32(gprT1, &mVU.cycles);
-			armAsm->Sub(gprT2.W(), gprT2.W(), gprT1.W());
-			armMoveAddressToReg(RSCRATCHADDR, &VU1.cycle);
-			armAsm->Ldr(gprT1q, a64::MemOperand(RSCRATCHADDR));
-			armAsm->Add(gprT2q, gprT2q, gprT1q);
-			mvuStr32(&VU1.xgkicklastcycle, gprT2);
-			armAsm->Mov(gprT1.W(), regS.W());
-			armAsm->And(gprT1.W(), gprT1.W(), 0x3FF);
-			armAsm->Lsl(gprT1.W(), gprT1.W(), 4);
-			mvuStr32(&VU1.xgkickaddr, gprT1);
-		}
-		mVU.regAlloc->clearNeeded(regS);
-		mVU.profiler.EmitOp(opXGKICK);
+// ---- FDIV group ----
+#ifdef INTERP_VU_FDIV
+#define ISTUB_VU_DIV     1
+#define ISTUB_VU_SQRT    1
+#define ISTUB_VU_RSQRT   1
+#define ISTUB_VU_WAITQ   1
+#define ISTUB_VU_WAITP   1
+#else
+#define ISTUB_VU_DIV     0
+#define ISTUB_VU_SQRT    0
+#define ISTUB_VU_RSQRT   0
+#define ISTUB_VU_WAITQ   0
+#define ISTUB_VU_WAITP   0
+#endif
+
+// ---- IALU group ----
+#ifdef INTERP_VU_IALU
+#define ISTUB_VU_IADD    1
+#define ISTUB_VU_ISUB    1
+#define ISTUB_VU_IADDI   1
+#define ISTUB_VU_IADDIU  1
+#define ISTUB_VU_ISUBIU  1
+#define ISTUB_VU_IAND    1
+#define ISTUB_VU_IOR     1
+#else
+#define ISTUB_VU_IADD    0
+#define ISTUB_VU_ISUB    0
+#define ISTUB_VU_IADDI   0
+#define ISTUB_VU_IADDIU  0
+#define ISTUB_VU_ISUBIU  0
+#define ISTUB_VU_IAND    0
+#define ISTUB_VU_IOR     0
+#endif
+
+// ---- LoadStore group ----
+#ifdef INTERP_VU_LOADSTORE
+#define ISTUB_VU_LQ      1
+#define ISTUB_VU_LQD     1
+#define ISTUB_VU_LQI     1
+#define ISTUB_VU_SQ      1
+#define ISTUB_VU_SQD     1
+#define ISTUB_VU_SQI     1
+#define ISTUB_VU_ILW     1
+#define ISTUB_VU_ISW     1
+#define ISTUB_VU_ILWR    1
+#define ISTUB_VU_ISWR    1
+#else
+#define ISTUB_VU_LQ      0
+#define ISTUB_VU_LQD     0
+#define ISTUB_VU_LQI     0
+#define ISTUB_VU_SQ      0
+#define ISTUB_VU_SQD     0
+#define ISTUB_VU_SQI     0
+#define ISTUB_VU_ILW     0
+#define ISTUB_VU_ISW     0
+#define ISTUB_VU_ILWR    0
+#define ISTUB_VU_ISWR    0
+#endif
+
+// ---- Branch group ----
+#ifdef INTERP_VU_BRANCH
+#define ISTUB_VU_B       1
+#define ISTUB_VU_BAL     1
+#define ISTUB_VU_JR      1
+#define ISTUB_VU_JALR    1
+#define ISTUB_VU_IBEQ    1
+#define ISTUB_VU_IBNE    1
+#define ISTUB_VU_IBLTZ   1
+#define ISTUB_VU_IBGTZ   1
+#define ISTUB_VU_IBLEZ   1
+#define ISTUB_VU_IBGEZ   1
+#else
+#define ISTUB_VU_B       0
+#define ISTUB_VU_BAL     0
+#define ISTUB_VU_JR      0
+#define ISTUB_VU_JALR    0
+#define ISTUB_VU_IBEQ    0
+#define ISTUB_VU_IBNE    0
+#define ISTUB_VU_IBLTZ   0
+#define ISTUB_VU_IBGTZ   0
+#define ISTUB_VU_IBLEZ   0
+#define ISTUB_VU_IBGEZ   0
+#endif
+
+// ---- Misc group (move, flag, random, EFU, special) ----
+#ifdef INTERP_VU_MISC
+#define ISTUB_VU_MOVE    1
+#define ISTUB_VU_MR32    1
+#define ISTUB_VU_MFIR    1
+#define ISTUB_VU_MTIR    1
+#define ISTUB_VU_MFP     1
+#define ISTUB_VU_FSAND   1
+#define ISTUB_VU_FSEQ    1
+#define ISTUB_VU_FSOR    1
+#define ISTUB_VU_FSSET   1
+#define ISTUB_VU_FMAND   1
+#define ISTUB_VU_FMEQ    1
+#define ISTUB_VU_FMOR    1
+#define ISTUB_VU_FCAND   1
+#define ISTUB_VU_FCEQ    1
+#define ISTUB_VU_FCOR    1
+#define ISTUB_VU_FCSET   1
+#define ISTUB_VU_FCGET   1
+#define ISTUB_VU_RINIT   1
+#define ISTUB_VU_RGET    1
+#define ISTUB_VU_RNEXT   1
+#define ISTUB_VU_RXOR    1
+#define ISTUB_VU_ESADD   1
+#define ISTUB_VU_ERSADD  1
+#define ISTUB_VU_ELENG   1
+#define ISTUB_VU_ERLENG  1
+#define ISTUB_VU_EATANxy 1
+#define ISTUB_VU_EATANxz 1
+#define ISTUB_VU_ESUM    1
+#define ISTUB_VU_ERCPR   1
+#define ISTUB_VU_ESQRT_EFU 1
+#define ISTUB_VU_ERSQRT  1
+#define ISTUB_VU_ESIN    1
+#define ISTUB_VU_EATAN   1
+#define ISTUB_VU_EEXP    1
+#define ISTUB_VU_XITOP   1
+#define ISTUB_VU_XTOP    1
+#define ISTUB_VU_XGKICK  1
+#else
+#define ISTUB_VU_MOVE    0
+#define ISTUB_VU_MR32    0
+#define ISTUB_VU_MFIR    0
+#define ISTUB_VU_MTIR    0
+#define ISTUB_VU_MFP     0
+#define ISTUB_VU_FSAND   0
+#define ISTUB_VU_FSEQ    0
+#define ISTUB_VU_FSOR    0
+#define ISTUB_VU_FSSET   0
+#define ISTUB_VU_FMAND   0
+#define ISTUB_VU_FMEQ    0
+#define ISTUB_VU_FMOR    0
+#define ISTUB_VU_FCAND   0
+#define ISTUB_VU_FCEQ    0
+#define ISTUB_VU_FCOR    0
+#define ISTUB_VU_FCSET   0
+#define ISTUB_VU_FCGET   0
+#define ISTUB_VU_RINIT   0
+#define ISTUB_VU_RGET    0
+#define ISTUB_VU_RNEXT   0
+#define ISTUB_VU_RXOR    0
+#define ISTUB_VU_ESADD   0
+#define ISTUB_VU_ERSADD  0
+#define ISTUB_VU_ELENG   0
+#define ISTUB_VU_ERLENG  0
+#define ISTUB_VU_EATANxy 0
+#define ISTUB_VU_EATANxz 0
+#define ISTUB_VU_ESUM    0
+#define ISTUB_VU_ERCPR   0
+#define ISTUB_VU_ESQRT_EFU 0
+#define ISTUB_VU_ERSQRT  0
+#define ISTUB_VU_ESIN    0
+#define ISTUB_VU_EATAN   0
+#define ISTUB_VU_EEXP    0
+#define ISTUB_VU_XITOP   0
+#define ISTUB_VU_XTOP    0
+#define ISTUB_VU_XGKICK  0
+#endif
+
+// ============================================================================
+//  Interpreter stub: dispatch through VU1 lower opcode table.
+//  VU1.code must be set before the rec function is called.
+//  The table handles sub-table dispatch (LowerOP, T3_xx) automatically.
+// ============================================================================
+
+// Code-emitter macro: called at block-compile time to emit the pinned-reg
+// flush + BL to interpreter + reload dance. See emitVU1InterpBL comment
+// for the pin-skew rationale. VU1.code is set by CompileBlock (both as
+// compile-time variable and as a runtime store) before calling this
+// function, so VU1_LOWER_OPCODE[VU1.code >> 25] resolves to the correct
+// interp function at emit time and the interpreter reads the correct
+// opcode at runtime.
+#define REC_VU1_LOWER_INTERP(name) \
+	void recVU1_##name() { \
+		emitVU1InterpBL(reinterpret_cast<const void*>(VU1_LOWER_OPCODE[VU1.code >> 25])); \
 	}
-	pass3 { mVUlog("XGKICK vi%02d", _Fs_); }
+
+// Non-INTERP path (ISTUB=0, no native codegen yet): same emitter as ISTUB=1.
+#define REC_VU1_LOWER_EMIT(name) \
+	void recVU1_##name() { \
+		emitVU1InterpBL(reinterpret_cast<const void*>(VU1_LOWER_OPCODE[VU1.code >> 25])); \
+	}
+
+// ============================================================================
+//  FDIV — Division pipeline
+// ============================================================================
+
+#if ISTUB_VU_DIV
+REC_VU1_LOWER_INTERP(DIV)
+#else
+void recVU1_DIV() {
+	const u32 ft = (VU1.code >> 16) & 0x1F;
+	const u32 ftf = (VU1.code >> 23) & 0x3;
+	const u32 fs = (VU1.code >> 11) & 0x1F;
+	const u32 fsf = (VU1.code >> 21) & 0x3;
+	const int64_t q_off  = static_cast<int64_t>(offsetof(VURegs, q));
+
+	// Phase 2: this emitter reads VF[ft] / VF[fs] memory directly via Ldr w.
+	// Flush any deferred dirty lanes to memory first so the reads are coherent.
+	vfCacheFlushOne(static_cast<int>(ft));
+	vfCacheFlushOne(static_cast<int>(fs));
+
+	// Load raw u32 float bits
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, vfOff(ft) + ftf * 4));
+	armAsm->Ldr(w1, MemOperand(VU1_BASE_REG, vfOff(fs) + fsf * 4));
+	// Save raw copies for sign check
+	armAsm->Mov(w4, w0);
+	armAsm->Mov(w5, w1);
+	// vuDouble clamp both operands
+	emitVuDouble(w0, w2);
+	emitVuDouble(w1, w2);
+	// Clear statusflag bits [5:4] on the pinned reg (no memory round-trip).
+	armAsm->Bic(VU1_STATUSFLAG_REG, VU1_STATUSFLAG_REG, 0x30);
+	// Convert to float
+	armAsm->Fmov(s0, w0); // ft
+	armAsm->Fmov(s1, w1); // fs
+
+	a64::Label ftNotZero, done;
+	armAsm->Fcmp(s0, 0.0);
+	armAsm->B(&ftNotZero, a64::ne);
+
+	// --- ft == 0 path ---
+	a64::Label fsNotZero, signCheck;
+	armAsm->Fcmp(s1, 0.0);
+	armAsm->B(&fsNotZero, a64::ne);
+	// fs==0: statusflag |= 0x10
+	armAsm->Orr(VU1_STATUSFLAG_REG, VU1_STATUSFLAG_REG, 0x10);
+	armAsm->B(&signCheck);
+	armAsm->Bind(&fsNotZero);
+	// fs!=0: statusflag |= 0x20
+	armAsm->Orr(VU1_STATUSFLAG_REG, VU1_STATUSFLAG_REG, 0x20);
+	armAsm->Bind(&signCheck);
+	// Sign check: (raw_ft ^ raw_fs) bit 31
+	armAsm->Eor(w3, w4, w5);
+	a64::Label diffSign;
+	armAsm->Tbnz(w3, 31, &diffSign);
+	// Same sign: q = 0x7F7FFFFF
+	armAsm->Mov(w0, 0x7F7FFFFFu);
+	armAsm->Str(w0, MemOperand(VU1_BASE_REG, q_off));
+	armAsm->B(&done);
+	armAsm->Bind(&diffSign);
+	// Different sign: q = 0xFF7FFFFF
+	armAsm->Mov(w0, 0xFF7FFFFFu);
+	armAsm->Str(w0, MemOperand(VU1_BASE_REG, q_off));
+	armAsm->B(&done);
+
+	// --- ft != 0 path ---
+	armAsm->Bind(&ftNotZero);
+	armAsm->Fdiv(s2, s1, s0); // fs / ft
+	armAsm->Fmov(w0, s2);
+	emitVuDouble(w0, w2);      // clamp result
+	armAsm->Str(w0, MemOperand(VU1_BASE_REG, q_off));
+
+	armAsm->Bind(&done);
 }
+#endif
 
-//------------------------------------------------------------------
-// Branches/Jumps
-//------------------------------------------------------------------
-// setBranchA (the branch-attribute setup) + mVU_B / mVU_BAL live in aVU_Tables.inl
-// (ported with the table big-bang). The conditional/jump *drivers*
-// (normBranch/normJump/condBranch) are in aVU_Branch.inl; the op handlers below
-// just record the comparison value / target into the mVU branch fields, which the
-// drivers (invoked by mVUcompile) consume.
+#if ISTUB_VU_SQRT
+REC_VU1_LOWER_INTERP(SQRT)
+#else
+void recVU1_SQRT() {
+	const u32 ft = (VU1.code >> 16) & 0x1F;
+	const u32 ftf = (VU1.code >> 23) & 0x3;
+	const int64_t q_off  = static_cast<int64_t>(offsetof(VURegs, q));
 
-void condEvilBranch(mV, a64::Condition JMPcc)
-{
-	if (mVUlow.badBranch)
+	// Phase 2: flush deferred ft writes before the direct memory Ldr.
+	vfCacheFlushOne(static_cast<int>(ft));
+
+	// Load and clamp ft
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, vfOff(ft) + ftf * 4));
+	emitVuDouble(w0, w2);
+	// Clear statusflag bits [5:4] on the pinned reg.
+	armAsm->Bic(VU1_STATUSFLAG_REG, VU1_STATUSFLAG_REG, 0x30);
+	// Convert to float
+	armAsm->Fmov(s0, w0);
+	// If negative: statusflag |= 0x10, use fabs
+	a64::Label notNeg, store;
+	armAsm->Fcmp(s0, 0.0);
+	armAsm->B(&notNeg, a64::ge);
+	armAsm->Orr(VU1_STATUSFLAG_REG, VU1_STATUSFLAG_REG, 0x10);
+	armAsm->Bind(&notNeg);
+	// sqrt(fabs(ft))
+	armAsm->Fabs(s0, s0);
+	armAsm->Fsqrt(s0, s0);
+	// Clamp result
+	armAsm->Fmov(w0, s0);
+	emitVuDouble(w0, w2);
+	armAsm->Str(w0, MemOperand(VU1_BASE_REG, q_off));
+}
+#endif
+
+#if ISTUB_VU_RSQRT
+REC_VU1_LOWER_INTERP(RSQRT)
+#else
+void recVU1_RSQRT() {
+	const u32 ft = (VU1.code >> 16) & 0x1F;
+	const u32 ftf = (VU1.code >> 23) & 0x3;
+	const u32 fs = (VU1.code >> 11) & 0x1F;
+	const u32 fsf = (VU1.code >> 21) & 0x3;
+	const int64_t q_off  = static_cast<int64_t>(offsetof(VURegs, q));
+
+	// Phase 2: flush deferred ft/fs writes before the direct memory Ldrs.
+	vfCacheFlushOne(static_cast<int>(ft));
+	vfCacheFlushOne(static_cast<int>(fs));
+
+	// Load raw bits
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, vfOff(ft) + ftf * 4));
+	armAsm->Ldr(w1, MemOperand(VU1_BASE_REG, vfOff(fs) + fsf * 4));
+	armAsm->Mov(w4, w0); // save raw ft
+	armAsm->Mov(w5, w1); // save raw fs
+	emitVuDouble(w0, w2);
+	emitVuDouble(w1, w2);
+	// Clear statusflag [5:4] on the pinned reg.
+	armAsm->Bic(VU1_STATUSFLAG_REG, VU1_STATUSFLAG_REG, 0x30);
+	armAsm->Fmov(s0, w0); // ft
+	armAsm->Fmov(s1, w1); // fs
+
+	a64::Label ftNotZero, done;
+	armAsm->Fcmp(s0, 0.0);
+	armAsm->B(&ftNotZero, a64::ne);
+
+	// --- ft == 0 ---
+	// statusflag |= 0x20
+	armAsm->Orr(VU1_STATUSFLAG_REG, VU1_STATUSFLAG_REG, 0x20);
+
+	a64::Label fsIsZero;
+	armAsm->Fcmp(s1, 0.0);
+	armAsm->B(&fsIsZero, a64::eq);
+
+	// fs != 0, ft == 0: q = ±max based on sign XOR
+	a64::Label diffSign1;
+	armAsm->Eor(w3, w4, w5);
+	armAsm->Tbnz(w3, 31, &diffSign1);
+	armAsm->Mov(w0, 0x7F7FFFFFu);
+	armAsm->Str(w0, MemOperand(VU1_BASE_REG, q_off));
+	armAsm->B(&done);
+	armAsm->Bind(&diffSign1);
+	armAsm->Mov(w0, 0xFF7FFFFFu);
+	armAsm->Str(w0, MemOperand(VU1_BASE_REG, q_off));
+	armAsm->B(&done);
+
+	armAsm->Bind(&fsIsZero);
+	// fs == 0, ft == 0: q = ±0, statusflag |= 0x10
+	armAsm->Orr(VU1_STATUSFLAG_REG, VU1_STATUSFLAG_REG, 0x10);
+	a64::Label diffSign2;
+	armAsm->Eor(w3, w4, w5);
+	armAsm->Tbnz(w3, 31, &diffSign2);
+	armAsm->Str(wzr, MemOperand(VU1_BASE_REG, q_off)); // +0
+	armAsm->B(&done);
+	armAsm->Bind(&diffSign2);
+	armAsm->Mov(w0, 0x80000000u);
+	armAsm->Str(w0, MemOperand(VU1_BASE_REG, q_off)); // -0
+	armAsm->B(&done);
+
+	// --- ft != 0 ---
+	armAsm->Bind(&ftNotZero);
+	// If ft < 0: statusflag |= 0x10 (on the pinned reg).
+	a64::Label ftPos;
+	armAsm->Fcmp(s0, 0.0);
+	armAsm->B(&ftPos, a64::ge);
+	armAsm->Orr(VU1_STATUSFLAG_REG, VU1_STATUSFLAG_REG, 0x10);
+	armAsm->Bind(&ftPos);
+	// temp = sqrt(fabs(ft)); q = fs / temp
+	armAsm->Fabs(s0, s0);
+	armAsm->Fsqrt(s0, s0);
+	armAsm->Fdiv(s2, s1, s0); // fs / sqrt(|ft|)
+	armAsm->Fmov(w0, s2);
+	emitVuDouble(w0, w2);
+	armAsm->Str(w0, MemOperand(VU1_BASE_REG, q_off));
+
+	armAsm->Bind(&done);
+}
+#endif
+
+#if ISTUB_VU_WAITQ
+REC_VU1_LOWER_INTERP(WAITQ)
+#else
+void recVU1_WAITQ() { /* NOP — no instructions to emit */ }
+#endif
+
+#if ISTUB_VU_WAITP
+REC_VU1_LOWER_INTERP(WAITP)
+#else
+void recVU1_WAITP() { /* NOP — no instructions to emit */ }
+#endif
+
+// ============================================================================
+//  Integer ALU
+// ============================================================================
+
+#if ISTUB_VU_IADD
+REC_VU1_LOWER_INTERP(IADD)
+#else
+void recVU1_IADD() {
+	const u32 id = (VU1.code >> 6) & 0xF;
+	if (id == 0) return;
+	const u32 is = (VU1.code >> 11) & 0xF;
+	const u32 it = (VU1.code >> 16) & 0xF;
+	emitBackupVI(id);
+	const auto regS = viCacheLoadResident(static_cast<int>(is));
+	const auto regT = viCacheLoadResident(static_cast<int>(it));
+	armAsm->Add(w0, regS, regT);
+	viCacheStore(static_cast<int>(id), w0);
+}
+#endif
+
+#if ISTUB_VU_ISUB
+REC_VU1_LOWER_INTERP(ISUB)
+#else
+void recVU1_ISUB() {
+	const u32 id = (VU1.code >> 6) & 0xF;
+	if (id == 0) return;
+	const u32 is = (VU1.code >> 11) & 0xF;
+	const u32 it = (VU1.code >> 16) & 0xF;
+	emitBackupVI(id);
+	const auto regS = viCacheLoadResident(static_cast<int>(is));
+	const auto regT = viCacheLoadResident(static_cast<int>(it));
+	armAsm->Sub(w0, regS, regT);
+	viCacheStore(static_cast<int>(id), w0);
+}
+#endif
+
+#if ISTUB_VU_IADDI
+REC_VU1_LOWER_INTERP(IADDI)
+#else
+void recVU1_IADDI() {
+	const u32 it = (VU1.code >> 16) & 0xF;
+	if (it == 0) return;
+	const u32 is = (VU1.code >> 11) & 0xF;
+	emitBackupVI(it);
+	const auto regS = viCacheLoadResident(static_cast<int>(is));
+	if (EmuConfig.Gamefixes.IbitHack)
 	{
-		mvuStr32(&mVU.branch, gprT1);
-		mvuStrImm32(&mVU.badBranch, branchAddr(mVU), gprT2);
-
-		armAsm->Cmp(gprT1.W(), 0);
-		a64::Label cJMP;
-		armAsm->B(&cJMP, JMPcc);
-			incPC(4); // Branch Not Taken Addr
-			mvuStrImm32(&mVU.badBranch, xPC, gprT1);
-			incPC(-4);
-		armAsm->Bind(&cJMP);
-		return;
-	}
-	if (isEvilBlock)
-	{
-		mvuStrImm32(&mVU.evilevilBranch, branchAddr(mVU), gprT2);
-		armAsm->Cmp(gprT1.W(), 0);
-		a64::Label cJMP;
-		armAsm->B(&cJMP, JMPcc);
-		mvuLdr32(gprT1, &mVU.evilBranch); // Branch Not Taken
-		armAsm->Add(gprT1.W(), gprT1.W(), 8); // We have already executed 1 instruction from the original branch
-		mvuStr32(&mVU.evilevilBranch, gprT1);
-		armAsm->Bind(&cJMP);
+		// Live 5-bit signed immediate from bits [10:6] of VU->code. Matches
+		// x86 microVU_Lower.inl IADDI IbitHack path (xSHL 21; xSAR 27).
+		armAsm->Ldr(w1, MemOperand(VU1_BASE_REG, static_cast<int64_t>(offsetof(VURegs, code))));
+		armAsm->Sbfx(w1, w1, 6, 5);
+		armAsm->Add(w0, regS, w1);
 	}
 	else
 	{
-		mvuStrImm32(&mVU.evilBranch, branchAddr(mVU), gprT2);
-		armAsm->Cmp(gprT1.W(), 0);
-		a64::Label cJMP;
-		armAsm->B(&cJMP, JMPcc);
-		mvuLdr32(gprT1, &mVU.badBranch); // Branch Not Taken
-		armAsm->Add(gprT1.W(), gprT1.W(), 8); // We have already executed 1 instruction from the original branch
-		mvuStr32(&mVU.evilBranch, gprT1);
-		armAsm->Bind(&cJMP);
-		incPC(-2);
-		if (mVUlow.branch >= 9)
-			DevCon.Warning("Conditional in JALR/JR delay slot - If game broken report to PCSX2 Team");
-		incPC(2);
+		// 5-bit signed immediate at bits [10:6], sign-extended at JIT time.
+		s32 imm = (VU1.code >> 6) & 0x1f;
+		imm = ((imm & 0x10) ? static_cast<s32>(0xfffffff0) : 0) | (imm & 0xf);
+		if (imm > 0)
+			armAsm->Add(w0, regS, imm);
+		else if (imm < 0)
+			armAsm->Sub(w0, regS, static_cast<u32>(-imm));
+		else
+			armAsm->Mov(w0, regS);
 	}
+	viCacheStore(static_cast<int>(it), w0);
 }
+#endif
 
-mVUop(mVU_B)
-{
-	setBranchA(mX, 1, 0);
-	pass1 { mVUanalyzeNormBranch(mVU, 0, false); }
-	pass2
+#if ISTUB_VU_IADDIU
+REC_VU1_LOWER_INTERP(IADDIU)
+#else
+void recVU1_IADDIU() {
+	const u32 it = (VU1.code >> 16) & 0xF;
+	if (it == 0) return;
+	const u32 is = (VU1.code >> 11) & 0xF;
+	emitBackupVI(it);
+	const auto regS = viCacheLoadResident(static_cast<int>(is));
+	if (EmuConfig.Gamefixes.IbitHack)
 	{
-		if (mVUlow.badBranch)  { mvuStrImm32(&mVU.badBranch, branchAddr(mVU), gprT1); }
-		if (mVUlow.evilBranch) { if (isEvilBlock) mvuStrImm32(&mVU.evilevilBranch, branchAddr(mVU), gprT1); else mvuStrImm32(&mVU.evilBranch, branchAddr(mVU), gprT1); }
-		mVU.profiler.EmitOp(opB);
+		// Live 15-bit unsigned immediate from VU->code: ((code >> 10) & 0x7800) | (code & 0x7FF).
+		// Mirrors x86 microVU_Lower.inl IADDIU IbitHack path.
+		armAsm->Ldr(w1, MemOperand(VU1_BASE_REG, static_cast<int64_t>(offsetof(VURegs, code))));
+		armAsm->Lsr(w2, w1, 10);
+		armAsm->And(w2, w2, 0x7800);
+		armAsm->And(w1, w1, 0x7FF);
+		armAsm->Orr(w1, w1, w2);
+		armAsm->Add(w0, regS, w1);
 	}
-	pass3 { mVUlog("B [<a href=\"#addr%04x\">%04x</a>]", branchAddr(mVU), branchAddr(mVU)); }
-}
-
-mVUop(mVU_BAL)
-{
-	setBranchA(mX, 2, _It_);
-	pass1 { mVUanalyzeNormBranch(mVU, _It_, true); }
-	pass2
+	else
 	{
-		if (!mVUlow.evilBranch)
+		// 15-bit unsigned immediate: bits [24:21] → [14:11], bits [10:0] → [10:0].
+		const u32 imm = ((VU1.code >> 10) & 0x7800) | (VU1.code & 0x7ff);
+		if (imm != 0)
 		{
-			const a64::Register regT = mVU.regAlloc->allocGPR(-1, _It_, mVUlow.backupVI);
-			armAsm->Mov(regT.W(), bSaveAddr);
-			mVU.regAlloc->clearNeeded(regT);
+			armAsm->Mov(w1, imm);
+			armAsm->Add(w0, regS, w1);
 		}
 		else
 		{
-			incPC(-2);
-			DevCon.Warning("Linking BAL from %s branch taken/not taken target! - If game broken report to PCSX2 Team", branchSTR[mVUlow.branch & 0xf]);
-			incPC(2);
-
-			const a64::Register regT = mVU.regAlloc->allocGPR(-1, _It_, mVUlow.backupVI);
-			if (isEvilBlock)
-				mvuLdr32(regT, &mVU.evilBranch);
-			else
-				mvuLdr32(regT, &mVU.badBranch);
-
-			armAsm->Add(regT.W(), regT.W(), 8);
-			armAsm->Lsr(regT.W(), regT.W(), 3);
-			mVU.regAlloc->clearNeeded(regT);
+			armAsm->Mov(w0, regS);
 		}
-
-		if (mVUlow.badBranch)  { mvuStrImm32(&mVU.badBranch, branchAddr(mVU), gprT1); }
-		if (mVUlow.evilBranch) { if (isEvilBlock) mvuStrImm32(&mVU.evilevilBranch, branchAddr(mVU), gprT1); else mvuStrImm32(&mVU.evilBranch, branchAddr(mVU), gprT1); }
-		mVU.profiler.EmitOp(opBAL);
 	}
-	pass3 { mVUlog("BAL vi%02d [<a href=\"#addr%04x\">%04x</a>]", _Ft_, branchAddr(mVU), branchAddr(mVU)); }
+	viCacheStore(static_cast<int>(it), w0);
 }
+#endif
 
-mVUop(mVU_IBEQ)
-{
-	setBranchA(mX, 3, 0);
-	pass1 { mVUanalyzeCondBranch2(mVU, _Is_, _It_); }
-	pass2
+#if ISTUB_VU_ISUBIU
+REC_VU1_LOWER_INTERP(ISUBIU)
+#else
+void recVU1_ISUBIU() {
+	const u32 it = (VU1.code >> 16) & 0xF;
+	if (it == 0) return;
+	const u32 is = (VU1.code >> 11) & 0xF;
+	emitBackupVI(it);
+	const auto regS = viCacheLoadResident(static_cast<int>(is));
+	if (EmuConfig.Gamefixes.IbitHack)
 	{
-		if (mVUlow.memReadIs)
-			mvuLdr32(gprT1, &mVU.VIbackup);
-		else
-			mVU.regAlloc->moveVIToGPR(gprT1, _Is_);
-
-		if (mVUlow.memReadIt)
+		armAsm->Ldr(w1, MemOperand(VU1_BASE_REG, static_cast<int64_t>(offsetof(VURegs, code))));
+		armAsm->Lsr(w2, w1, 10);
+		armAsm->And(w2, w2, 0x7800);
+		armAsm->And(w1, w1, 0x7FF);
+		armAsm->Orr(w1, w1, w2);
+		armAsm->Sub(w0, regS, w1);
+	}
+	else
+	{
+		const u32 imm = ((VU1.code >> 10) & 0x7800) | (VU1.code & 0x7ff);
+		if (imm != 0)
 		{
-			mvuLdr32(gprT2, &mVU.VIbackup);
-			armAsm->Eor(gprT1.W(), gprT1.W(), gprT2.W());
+			armAsm->Mov(w1, imm);
+			armAsm->Sub(w0, regS, w1);
 		}
 		else
 		{
-			const a64::Register regT = mVU.regAlloc->allocGPR(_It_);
-			armAsm->Eor(gprT1.W(), gprT1.W(), regT.W());
-			mVU.regAlloc->clearNeeded(regT);
+			armAsm->Mov(w0, regS);
 		}
-
-		if (!(isBadOrEvil))
-			mvuStr32(&mVU.branch, gprT1);
-		else
-			condEvilBranch(mVU, a64::eq);
-		mVU.profiler.EmitOp(opIBEQ);
 	}
-	pass3 { mVUlog("IBEQ vi%02d, vi%02d [<a href=\"#addr%04x\">%04x</a>]", _Ft_, _Fs_, branchAddr(mVU), branchAddr(mVU)); }
+	viCacheStore(static_cast<int>(it), w0);
+}
+#endif
+
+#if ISTUB_VU_IAND
+REC_VU1_LOWER_INTERP(IAND)
+#else
+void recVU1_IAND() {
+	const u32 id = (VU1.code >> 6) & 0xF;
+	if (id == 0) return;
+	const u32 is = (VU1.code >> 11) & 0xF;
+	const u32 it = (VU1.code >> 16) & 0xF;
+	emitBackupVI(id);
+	const auto regS = viCacheLoadResident(static_cast<int>(is));
+	const auto regT = viCacheLoadResident(static_cast<int>(it));
+	armAsm->And(w0, regS, regT);
+	viCacheStore(static_cast<int>(id), w0);
+}
+#endif
+
+#if ISTUB_VU_IOR
+REC_VU1_LOWER_INTERP(IOR)
+#else
+void recVU1_IOR() {
+	const u32 id = (VU1.code >> 6) & 0xF;
+	if (id == 0) return;
+	const u32 is = (VU1.code >> 11) & 0xF;
+	const u32 it = (VU1.code >> 16) & 0xF;
+	emitBackupVI(id);
+	const auto regS = viCacheLoadResident(static_cast<int>(is));
+	const auto regT = viCacheLoadResident(static_cast<int>(it));
+	armAsm->Orr(w0, regS, regT);
+	viCacheStore(static_cast<int>(id), w0);
+}
+#endif
+
+// ============================================================================
+//  Load / Store (VU data memory)
+// ============================================================================
+
+// Decode the 10-bit signed immediate used by LQ/SQ/ILW/ISW.
+static inline s32 decodeVuImm10(u32 code)
+{
+	return (code & 0x400) ? static_cast<s32>((code & 0x3ff) | 0xfffffc00u)
+	                      : static_cast<s32>(code & 0x3ff);
 }
 
-mVUop(mVU_IBGEZ)
+// Compute the effective VU1.Mem byte offset for (VI[is_reg] + imm) * 16,
+// masked to 14 bits with 16-byte alignment (matches u16 cast + & 0x3FFF).
+// Result: w0 = 14-bit masked offset (and x0 holds the zero-extended version).
+// Clobbers w0.
+//
+// VI cache: source VI loaded via viCacheLoadSignedInto so vireg==0 routes
+// to `Mov w0, wzr` (vixl's Sxth rejects wzr-source). One extra insn vs the
+// old direct Ldrsh on cache miss; saves the entire load on subsequent uses
+// of the same VI in the block.
+static void emitComputeVuMemOffset(u32 is_reg, s32 imm)
 {
-	setBranchA(mX, 4, 0);
-	pass1 { mVUanalyzeCondBranch1(mVU, _Is_); }
-	pass2
-	{
-		if (mVUlow.memReadIs)
-			mvuLdr32(gprT1, &mVU.VIbackup);
-		else
-			mVU.regAlloc->moveVIToGPR(gprT1, _Is_);
-		if (!(isBadOrEvil))
-			mvuStr32(&mVU.branch, gprT1);
-		else
-			condEvilBranch(mVU, a64::ge);
-		mVU.profiler.EmitOp(opIBGEZ);
-	}
-	pass3 { mVUlog("IBGEZ vi%02d [<a href=\"#addr%04x\">%04x</a>]", _Fs_, branchAddr(mVU), branchAddr(mVU)); }
+	viCacheLoadSignedInto(static_cast<int>(is_reg), w0);
+	if (imm > 0)
+		armAsm->Add(w0, w0, imm);
+	else if (imm < 0)
+		armAsm->Sub(w0, w0, static_cast<u32>(-imm));
+	armAsm->Lsl(w0, w0, 4);
+	armAsm->And(w0, w0, 0x3FF0);
 }
 
-mVUop(mVU_IBGTZ)
-{
-	setBranchA(mX, 5, 0);
-	pass1 { mVUanalyzeCondBranch1(mVU, _Is_); }
-	pass2
+#if ISTUB_VU_LQ
+REC_VU1_LOWER_INTERP(LQ)
+#else
+void recVU1_LQ() {
+	// IbitHack: route to C wrapper which reads VU->code at runtime. Block
+	// dispatcher's live-Ldr keeps VU->code aligned with post-compile patches.
+	if (EmuConfig.Gamefixes.IbitHack)
 	{
-		if (mVUlow.memReadIs)
-			mvuLdr32(gprT1, &mVU.VIbackup);
-		else
-			mVU.regAlloc->moveVIToGPR(gprT1, _Is_);
-		if (!(isBadOrEvil))
-			mvuStr32(&mVU.branch, gprT1);
-		else
-			condEvilBranch(mVU, a64::gt);
-		mVU.profiler.EmitOp(opIBGTZ);
+		armAsm->Mov(x0, VU1_BASE_REG);
+		emitVu1Call(reinterpret_cast<const void*>(vu1_LQ));
+		return;
 	}
-	pass3 { mVUlog("IBGTZ vi%02d [<a href=\"#addr%04x\">%04x</a>]", _Fs_, branchAddr(mVU), branchAddr(mVU)); }
-}
+	const u32 ft = W_Ft(&VU1);
+	if (ft == 0) return;
+	const u32 is = W_Is(&VU1);
+	const u32 xyzw = W_XYZW(&VU1);
+	const s32 imm = decodeVuImm10(VU1.code);
+	const int64_t mem_off = static_cast<int64_t>(offsetof(VURegs, Mem));
 
-mVUop(mVU_IBLEZ)
-{
-	setBranchA(mX, 6, 0);
-	pass1 { mVUanalyzeCondBranch1(mVU, _Is_); }
-	pass2
+	// Phase 2: this emitter writes VU1.VF[ft] memory directly. Drop any
+	// cached copy of ft (after flushing dirty lanes that LQ won't overwrite)
+	// so next reads reload from the freshly-stored memory.
+	vfCacheFlushOne(static_cast<int>(ft));
+
+	emitComputeVuMemOffset(is, imm);
+	armAsm->Ldr(x1, MemOperand(VU1_BASE_REG, mem_off));
+	armAsm->Add(x1, x1, x0); // x0 is zero-extended from And
+
+	if (xyzw == 0xF)
 	{
-		if (mVUlow.memReadIs)
-			mvuLdr32(gprT1, &mVU.VIbackup);
-		else
-			mVU.regAlloc->moveVIToGPR(gprT1, _Is_);
-		if (!(isBadOrEvil))
-			mvuStr32(&mVU.branch, gprT1);
-		else
-			condEvilBranch(mVU, a64::le);
-		mVU.profiler.EmitOp(opIBLEZ);
+		armAsm->Ldr(q0, MemOperand(x1));
+		armAsm->Str(q0, MemOperand(VU1_BASE_REG, vfOff(ft)));
 	}
-	pass3 { mVUlog("IBLEZ vi%02d [<a href=\"#addr%04x\">%04x</a>]", _Fs_, branchAddr(mVU), branchAddr(mVU)); }
-}
-
-mVUop(mVU_IBLTZ)
-{
-	setBranchA(mX, 7, 0);
-	pass1 { mVUanalyzeCondBranch1(mVU, _Is_); }
-	pass2
+	else
 	{
-		if (mVUlow.memReadIs)
-			mvuLdr32(gprT1, &mVU.VIbackup);
-		else
-			mVU.regAlloc->moveVIToGPR(gprT1, _Is_);
-		if (!(isBadOrEvil))
-			mvuStr32(&mVU.branch, gprT1);
-		else
-			condEvilBranch(mVU, a64::lt);
-		mVU.profiler.EmitOp(opIBLTZ);
+		if (xyzw & 8) { armAsm->Ldr(w2, MemOperand(x1,  0)); armAsm->Str(w2, MemOperand(VU1_BASE_REG, vfOff(ft) +  0)); }
+		if (xyzw & 4) { armAsm->Ldr(w2, MemOperand(x1,  4)); armAsm->Str(w2, MemOperand(VU1_BASE_REG, vfOff(ft) +  4)); }
+		if (xyzw & 2) { armAsm->Ldr(w2, MemOperand(x1,  8)); armAsm->Str(w2, MemOperand(VU1_BASE_REG, vfOff(ft) +  8)); }
+		if (xyzw & 1) { armAsm->Ldr(w2, MemOperand(x1, 12)); armAsm->Str(w2, MemOperand(VU1_BASE_REG, vfOff(ft) + 12)); }
 	}
-	pass3 { mVUlog("IBLTZ vi%02d [<a href=\"#addr%04x\">%04x</a>]", _Fs_, branchAddr(mVU), branchAddr(mVU)); }
 }
+#endif
 
-mVUop(mVU_IBNE)
-{
-	setBranchA(mX, 8, 0);
-	pass1 { mVUanalyzeCondBranch2(mVU, _Is_, _It_); }
-	pass2
+#if ISTUB_VU_LQD
+REC_VU1_LOWER_INTERP(LQD)
+#else
+void recVU1_LQD() {
+	const u32 ft = W_Ft(&VU1);
+	const u32 is = W_Is(&VU1);
+	const u32 xyzw = W_XYZW(&VU1);
+	const int64_t mem_off = static_cast<int64_t>(offsetof(VURegs, Mem));
+
+	// Interpreter unconditionally backs up VI[is] before the decrement.
+	emitBackupVI(is);
+
+	// L-1 fix (parallels VU0 D-4): always compute VI[is] - 1 into w2 and use
+	// it for the address, even when is == 0. x86 microVU allocates a reg for
+	// VI[0]=0, DECs it, and uses (u16)-1 * 16 = 0x3FF0 (post-mask) as the
+	// address. Writeback to VI[is] is still gated on is != 0 so the VI[0]
+	// hardwired-zero invariant is preserved in memory.
 	{
-		if (mVUlow.memReadIs)
-			mvuLdr32(gprT1, &mVU.VIbackup);
-		else
-			mVU.regAlloc->moveVIToGPR(gprT1, _Is_);
+		const auto srcVi = viCacheLoadResident(static_cast<int>(is));
+		armAsm->Sub(w2, srcVi, 1);
+	}
+	if (is != 0)
+		viCacheStore(static_cast<int>(is), w2);
 
-		if (mVUlow.memReadIt)
+	if (ft == 0) return;
+
+	// Phase 2: drop any cached copy of ft — the inline Str writes memory
+	// directly. Flushes dirty lanes that LQD won't overwrite.
+	vfCacheFlushOne(static_cast<int>(ft));
+
+	// Address = w2 * 16 masked to 14 bits (interpreter uses US[0] unsigned,
+	// but the final & 0x3FF0 mask makes sign irrelevant).
+	armAsm->Lsl(w0, w2, 4);
+	armAsm->And(w0, w0, 0x3FF0);
+	armAsm->Ldr(x1, MemOperand(VU1_BASE_REG, mem_off));
+	armAsm->Add(x1, x1, x0);
+
+	if (xyzw == 0xF)
+	{
+		armAsm->Ldr(q0, MemOperand(x1));
+		armAsm->Str(q0, MemOperand(VU1_BASE_REG, vfOff(ft)));
+	}
+	else
+	{
+		if (xyzw & 8) { armAsm->Ldr(w2, MemOperand(x1,  0)); armAsm->Str(w2, MemOperand(VU1_BASE_REG, vfOff(ft) +  0)); }
+		if (xyzw & 4) { armAsm->Ldr(w2, MemOperand(x1,  4)); armAsm->Str(w2, MemOperand(VU1_BASE_REG, vfOff(ft) +  4)); }
+		if (xyzw & 2) { armAsm->Ldr(w2, MemOperand(x1,  8)); armAsm->Str(w2, MemOperand(VU1_BASE_REG, vfOff(ft) +  8)); }
+		if (xyzw & 1) { armAsm->Ldr(w2, MemOperand(x1, 12)); armAsm->Str(w2, MemOperand(VU1_BASE_REG, vfOff(ft) + 12)); }
+	}
+}
+#endif
+
+#if ISTUB_VU_LQI
+REC_VU1_LOWER_INTERP(LQI)
+#else
+void recVU1_LQI() {
+	const u32 ft = W_Ft(&VU1);
+	const u32 is = W_Is(&VU1);
+	const u32 fs = W_Fs(&VU1); // interpreter gates the increment on W_Fs (bit 15 quirk)
+	const u32 xyzw = W_XYZW(&VU1);
+	const int64_t mem_off = static_cast<int64_t>(offsetof(VURegs, Mem));
+
+	emitBackupVI(is);
+
+	// Load uses VI[is] pre-increment.
+	if (ft != 0)
+	{
+		// Phase 2: drop any cached copy of ft — inline Str writes memory.
+		vfCacheFlushOne(static_cast<int>(ft));
+
+		emitComputeVuMemOffset(is, 0);
+		armAsm->Ldr(x1, MemOperand(VU1_BASE_REG, mem_off));
+		armAsm->Add(x1, x1, x0);
+
+		if (xyzw == 0xF)
 		{
-			mvuLdr32(gprT2, &mVU.VIbackup);
-			armAsm->Eor(gprT1.W(), gprT1.W(), gprT2.W());
+			armAsm->Ldr(q0, MemOperand(x1));
+			armAsm->Str(q0, MemOperand(VU1_BASE_REG, vfOff(ft)));
 		}
 		else
 		{
-			const a64::Register regT = mVU.regAlloc->allocGPR(_It_);
-			armAsm->Eor(gprT1.W(), gprT1.W(), regT.W());
-			mVU.regAlloc->clearNeeded(regT);
+			if (xyzw & 8) { armAsm->Ldr(w2, MemOperand(x1,  0)); armAsm->Str(w2, MemOperand(VU1_BASE_REG, vfOff(ft) +  0)); }
+			if (xyzw & 4) { armAsm->Ldr(w2, MemOperand(x1,  4)); armAsm->Str(w2, MemOperand(VU1_BASE_REG, vfOff(ft) +  4)); }
+			if (xyzw & 2) { armAsm->Ldr(w2, MemOperand(x1,  8)); armAsm->Str(w2, MemOperand(VU1_BASE_REG, vfOff(ft) +  8)); }
+			if (xyzw & 1) { armAsm->Ldr(w2, MemOperand(x1, 12)); armAsm->Str(w2, MemOperand(VU1_BASE_REG, vfOff(ft) + 12)); }
 		}
-
-		if (!(isBadOrEvil))
-			mvuStr32(&mVU.branch, gprT1);
-		else
-			condEvilBranch(mVU, a64::ne);
-		mVU.profiler.EmitOp(opIBNE);
 	}
-	pass3 { mVUlog("IBNE vi%02d, vi%02d [<a href=\"#addr%04x\">%04x</a>]", _Ft_, _Fs_, branchAddr(mVU), branchAddr(mVU)); }
-}
 
-void normJumpPass2(mV)
-{
-	if (!mVUlow.constJump.isValid || mVUlow.evilBranch)
+	// Post-increment — interpreter gates on fs != 0, not is != 0.
+	if (fs != 0)
 	{
-		mVU.regAlloc->moveVIToGPR(gprT1, _Is_);
-		armAsm->Lsl(gprT1.W(), gprT1.W(), 3);
-		armAsm->And(gprT1.W(), gprT1.W(), mVU.microMemSize - 8);
-
-		if (!mVUlow.evilBranch)
-		{
-			mvuStr32(&mVU.branch, gprT1);
-		}
-		else
-		{
-			if (isEvilBlock)
-				mvuStr32(&mVU.evilevilBranch, gprT1);
-			else
-				mvuStr32(&mVU.evilBranch, gprT1);
-		}
-		//If delay slot is conditional, it uses badBranch to go to its target
-		if (mVUlow.badBranch)
-		{
-			mvuStr32(&mVU.badBranch, gprT1);
-		}
+		const auto srcVi = viCacheLoadResident(static_cast<int>(is));
+		armAsm->Add(w2, srcVi, 1);
+		viCacheStore(static_cast<int>(is), w2);
 	}
 }
+#endif
 
-mVUop(mVU_JR)
-{
-	mVUbranch = 9;
-	pass1 { mVUanalyzeJump(mVU, _Is_, 0, false); }
-	pass2
+#if ISTUB_VU_SQ
+REC_VU1_LOWER_INTERP(SQ)
+#else
+void recVU1_SQ() {
+	if (EmuConfig.Gamefixes.IbitHack)
 	{
-		normJumpPass2(mVU);
-		mVU.profiler.EmitOp(opJR);
+		armAsm->Mov(x0, VU1_BASE_REG);
+		emitVu1Call(reinterpret_cast<const void*>(vu1_SQ));
+		return;
 	}
-	pass3 { mVUlog("JR [vi%02d]", _Fs_); }
-}
+	const u32 fs = W_Fs(&VU1);
+	const u32 it = W_It(&VU1); // SQ uses It as the base register
+	const u32 xyzw = W_XYZW(&VU1);
+	const s32 imm = decodeVuImm10(VU1.code);
+	const int64_t mem_off = static_cast<int64_t>(offsetof(VURegs, Mem));
 
-mVUop(mVU_JALR)
-{
-	mVUbranch = 10;
-	pass1 { mVUanalyzeJump(mVU, _Is_, _It_, 1); }
-	pass2
+	// Phase 2: SQ reads VF[fs] from memory directly. Flush any deferred
+	// dirty lanes of fs so the inline Ldrs see coherent data. Drops the
+	// cache slot — fs is unlikely to be read again (typical SQ pattern is
+	// "transform → SQ → next vertex"). If kept-cached SQ becomes a hot
+	// pattern, switch to a flush-without-invalidate variant.
+	vfCacheFlushOne(static_cast<int>(fs));
+
+	emitComputeVuMemOffset(it, imm);
+	armAsm->Ldr(x1, MemOperand(VU1_BASE_REG, mem_off));
+	armAsm->Add(x1, x1, x0);
+
+	if (xyzw == 0xF)
 	{
-		normJumpPass2(mVU);
-		if (!mVUlow.evilBranch)
-		{
-			const a64::Register regT = mVU.regAlloc->allocGPR(-1, _It_, mVUlow.backupVI);
-			armAsm->Mov(regT.W(), bSaveAddr);
-			mVU.regAlloc->clearNeeded(regT);
-		}
-		if (mVUlow.evilBranch)
-		{
-			const a64::Register regT = mVU.regAlloc->allocGPR(-1, _It_, mVUlow.backupVI);
-			if (isEvilBlock)
-			{
-				mvuLdr32(regT, &mVU.evilBranch);
-				armAsm->Add(regT.W(), regT.W(), 8);
-				armAsm->Lsr(regT.W(), regT.W(), 3);
-			}
-			else
-			{
-				incPC(-2);
-				DevCon.Warning("Linking JALR from %s branch taken/not taken target! - If game broken report to PCSX2 Team", branchSTR[mVUlow.branch & 0xf]);
-				incPC(2);
-
-				mvuLdr32(regT, &mVU.badBranch);
-				armAsm->Add(regT.W(), regT.W(), 8);
-				armAsm->Lsr(regT.W(), regT.W(), 3);
-			}
-			mVU.regAlloc->clearNeeded(regT);
-		}
-
-		mVU.profiler.EmitOp(opJALR);
+		armAsm->Ldr(q0, MemOperand(VU1_BASE_REG, vfOff(fs)));
+		armAsm->Str(q0, MemOperand(x1));
 	}
-	pass3 { mVUlog("JALR vi%02d, [vi%02d]", _Ft_, _Fs_); }
+	else
+	{
+		if (xyzw & 8) { armAsm->Ldr(w2, MemOperand(VU1_BASE_REG, vfOff(fs) +  0)); armAsm->Str(w2, MemOperand(x1,  0)); }
+		if (xyzw & 4) { armAsm->Ldr(w2, MemOperand(VU1_BASE_REG, vfOff(fs) +  4)); armAsm->Str(w2, MemOperand(x1,  4)); }
+		if (xyzw & 2) { armAsm->Ldr(w2, MemOperand(VU1_BASE_REG, vfOff(fs) +  8)); armAsm->Str(w2, MemOperand(x1,  8)); }
+		if (xyzw & 1) { armAsm->Ldr(w2, MemOperand(VU1_BASE_REG, vfOff(fs) + 12)); armAsm->Str(w2, MemOperand(x1, 12)); }
+	}
+}
+#endif
+
+#if ISTUB_VU_SQD
+REC_VU1_LOWER_INTERP(SQD)
+#else
+void recVU1_SQD() {
+	const u32 fs = W_Fs(&VU1);
+	const u32 it = W_It(&VU1);
+	const u32 ft = W_Ft(&VU1); // interpreter gates the decrement on W_Ft, not W_It
+	const u32 xyzw = W_XYZW(&VU1);
+	const int64_t mem_off = static_cast<int64_t>(offsetof(VURegs, Mem));
+
+	// Phase 2: SQD reads VF[fs] from memory. Flush any deferred fs writes.
+	vfCacheFlushOne(static_cast<int>(fs));
+
+	emitBackupVI(it);
+
+	// L-1 fix (parallels VU0 D-4): decrement path uses the decremented value
+	// for the address even when it == 0 (x86 wraps to offset 0x3FF0). The
+	// writeback guard `ft != 0` comes from the interp's SQD-Ft==0-is-NOP
+	// quirk; the `it != 0` addition protects VI[0]'s hardwired invariant.
+	// When ft == 0 we leave VI[it] untouched and use the un-decremented
+	// value for the address (matches interp — SQD Ft==0 still stores).
+	if (ft != 0)
+	{
+		const auto srcVi = viCacheLoadResident(static_cast<int>(it));
+		armAsm->Sub(w2, srcVi, 1);
+		if (it != 0)
+			viCacheStore(static_cast<int>(it), w2);
+		armAsm->Lsl(w0, w2, 4);
+		armAsm->And(w0, w0, 0x3FF0);
+	}
+	else
+	{
+		emitComputeVuMemOffset(it, 0);
+	}
+	armAsm->Ldr(x1, MemOperand(VU1_BASE_REG, mem_off));
+	armAsm->Add(x1, x1, x0);
+
+	if (xyzw == 0xF)
+	{
+		armAsm->Ldr(q0, MemOperand(VU1_BASE_REG, vfOff(fs)));
+		armAsm->Str(q0, MemOperand(x1));
+	}
+	else
+	{
+		if (xyzw & 8) { armAsm->Ldr(w2, MemOperand(VU1_BASE_REG, vfOff(fs) +  0)); armAsm->Str(w2, MemOperand(x1,  0)); }
+		if (xyzw & 4) { armAsm->Ldr(w2, MemOperand(VU1_BASE_REG, vfOff(fs) +  4)); armAsm->Str(w2, MemOperand(x1,  4)); }
+		if (xyzw & 2) { armAsm->Ldr(w2, MemOperand(VU1_BASE_REG, vfOff(fs) +  8)); armAsm->Str(w2, MemOperand(x1,  8)); }
+		if (xyzw & 1) { armAsm->Ldr(w2, MemOperand(VU1_BASE_REG, vfOff(fs) + 12)); armAsm->Str(w2, MemOperand(x1, 12)); }
+	}
+}
+#endif
+
+#if ISTUB_VU_SQI
+REC_VU1_LOWER_INTERP(SQI)
+#else
+void recVU1_SQI() {
+	const u32 fs = W_Fs(&VU1);
+	const u32 it = W_It(&VU1);
+	const u32 ft = W_Ft(&VU1);
+	const u32 xyzw = W_XYZW(&VU1);
+	const int64_t mem_off = static_cast<int64_t>(offsetof(VURegs, Mem));
+
+	// Phase 2: SQI reads VF[fs] from memory. Flush any deferred fs writes.
+	vfCacheFlushOne(static_cast<int>(fs));
+
+	emitBackupVI(it);
+
+	emitComputeVuMemOffset(it, 0);
+	armAsm->Ldr(x1, MemOperand(VU1_BASE_REG, mem_off));
+	armAsm->Add(x1, x1, x0);
+
+	if (xyzw == 0xF)
+	{
+		armAsm->Ldr(q0, MemOperand(VU1_BASE_REG, vfOff(fs)));
+		armAsm->Str(q0, MemOperand(x1));
+	}
+	else
+	{
+		if (xyzw & 8) { armAsm->Ldr(w2, MemOperand(VU1_BASE_REG, vfOff(fs) +  0)); armAsm->Str(w2, MemOperand(x1,  0)); }
+		if (xyzw & 4) { armAsm->Ldr(w2, MemOperand(VU1_BASE_REG, vfOff(fs) +  4)); armAsm->Str(w2, MemOperand(x1,  4)); }
+		if (xyzw & 2) { armAsm->Ldr(w2, MemOperand(VU1_BASE_REG, vfOff(fs) +  8)); armAsm->Str(w2, MemOperand(x1,  8)); }
+		if (xyzw & 1) { armAsm->Ldr(w2, MemOperand(VU1_BASE_REG, vfOff(fs) + 12)); armAsm->Str(w2, MemOperand(x1, 12)); }
+	}
+
+	// Post-increment — same W_Ft gate as SQD's decrement. Writeback
+	// additionally gated on it != 0 so VI[0]'s hardwired-zero invariant
+	// is preserved (matches the L-1 fix pattern for SQD).
+	if (ft != 0 && it != 0)
+	{
+		const auto srcVi = viCacheLoadResident(static_cast<int>(it));
+		armAsm->Add(w2, srcVi, 1);
+		viCacheStore(static_cast<int>(it), w2);
+	}
+}
+#endif
+
+#if ISTUB_VU_ILW
+REC_VU1_LOWER_INTERP(ILW)
+#else
+void recVU1_ILW() {
+	if (EmuConfig.Gamefixes.IbitHack)
+	{
+		armAsm->Mov(x0, VU1_BASE_REG);
+		emitVu1Call(reinterpret_cast<const void*>(vu1_ILW));
+		return;
+	}
+	const u32 it = W_It(&VU1);
+	if (it == 0) return;
+	const u32 is = W_Is(&VU1);
+	const u32 xyzw = W_XYZW(&VU1);
+	const s32 imm = decodeVuImm10(VU1.code);
+	const int64_t mem_off = static_cast<int64_t>(offsetof(VURegs, Mem));
+
+	emitComputeVuMemOffset(is, imm);
+	armAsm->Ldr(x1, MemOperand(VU1_BASE_REG, mem_off));
+	armAsm->Add(x1, x1, x0);
+
+	// First-set-wins priority (X>Y>Z>W) — matches x86 microVU's offsetSS
+	// selection (_X ? 0 : _Y ? 4 : _Z ? 8 : 12). Only diverges from the
+	// previous last-set-wins sequential-if order when multiple lane bits
+	// are set (invalid encoding). Fixes L-2 / D-5 parallel.
+	if      (xyzw & 8) { armAsm->Ldrh(w2, MemOperand(x1,  0)); viCacheStore(static_cast<int>(it), w2); }
+	else if (xyzw & 4) { armAsm->Ldrh(w2, MemOperand(x1,  4)); viCacheStore(static_cast<int>(it), w2); }
+	else if (xyzw & 2) { armAsm->Ldrh(w2, MemOperand(x1,  8)); viCacheStore(static_cast<int>(it), w2); }
+	else if (xyzw & 1) { armAsm->Ldrh(w2, MemOperand(x1, 12)); viCacheStore(static_cast<int>(it), w2); }
+}
+#endif
+
+#if ISTUB_VU_ISW
+REC_VU1_LOWER_INTERP(ISW)
+#else
+void recVU1_ISW() {
+	if (EmuConfig.Gamefixes.IbitHack)
+	{
+		armAsm->Mov(x0, VU1_BASE_REG);
+		emitVu1Call(reinterpret_cast<const void*>(vu1_ISW));
+		return;
+	}
+	const u32 it = W_It(&VU1);
+	const u32 is = W_Is(&VU1);
+	const u32 xyzw = W_XYZW(&VU1);
+	const s32 imm = decodeVuImm10(VU1.code);
+	const int64_t mem_off = static_cast<int64_t>(offsetof(VURegs, Mem));
+
+	emitComputeVuMemOffset(is, imm);
+	armAsm->Ldr(x1, MemOperand(VU1_BASE_REG, mem_off));
+	armAsm->Add(x1, x1, x0);
+
+	// Source is VI[it].US[0] zero-extended; wrapper stores the u16 then zeros
+	// the next u16, which equals a 32-bit store of the zero-extended value.
+	const auto regT = viCacheLoadResident(static_cast<int>(it));
+	if (xyzw & 8) armAsm->Str(regT, MemOperand(x1,  0));
+	if (xyzw & 4) armAsm->Str(regT, MemOperand(x1,  4));
+	if (xyzw & 2) armAsm->Str(regT, MemOperand(x1,  8));
+	if (xyzw & 1) armAsm->Str(regT, MemOperand(x1, 12));
+}
+#endif
+
+#if ISTUB_VU_ILWR
+REC_VU1_LOWER_INTERP(ILWR)
+#else
+void recVU1_ILWR() {
+	const u32 it = W_It(&VU1);
+	if (it == 0) return;
+	const u32 is = W_Is(&VU1);
+	const u32 xyzw = W_XYZW(&VU1);
+	const int64_t mem_off = static_cast<int64_t>(offsetof(VURegs, Mem));
+
+	emitBackupVI(it);
+
+	emitComputeVuMemOffset(is, 0);
+	armAsm->Ldr(x1, MemOperand(VU1_BASE_REG, mem_off));
+	armAsm->Add(x1, x1, x0);
+
+	// First-set-wins priority (X>Y>Z>W) — matches x86 microVU's offsetSS.
+	if      (xyzw & 8) { armAsm->Ldrh(w2, MemOperand(x1,  0)); viCacheStore(static_cast<int>(it), w2); }
+	else if (xyzw & 4) { armAsm->Ldrh(w2, MemOperand(x1,  4)); viCacheStore(static_cast<int>(it), w2); }
+	else if (xyzw & 2) { armAsm->Ldrh(w2, MemOperand(x1,  8)); viCacheStore(static_cast<int>(it), w2); }
+	else if (xyzw & 1) { armAsm->Ldrh(w2, MemOperand(x1, 12)); viCacheStore(static_cast<int>(it), w2); }
+}
+#endif
+
+#if ISTUB_VU_ISWR
+REC_VU1_LOWER_INTERP(ISWR)
+#else
+void recVU1_ISWR() {
+	const u32 it = W_It(&VU1);
+	const u32 is = W_Is(&VU1);
+	const u32 xyzw = W_XYZW(&VU1);
+	const int64_t mem_off = static_cast<int64_t>(offsetof(VURegs, Mem));
+
+	emitComputeVuMemOffset(is, 0);
+	armAsm->Ldr(x1, MemOperand(VU1_BASE_REG, mem_off));
+	armAsm->Add(x1, x1, x0);
+
+	// Source is VI[it].US[0] zero-extended to 32 bits (interpreter stores the
+	// u16 then zeros the adjacent u16 — equivalent to a 32-bit zero-extended store).
+	const auto regT = viCacheLoadResident(static_cast<int>(it));
+	if (xyzw & 8) armAsm->Str(regT, MemOperand(x1,  0));
+	if (xyzw & 4) armAsm->Str(regT, MemOperand(x1,  4));
+	if (xyzw & 2) armAsm->Str(regT, MemOperand(x1,  8));
+	if (xyzw & 1) armAsm->Str(regT, MemOperand(x1, 12));
+}
+#endif
+
+// ============================================================================
+//  Branches
+// ============================================================================
+
+// Emit inline vu1SetBranch(VU, bpc). bpc is in w_bpc. Clobbers w4, w5.
+// Mirrors _setBranch() in VUops.cpp: if already in a delay slot (branch==1),
+// deferred onto delaybranchpc/takedelaybranch; otherwise sets branch=2 and
+// branchpc so the per-pair countdown (step 12) fires it two pairs later.
+static void emitInlineSetBranch(const Register& w_bpc)
+{
+	const int64_t branch_off        = static_cast<int64_t>(offsetof(VURegs, branch));
+	const int64_t branchpc_off      = static_cast<int64_t>(offsetof(VURegs, branchpc));
+	const int64_t delaybranchpc_off = static_cast<int64_t>(offsetof(VURegs, delaybranchpc));
+	const int64_t takedelay_off     = static_cast<int64_t>(offsetof(VURegs, takedelaybranch));
+
+	a64::Label is_delay, done;
+	armAsm->Ldr(w4, MemOperand(VU1_BASE_REG, branch_off));
+	armAsm->Cmp(w4, 1);
+	armAsm->B(&is_delay, a64::eq);
+
+	// Normal path: branch != 1 → set branch=2, branchpc=bpc
+	armAsm->Mov(w5, 2);
+	armAsm->Str(w5, MemOperand(VU1_BASE_REG, branch_off));
+	armAsm->Str(w_bpc, MemOperand(VU1_BASE_REG, branchpc_off));
+	armAsm->B(&done);
+
+	// Delay-slot-in-delay-slot path: branch == 1 → queue via delaybranchpc
+	armAsm->Bind(&is_delay);
+	armAsm->Str(w_bpc, MemOperand(VU1_BASE_REG, delaybranchpc_off));
+	armAsm->Mov(w5, 1);
+	armAsm->Strb(w5, MemOperand(VU1_BASE_REG, takedelay_off));
+
+	armAsm->Bind(&done);
 }
 
-#undef gprT1q
-#undef gprT2q
+// Emit hazard-corrected VI[reg].US[0] read.
+// The 2-cycle integer pipeline hazard: if VIBackupCycles > 0 and VIRegNumber
+// matches `reg`, return VIOldValue (which holds the pre-write u16) instead of
+// VI[reg].US[0]. reg is a compile-time constant.
+//   dest  : destination w-reg (result)
+//   reg   : VI register number (0..15)
+//   signed_read : emit Ldrsh instead of Ldrh (so IBLTZ/IBGTZ/etc. can compare signed)
+//   w_tmp : scratch w-reg, clobbered
+static void emitHazardVIRead(const Register& dest, u32 reg, bool signed_read, const Register& w_tmp)
+{
+	const int64_t vibackup_off = static_cast<int64_t>(offsetof(VURegs, VIBackupCycles));
+	const int64_t viregnum_off = static_cast<int64_t>(offsetof(VURegs, VIRegNumber));
+	const int64_t violdval_off = static_cast<int64_t>(offsetof(VURegs, VIOldValue));
+
+	// VI cache: under write-through, memory and the cached slot are coherent.
+	// Use the cached value when available. The signed path goes through
+	// viCacheLoadSignedInto so vireg==0 routes to Mov-wzr (vixl's Sxth
+	// rejects wzr-source); the unsigned path uses LoadResident directly
+	// since wzr is a valid source for Mov.
+	if (signed_read)
+	{
+		viCacheLoadSignedInto(static_cast<int>(reg), dest);
+	}
+	else
+	{
+		const auto srcVi = viCacheLoadResident(static_cast<int>(reg));
+		if (dest.GetCode() != srcVi.GetCode())
+			armAsm->Mov(dest, srcVi);
+	}
+
+	a64::Label done;
+	armAsm->Ldrb(w_tmp, MemOperand(VU1_BASE_REG, vibackup_off));
+	armAsm->Cbz(w_tmp, &done);                       // no backup active
+	armAsm->Ldr(w_tmp, MemOperand(VU1_BASE_REG, viregnum_off));
+	armAsm->Cmp(w_tmp, reg);
+	armAsm->B(&done, a64::ne);                        // different reg
+	// VIOldValue is u32 but holds the original u16 in its low halfword.
+	// Ldrsh/Ldrh from the low halfword matches the interpreter's
+	// `src = VU->VIOldValue` (truncation to s16 / u16 on assignment).
+	if (signed_read)
+		armAsm->Ldrsh(dest, MemOperand(VU1_BASE_REG, violdval_off));
+	else
+		armAsm->Ldrh(dest, MemOperand(VU1_BASE_REG, violdval_off));
+	armAsm->Bind(&done);
+}
+
+// Compute compile-time branch target for PC-relative branches (B/BAL/IBxx).
+// At emit time, step 2 of the per-pair loop has already stored
+// (pair_pc+8) & VU1_PROGMASK into VI[REG_TPC], so runtime TPC is known and
+// the full _branchAddr() formula resolves to a constant.
+static inline u32 vu1ComputePCRelTarget()
+{
+	const s32 pair_pc = static_cast<s32>(g_vu1CurrentPC);
+	const s32 imm11   = W_Imm11(&VU1);
+	const s32 tpc_val = static_cast<s32>((pair_pc + 8) & 0x3fff);
+	return static_cast<u32>((tpc_val + imm11 * 8) & 0x3fff);
+}
+
+// IbitHack variant: emit runtime computation of PC-relative branch target
+// into w3. pair_pc portion remains compile-time (matches what step 2 wrote
+// to TPC); only imm11 is read live from VU->code to catch post-compile
+// micro-memory patches. Mirrors x86 microVU's ptr32[&curI] path for branches.
+// Clobbers w3.
+static void emitRuntimePCRelTarget()
+{
+	const s32 tpc_const = static_cast<s32>((g_vu1CurrentPC + 8) & 0x3fff);
+	armAsm->Ldr(w3, MemOperand(VU1_BASE_REG, static_cast<int64_t>(offsetof(VURegs, code))));
+	armAsm->Sbfx(w3, w3, 0, 11);    // signed 11-bit imm in bits [10:0]
+	armAsm->Lsl(w3, w3, 3);          // imm11 * 8
+	armAsm->Add(w3, w3, tpc_const);
+	armAsm->And(w3, w3, 0x3fff);
+}
+
+// Emit Mov w3, bpc — either baked compile-time target or live runtime
+// decode — picking the path based on EmuConfig.Gamefixes.IbitHack. All
+// PC-relative branches use this before calling emitInlineSetBranch(w3).
+static void emitPCRelTargetIntoW3()
+{
+	if (EmuConfig.Gamefixes.IbitHack)
+	{
+		emitRuntimePCRelTarget();
+	}
+	else
+	{
+		const u32 bpc = vu1ComputePCRelTarget();
+		armAsm->Mov(w3, bpc);
+	}
+}
+
+// Emit BAL/JALR link register write. Called before emitInlineSetBranch.
+// The link value matches _vuBAL/_vuJALR in VUops.cpp: when already in a
+// delay slot (branch==1) we link to branchpc+8 (runtime), otherwise we
+// link to TPC+8 (compile-time since step 2 has already written TPC).
+// Does not touch branch state. it must be nonzero.
+static void emitBranchLinkWrite(u32 it)
+{
+	const int64_t branch_off   = static_cast<int64_t>(offsetof(VURegs, branch));
+	const int64_t branchpc_off = static_cast<int64_t>(offsetof(VURegs, branchpc));
+	const u32 runtime_tpc = (g_vu1CurrentPC + 8) & 0x3fff;
+	const u32 link_normal = (runtime_tpc + 8) / 8;
+
+	a64::Label is_delay, done;
+	armAsm->Ldr(w4, MemOperand(VU1_BASE_REG, branch_off));
+	armAsm->Cmp(w4, 1);
+	armAsm->B(&is_delay, a64::eq);
+
+	// Normal link: (TPC+8)/8 — compile-time constant
+	armAsm->Mov(w5, link_normal);
+	viCacheStore(static_cast<int>(it), w5);
+	armAsm->B(&done);
+
+	// In-delay-slot link: (branchpc+8)/8 — runtime
+	armAsm->Bind(&is_delay);
+	armAsm->Ldr(w4, MemOperand(VU1_BASE_REG, branchpc_off));
+	armAsm->Add(w4, w4, 8);
+	armAsm->Lsr(w4, w4, 3);
+	viCacheStore(static_cast<int>(it), w4);
+
+	armAsm->Bind(&done);
+}
+
+#if ISTUB_VU_B
+REC_VU1_LOWER_INTERP(B)
+#else
+void recVU1_B() {
+	emitPCRelTargetIntoW3();
+	emitInlineSetBranch(w3);
+}
+#endif
+
+#if ISTUB_VU_BAL
+REC_VU1_LOWER_INTERP(BAL)
+#else
+void recVU1_BAL() {
+	const u32 it = W_It(&VU1);
+	if (it != 0)
+		emitBranchLinkWrite(it);
+	emitPCRelTargetIntoW3();
+	emitInlineSetBranch(w3);
+}
+#endif
+
+#if ISTUB_VU_JR
+REC_VU1_LOWER_INTERP(JR)
+#else
+void recVU1_JR() {
+	const u32 is = W_Is(&VU1);
+	// bpc = VI[is].US[0] * 8. JR vi00 is legal (Scarface intro hits this) —
+	// vi00 is hardwired zero, so the target is fixed at PC 0. vixl's
+	// Lsl(rd, rn, shift) asserts !rn.IsZero(), so we can't pass wzr through
+	// it; emit a direct `Mov w3, wzr` for the is==0 case.
+	if (is == 0)
+	{
+		armAsm->Mov(w3, a64::wzr);
+	}
+	else
+	{
+		const auto srcVi = viCacheLoadResident(static_cast<int>(is));
+		armAsm->Lsl(w3, srcVi, 3);
+	}
+	emitInlineSetBranch(w3);
+}
+#endif
+
+#if ISTUB_VU_JALR
+REC_VU1_LOWER_INTERP(JALR)
+#else
+void recVU1_JALR() {
+	const u32 is = W_Is(&VU1);
+	const u32 it = W_It(&VU1);
+	// Compute bpc into w3 first (preserved across link write — which only touches w4/w5).
+	// is==0: target fixed at PC 0 (vi00 hardwired). See recVU1_JR comment.
+	if (is == 0)
+	{
+		armAsm->Mov(w3, a64::wzr);
+	}
+	else
+	{
+		const auto srcVi = viCacheLoadResident(static_cast<int>(is));
+		armAsm->Lsl(w3, srcVi, 3);
+	}
+	if (it != 0)
+		emitBranchLinkWrite(it);
+	emitInlineSetBranch(w3);
+}
+#endif
+
+#if ISTUB_VU_IBEQ
+REC_VU1_LOWER_INTERP(IBEQ)
+#else
+void recVU1_IBEQ() {
+	const u32 it = W_It(&VU1);
+	const u32 is = W_Is(&VU1);
+	a64::Label not_taken;
+	emitHazardVIRead(w6, it, false, w4);
+	emitHazardVIRead(w7, is, false, w4);
+	armAsm->Cmp(w6, w7);
+	armAsm->B(&not_taken, a64::ne);
+	emitPCRelTargetIntoW3();
+	emitInlineSetBranch(w3);
+	armAsm->Bind(&not_taken);
+}
+#endif
+
+#if ISTUB_VU_IBNE
+REC_VU1_LOWER_INTERP(IBNE)
+#else
+void recVU1_IBNE() {
+	const u32 it = W_It(&VU1);
+	const u32 is = W_Is(&VU1);
+	a64::Label not_taken;
+	emitHazardVIRead(w6, it, false, w4);
+	emitHazardVIRead(w7, is, false, w4);
+	armAsm->Cmp(w6, w7);
+	armAsm->B(&not_taken, a64::eq);
+	emitPCRelTargetIntoW3();
+	emitInlineSetBranch(w3);
+	armAsm->Bind(&not_taken);
+}
+#endif
+
+#if ISTUB_VU_IBLTZ
+REC_VU1_LOWER_INTERP(IBLTZ)
+#else
+void recVU1_IBLTZ() {
+	const u32 is = W_Is(&VU1);
+	a64::Label not_taken;
+	emitHazardVIRead(w6, is, true, w4);
+	armAsm->Cmp(w6, 0);
+	armAsm->B(&not_taken, a64::ge);
+	emitPCRelTargetIntoW3();
+	emitInlineSetBranch(w3);
+	armAsm->Bind(&not_taken);
+}
+#endif
+
+#if ISTUB_VU_IBGTZ
+REC_VU1_LOWER_INTERP(IBGTZ)
+#else
+void recVU1_IBGTZ() {
+	const u32 is = W_Is(&VU1);
+	a64::Label not_taken;
+	emitHazardVIRead(w6, is, true, w4);
+	armAsm->Cmp(w6, 0);
+	armAsm->B(&not_taken, a64::le);
+	emitPCRelTargetIntoW3();
+	emitInlineSetBranch(w3);
+	armAsm->Bind(&not_taken);
+}
+#endif
+
+#if ISTUB_VU_IBLEZ
+REC_VU1_LOWER_INTERP(IBLEZ)
+#else
+void recVU1_IBLEZ() {
+	const u32 is = W_Is(&VU1);
+	a64::Label not_taken;
+	emitHazardVIRead(w6, is, true, w4);
+	armAsm->Cmp(w6, 0);
+	armAsm->B(&not_taken, a64::gt);
+	emitPCRelTargetIntoW3();
+	emitInlineSetBranch(w3);
+	armAsm->Bind(&not_taken);
+}
+#endif
+
+#if ISTUB_VU_IBGEZ
+REC_VU1_LOWER_INTERP(IBGEZ)
+#else
+void recVU1_IBGEZ() {
+	const u32 is = W_Is(&VU1);
+	a64::Label not_taken;
+	emitHazardVIRead(w6, is, true, w4);
+	armAsm->Cmp(w6, 0);
+	armAsm->B(&not_taken, a64::lt);
+	emitPCRelTargetIntoW3();
+	emitInlineSetBranch(w3);
+	armAsm->Bind(&not_taken);
+}
+#endif
+
+// ============================================================================
+//  Move / Transfer
+// ============================================================================
+
+#if ISTUB_VU_MOVE
+REC_VU1_LOWER_INTERP(MOVE)
+#else
+void recVU1_MOVE() {
+	const u32 ft = (VU1.code >> 16) & 0x1F;
+	if (ft == 0) return;
+	const u32 fs = (VU1.code >> 11) & 0x1F;
+	const u32 xyzw = (VU1.code >> 21) & 0xF;
+	// Phase 2: route through the VF cache. Read fs into a resident NEON
+	// reg, defer-write into ft's cache slot. fs == ft is handled correctly
+	// — vfCacheStore detects same-slot and skips the redundant Mov when
+	// xyzw == 0xF (no-op), or merges into self for partial masks.
+	if (fs == 0)
+	{
+		// VF0 is hardwired {0,0,0,1} — load directly into a scratch then
+		// route through the cache for ft so the write is still deferred.
+		armAsm->Ldr(q0, MemOperand(VU1_BASE_REG, vfOff(0)));
+		vfCacheStore(static_cast<int>(ft), v0, static_cast<u8>(xyzw));
+		return;
+	}
+	const auto src = vfCacheLoadResident(static_cast<int>(fs));
+	vfCacheStore(static_cast<int>(ft), src, static_cast<u8>(xyzw));
+}
+#endif
+
+#if ISTUB_VU_MR32
+REC_VU1_LOWER_INTERP(MR32)
+#else
+void recVU1_MR32() {
+	const u32 ft = (VU1.code >> 16) & 0x1F;
+	if (ft == 0) return;
+	const u32 fs = (VU1.code >> 11) & 0x1F;
+	const u32 xyzw = (VU1.code >> 21) & 0xF;
+	// Phase 2: NEON rotate via Ext. MR32 maps {x,y,z,w} → {y,z,w,x}, which
+	// is exactly Ext v_out, v_in, v_in, #4 (rotate left by 4 bytes = 1 lane).
+	// Then write through the cache so subsequent reads of ft hit the slot.
+	if (fs == 0)
+	{
+		armAsm->Ldr(q0, MemOperand(VU1_BASE_REG, vfOff(0)));
+		armAsm->Ext(v1.V16B(), v0.V16B(), v0.V16B(), 4);
+		// FMAC opt #16: Ext into v1 invalidates the broadcast cache.
+		vu1BroadcastCacheReset();
+		vfCacheStore(static_cast<int>(ft), v1, static_cast<u8>(xyzw));
+		return;
+	}
+	const auto src = vfCacheLoadResident(static_cast<int>(fs));
+	armAsm->Ext(v0.V16B(), src.V16B(), src.V16B(), 4);
+	vfCacheStore(static_cast<int>(ft), v0, static_cast<u8>(xyzw));
+}
+#endif
+
+#if ISTUB_VU_MFIR
+REC_VU1_LOWER_INTERP(MFIR)
+#else
+void recVU1_MFIR() {
+	const u32 ft = (VU1.code >> 16) & 0x1F;
+	if (ft == 0) return;
+	const u32 is = (VU1.code >> 11) & 0xF;
+	const u32 xyzw = (VU1.code >> 21) & 0xF;
+	// VI cache: read VI[is] sign-extended into w0, then Dup-broadcast to
+	// NEON for the VF write. viCacheLoadSignedInto handles vireg==0 (vixl's
+	// Sxth rejects wzr-source).
+	viCacheLoadSignedInto(static_cast<int>(is), w0);
+	armAsm->Dup(v0.V4S(), w0);
+	vfCacheStore(static_cast<int>(ft), v0, static_cast<u8>(xyzw));
+}
+#endif
+
+#if ISTUB_VU_MTIR
+REC_VU1_LOWER_INTERP(MTIR)
+#else
+void recVU1_MTIR() {
+	const u32 it = (VU1.code >> 16) & 0xF;
+	if (it == 0) return;
+	const u32 fs = (VU1.code >> 11) & 0x1F;
+	const u32 fsf = (VU1.code >> 21) & 0x3; // 0=x, 1=y, 2=z, 3=w
+	emitBackupVI(it);
+	// Phase 2: pull the lane from VF cache if VF[fs] is resident; otherwise
+	// fall back to the original Ldrh from memory. fs == 0 is the constant
+	// {0,0,0,1} — the original direct-Ldrh is fine.
+	if (fs == 0)
+	{
+		armAsm->Ldrh(w0, MemOperand(VU1_BASE_REG, vfOff(fs) + fsf * 4));
+	}
+	else
+	{
+		const auto src = vfCacheLoadResident(static_cast<int>(fs));
+		armAsm->Umov(w0, src.V4S(), fsf);
+	}
+	// VI cache: write-through store of the extracted lane into VI[it].
+	viCacheStore(static_cast<int>(it), w0);
+}
+#endif
+
+#if ISTUB_VU_MFP
+REC_VU1_LOWER_INTERP(MFP)
+#else
+void recVU1_MFP() {
+	const u32 ft = (VU1.code >> 16) & 0x1F;
+	if (ft == 0) return;
+	const u32 xyzw = (VU1.code >> 21) & 0xF;
+	// Phase 2: load P, broadcast to NEON, defer-write through cache.
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, viOff(REG_P)));
+	armAsm->Dup(v0.V4S(), w0);
+	vfCacheStore(static_cast<int>(ft), v0, static_cast<u8>(xyzw));
+}
+#endif
+
+// ============================================================================
+//  Flag read/write
+// ============================================================================
+
+// Status flag imm: bit 21 -> bit 11, bits [10:0] as-is. Max value 0xFFF.
+static inline u32 decodeFSImm(u32 code)
+{
+	return (((code >> 21) & 0x1) << 11) | (code & 0x7ff);
+}
+
+#if ISTUB_VU_FSAND
+REC_VU1_LOWER_INTERP(FSAND)
+#else
+void recVU1_FSAND() {
+	const u32 it = W_It(&VU1);
+	if (it == 0) return;
+	const u32 imm = decodeFSImm(VU1.code);
+	armAsm->Ldrh(w0, MemOperand(VU1_BASE_REG, viOff(REG_STATUS_FLAG)));
+	if (imm == 0)
+		armAsm->Mov(w0, 0);
+	else
+	{
+		armAsm->Mov(w1, imm);
+		armAsm->And(w0, w0, w1);
+	}
+	viCacheStore(static_cast<int>(it), w0);
+}
+#endif
+
+#if ISTUB_VU_FSEQ
+REC_VU1_LOWER_INTERP(FSEQ)
+#else
+void recVU1_FSEQ() {
+	const u32 it = W_It(&VU1);
+	if (it == 0) return;
+	const u32 imm = decodeFSImm(VU1.code);
+	armAsm->Ldrh(w0, MemOperand(VU1_BASE_REG, viOff(REG_STATUS_FLAG)));
+	armAsm->And(w0, w0, 0xFFF);
+	armAsm->Mov(w1, imm);
+	armAsm->Cmp(w0, w1);
+	armAsm->Cset(w0, a64::eq);
+	viCacheStore(static_cast<int>(it), w0);
+}
+#endif
+
+#if ISTUB_VU_FSOR
+REC_VU1_LOWER_INTERP(FSOR)
+#else
+void recVU1_FSOR() {
+	const u32 it = W_It(&VU1);
+	if (it == 0) return;
+	const u32 imm = decodeFSImm(VU1.code);
+	armAsm->Ldrh(w0, MemOperand(VU1_BASE_REG, viOff(REG_STATUS_FLAG)));
+	armAsm->And(w0, w0, 0xFFF);
+	if (imm != 0)
+	{
+		armAsm->Mov(w1, imm);
+		armAsm->Orr(w0, w0, w1);
+	}
+	viCacheStore(static_cast<int>(it), w0);
+}
+#endif
+
+#if ISTUB_VU_FSSET
+REC_VU1_LOWER_INTERP(FSSET)
+#else
+void recVU1_FSSET() {
+	const u32 imm     = decodeFSImm(VU1.code);
+	const u32 top     = imm & 0xFC0;
+	// Read/write statusflag in the pinned reg — no memory round-trip.
+	armAsm->And(VU1_STATUSFLAG_REG, VU1_STATUSFLAG_REG, 0x3F);
+	if (top != 0)
+	{
+		armAsm->Mov(w1, top);
+		armAsm->Orr(VU1_STATUSFLAG_REG, VU1_STATUSFLAG_REG, w1);
+	}
+}
+#endif
+
+#if ISTUB_VU_FMAND
+REC_VU1_LOWER_INTERP(FMAND)
+#else
+void recVU1_FMAND() {
+	const u32 it = W_It(&VU1);
+	if (it == 0) return;
+	const u32 is = W_Is(&VU1);
+	const auto regS = viCacheLoadResident(static_cast<int>(is));
+	armAsm->Ldrh(w1, MemOperand(VU1_BASE_REG, viOff(REG_MAC_FLAG)));
+	armAsm->And(w0, regS, w1);
+	viCacheStore(static_cast<int>(it), w0);
+}
+#endif
+
+#if ISTUB_VU_FMEQ
+REC_VU1_LOWER_INTERP(FMEQ)
+#else
+void recVU1_FMEQ() {
+	const u32 it = W_It(&VU1);
+	if (it == 0) return;
+	const u32 is = W_Is(&VU1);
+	armAsm->Ldrh(w0, MemOperand(VU1_BASE_REG, viOff(REG_MAC_FLAG)));
+	const auto regS = viCacheLoadResident(static_cast<int>(is));
+	armAsm->Cmp(w0, regS);
+	armAsm->Cset(w0, a64::eq);
+	viCacheStore(static_cast<int>(it), w0);
+}
+#endif
+
+#if ISTUB_VU_FMOR
+REC_VU1_LOWER_INTERP(FMOR)
+#else
+void recVU1_FMOR() {
+	const u32 it = W_It(&VU1);
+	if (it == 0) return;
+	const u32 is = W_Is(&VU1);
+	armAsm->Ldrh(w0, MemOperand(VU1_BASE_REG, viOff(REG_MAC_FLAG)));
+	const auto regS = viCacheLoadResident(static_cast<int>(is));
+	armAsm->Orr(w0, w0, regS);
+	viCacheStore(static_cast<int>(it), w0);
+}
+#endif
+
+#if ISTUB_VU_FCAND
+REC_VU1_LOWER_INTERP(FCAND)
+#else
+void recVU1_FCAND() {
+	const u32 imm = VU1.code & 0xFFFFFF;
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, viOff(REG_CLIP_FLAG)));
+	if (imm == 0)
+		armAsm->Mov(w0, 0);
+	else
+	{
+		armAsm->Mov(w1, imm);
+		armAsm->Tst(w0, w1);
+		armAsm->Cset(w0, a64::ne);
+	}
+	viCacheStore(1, w0);
+}
+#endif
+
+#if ISTUB_VU_FCEQ
+REC_VU1_LOWER_INTERP(FCEQ)
+#else
+void recVU1_FCEQ() {
+	// Compare full 32 bits of clipflag against imm24. Matches x86
+	// microVU_Lower.inl:612-627 (XOR + SUB 1 + SHR 31 on the full register).
+	// If clipflag's upper 8 bits are non-zero, Cmp fails and Cset returns 0
+	// — correctly aligned with x86. In normal flow clipflag never has
+	// garbage upper bits (FCSET writes the 24-bit-masked imm to the pinned
+	// reg), so this is behaviorally a no-op for real code, but the stricter
+	// compare keeps the divergence from x86 closed.
+	const u32 imm = VU1.code & 0xFFFFFF;
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, viOff(REG_CLIP_FLAG)));
+	armAsm->Mov(w1, imm);
+	armAsm->Cmp(w0, w1);
+	armAsm->Cset(w0, a64::eq);
+	viCacheStore(1, w0);
+}
+#endif
+
+#if ISTUB_VU_FCOR
+REC_VU1_LOWER_INTERP(FCOR)
+#else
+void recVU1_FCOR() {
+	const u32 imm = VU1.code & 0xFFFFFF;
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, viOff(REG_CLIP_FLAG)));
+	armAsm->And(w0, w0, 0xFFFFFF);
+	if (imm != 0)
+	{
+		armAsm->Mov(w1, imm);
+		armAsm->Orr(w0, w0, w1);
+	}
+	armAsm->Mov(w1, 0xFFFFFFu);
+	armAsm->Cmp(w0, w1);
+	armAsm->Cset(w0, a64::eq);
+	viCacheStore(1, w0);
+}
+#endif
+
+#if ISTUB_VU_FCSET
+REC_VU1_LOWER_INTERP(FCSET)
+#else
+void recVU1_FCSET() {
+	const u32 imm = VU1.code & 0xFFFFFF;
+	// Write directly to the pinned clipflag reg.
+	if (imm == 0)
+		armAsm->Mov(VU1_CLIPFLAG_REG, wzr);
+	else
+		armAsm->Mov(VU1_CLIPFLAG_REG, imm);
+}
+#endif
+
+#if ISTUB_VU_FCGET
+REC_VU1_LOWER_INTERP(FCGET)
+#else
+void recVU1_FCGET() {
+	const u32 it = W_It(&VU1);
+	if (it == 0) return;
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, viOff(REG_CLIP_FLAG)));
+	armAsm->And(w0, w0, 0xFFF);
+	viCacheStore(static_cast<int>(it), w0);
+}
+#endif
+
+// ============================================================================
+//  Random number generator
+// ============================================================================
+
+#if ISTUB_VU_RINIT
+REC_VU1_LOWER_INTERP(RINIT)
+#else
+void recVU1_RINIT() {
+	const u32 fs  = W_Fs(&VU1);
+	const u32 fsf = W_Fsf(&VU1);
+	vfCacheFlushOne(static_cast<int>(fs));
+	// VI[REG_R].UL = 0x3F800000 | (VF[fs].UL[fsf] & 0x007FFFFF)
+	armAsm->Mov(w0, 0x3F800000u);
+	armAsm->Ldr(w1, MemOperand(VU1_BASE_REG, vfOff(fs) + fsf * 4));
+	armAsm->Bfi(w0, w1, 0, 23);
+	armAsm->Str(w0, MemOperand(VU1_BASE_REG, viOff(REG_R)));
+}
+#endif
+
+#if ISTUB_VU_RGET
+REC_VU1_LOWER_INTERP(RGET)
+#else
+void recVU1_RGET() {
+	const u32 ft = W_Ft(&VU1);
+	if (ft == 0) return;
+	const u32 xyzw = W_XYZW(&VU1);
+	// Phase 2: drop any cached ft — direct Strs will overwrite memory.
+	vfCacheFlushOne(static_cast<int>(ft));
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, viOff(REG_R)));
+	if (xyzw & 8) armAsm->Str(w0, MemOperand(VU1_BASE_REG, vfOff(ft) + 0));
+	if (xyzw & 4) armAsm->Str(w0, MemOperand(VU1_BASE_REG, vfOff(ft) + 4));
+	if (xyzw & 2) armAsm->Str(w0, MemOperand(VU1_BASE_REG, vfOff(ft) + 8));
+	if (xyzw & 1) armAsm->Str(w0, MemOperand(VU1_BASE_REG, vfOff(ft) + 12));
+}
+#endif
+
+#if ISTUB_VU_RNEXT
+REC_VU1_LOWER_INTERP(RNEXT)
+#else
+void recVU1_RNEXT() {
+	const u32 ft = W_Ft(&VU1);
+	if (ft == 0) return;
+	const u32 xyzw = W_XYZW(&VU1);
+	// Phase 2: drop any cached ft — direct Strs will overwrite memory.
+	vfCacheFlushOne(static_cast<int>(ft));
+	// LFSR advance (mirrors AdvanceLFSR in VUops.cpp):
+	//   x = (R >> 4) & 1
+	//   y = (R >> 22) & 1
+	//   R = ((R << 1) ^ (x ^ y)) with exponent forced to 0x3F800000
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, viOff(REG_R)));
+	armAsm->Ubfx(w1, w0, 4, 1);            // w1 = x
+	armAsm->Ubfx(w2, w0, 22, 1);           // w2 = y
+	armAsm->Eor(w1, w1, w2);               // w1 = x ^ y
+	armAsm->Lsl(w0, w0, 1);                // R <<= 1 (bit0 becomes 0)
+	armAsm->Orr(w0, w0, w1);               // bit0 = x^y
+	armAsm->Mov(w2, 0x3F800000u);
+	armAsm->Bfi(w2, w0, 0, 23);            // w2 = 0x3F800000 | (R & 0x7FFFFF)
+	armAsm->Str(w2, MemOperand(VU1_BASE_REG, viOff(REG_R)));
+	// Broadcast to selected VF[ft] components.
+	if (xyzw & 8) armAsm->Str(w2, MemOperand(VU1_BASE_REG, vfOff(ft) + 0));
+	if (xyzw & 4) armAsm->Str(w2, MemOperand(VU1_BASE_REG, vfOff(ft) + 4));
+	if (xyzw & 2) armAsm->Str(w2, MemOperand(VU1_BASE_REG, vfOff(ft) + 8));
+	if (xyzw & 1) armAsm->Str(w2, MemOperand(VU1_BASE_REG, vfOff(ft) + 12));
+}
+#endif
+
+#if ISTUB_VU_RXOR
+REC_VU1_LOWER_INTERP(RXOR)
+#else
+void recVU1_RXOR() {
+	const u32 fs  = W_Fs(&VU1);
+	const u32 fsf = W_Fsf(&VU1);
+	vfCacheFlushOne(static_cast<int>(fs));
+	// VI[REG_R].UL = 0x3F800000 | ((VI[REG_R].UL ^ VF[fs].UL[fsf]) & 0x007FFFFF)
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, viOff(REG_R)));
+	armAsm->Ldr(w1, MemOperand(VU1_BASE_REG, vfOff(fs) + fsf * 4));
+	armAsm->Eor(w1, w0, w1);
+	armAsm->Mov(w0, 0x3F800000u);
+	armAsm->Bfi(w0, w1, 0, 23);
+	armAsm->Str(w0, MemOperand(VU1_BASE_REG, viOff(REG_R)));
+}
+#endif
+
+// ============================================================================
+//  EFU — Elementary Function Unit (VU1 only)
+//
+//  Native emitters for the non-transcendental ops (ESADD/ERSADD/ELENG/ERLENG/
+//  ESUM/ERCPR/ESQRT/ERSQRT). Each writes the running `VU->p` field; the 29-
+//  cycle EFU pipeline then moves that value into VI[REG_P] via the inline
+//  EFU pipe add emitted by emitLowerNonFMACAdd and vu1_TestPipes_VU1's EFU
+//  flush, unchanged.
+//
+//  Inputs are vuDouble-clamped one lane at a time (matches _vuESADD et al. in
+//  VUops.cpp). Outputs are NOT clamped — none of these ops wrap the result in
+//  vuDouble() in the interpreter.
+//
+//  EATAN / EATANxy / EATANxz / ESIN / EEXP stay on C-helper dispatch — they're
+//  8th/13th-order polynomials with pow() calls and aren't worth inlining.
+// ============================================================================
+
+// Helper: load VF[fs].x/y/z, vuDouble-clamp each, leave squared-sum in s0.
+// Clobbers w0/w1 (integer scratch) and s0/s1/s2 (FP scratch).
+static void emitEFUSumSquaresXYZ(u32 fs)
+{
+	// Phase 2: flush deferred fs writes — direct Ldr w of three lanes.
+	vfCacheFlushOne(static_cast<int>(fs));
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, vfOff(fs) + 0));
+	emitVuDouble(w0, w1);
+	armAsm->Fmov(s0, w0);
+
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, vfOff(fs) + 4));
+	emitVuDouble(w0, w1);
+	armAsm->Fmov(s1, w0);
+
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, vfOff(fs) + 8));
+	emitVuDouble(w0, w1);
+	armAsm->Fmov(s2, w0);
+
+	armAsm->Fmul(s0, s0, s0);
+	armAsm->Fmul(s1, s1, s1);
+	armAsm->Fmul(s2, s2, s2);
+	armAsm->Fadd(s0, s0, s1);
+	armAsm->Fadd(s0, s0, s2);
+}
+
+// Helper: store s0 → VU->p and VI[REG_P] (as raw bits). Clobbers w0.
+static void emitEFUStoreP()
+{
+	const int64_t p_off = static_cast<int64_t>(offsetof(VURegs, p));
+	armAsm->Fmov(w0, s0);
+	armAsm->Str(w0, MemOperand(VU1_BASE_REG, p_off));
+	armAsm->Str(w0, MemOperand(VU1_BASE_REG, viOff(REG_P)));
+}
+
+#if ISTUB_VU_ESADD
+REC_VU1_LOWER_INTERP(ESADD)
+#else
+void recVU1_ESADD() {
+	// p = fs.x² + fs.y² + fs.z²
+	const u32 fs = W_Fs(&VU1);
+	emitEFUSumSquaresXYZ(fs);
+	emitEFUStoreP();
+}
+#endif
+
+#if ISTUB_VU_ERSADD
+REC_VU1_LOWER_INTERP(ERSADD)
+#else
+void recVU1_ERSADD() {
+	// p = fs.x² + fs.y² + fs.z²; if (p != 0) p = 1/p
+	const u32 fs = W_Fs(&VU1);
+	emitEFUSumSquaresXYZ(fs);
+	a64::Label skip;
+	armAsm->Fcmp(s0, 0.0);
+	armAsm->B(&skip, a64::eq);
+	armAsm->Fmov(s1, 1.0f);
+	armAsm->Fdiv(s0, s1, s0);
+	armAsm->Bind(&skip);
+	emitEFUStoreP();
+}
+#endif
+
+#if ISTUB_VU_ELENG
+REC_VU1_LOWER_INTERP(ELENG)
+#else
+void recVU1_ELENG() {
+	// p = fs.x² + fs.y² + fs.z²; if (p >= 0) p = sqrt(p)
+	// Sum-of-squares is always ≥0 for finite inputs, but mirror the
+	// interpreter's defensive guard so NaN propagates unchanged.
+	const u32 fs = W_Fs(&VU1);
+	emitEFUSumSquaresXYZ(fs);
+	a64::Label skip;
+	armAsm->Fcmp(s0, 0.0);
+	armAsm->B(&skip, a64::lt); // p<0 or unordered → skip sqrt
+	armAsm->Fsqrt(s0, s0);
+	armAsm->Bind(&skip);
+	emitEFUStoreP();
+}
+#endif
+
+#if ISTUB_VU_ERLENG
+REC_VU1_LOWER_INTERP(ERLENG)
+#else
+void recVU1_ERLENG() {
+	// p = fs.x² + fs.y² + fs.z²;
+	// if (p >= 0) { p = sqrt(p); if (p != 0) p = 1/p; }
+	const u32 fs = W_Fs(&VU1);
+	emitEFUSumSquaresXYZ(fs);
+	a64::Label skip_all, skip_rcp;
+	armAsm->Fcmp(s0, 0.0);
+	armAsm->B(&skip_all, a64::lt);
+	armAsm->Fsqrt(s0, s0);
+	armAsm->Fcmp(s0, 0.0);
+	armAsm->B(&skip_rcp, a64::eq);
+	armAsm->Fmov(s1, 1.0f);
+	armAsm->Fdiv(s0, s1, s0);
+	armAsm->Bind(&skip_rcp);
+	armAsm->Bind(&skip_all);
+	emitEFUStoreP();
+}
+#endif
+
+#if ISTUB_VU_EATANxy
+REC_VU1_LOWER_INTERP(EATANxy)
+#else
+REC_VU1_LOWER_CALL(EATANxy)
+#endif
+
+#if ISTUB_VU_EATANxz
+REC_VU1_LOWER_INTERP(EATANxz)
+#else
+REC_VU1_LOWER_CALL(EATANxz)
+#endif
+
+#if ISTUB_VU_ESUM
+REC_VU1_LOWER_INTERP(ESUM)
+#else
+void recVU1_ESUM() {
+	// p = fs.x + fs.y + fs.z + fs.w
+	const u32 fs = W_Fs(&VU1);
+	vfCacheFlushOne(static_cast<int>(fs));
+
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, vfOff(fs) + 0));
+	emitVuDouble(w0, w1);
+	armAsm->Fmov(s0, w0);
+
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, vfOff(fs) + 4));
+	emitVuDouble(w0, w1);
+	armAsm->Fmov(s1, w0);
+
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, vfOff(fs) + 8));
+	emitVuDouble(w0, w1);
+	armAsm->Fmov(s2, w0);
+
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, vfOff(fs) + 12));
+	emitVuDouble(w0, w1);
+	armAsm->Fmov(s3, w0);
+
+	armAsm->Fadd(s0, s0, s1);
+	armAsm->Fadd(s0, s0, s2);
+	armAsm->Fadd(s0, s0, s3);
+	emitEFUStoreP();
+}
+#endif
+
+#if ISTUB_VU_ERCPR
+REC_VU1_LOWER_INTERP(ERCPR)
+#else
+void recVU1_ERCPR() {
+	// p = vuDouble(fs[fsf]); if (p != 0) p = 1/p
+	const u32 fs  = W_Fs(&VU1);
+	const u32 fsf = W_Fsf(&VU1);
+	vfCacheFlushOne(static_cast<int>(fs));
+
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, vfOff(fs) + fsf * 4));
+	emitVuDouble(w0, w1);
+	armAsm->Fmov(s0, w0);
+
+	a64::Label skip;
+	armAsm->Fcmp(s0, 0.0);
+	armAsm->B(&skip, a64::eq);
+	armAsm->Fmov(s1, 1.0f);
+	armAsm->Fdiv(s0, s1, s0);
+	armAsm->Bind(&skip);
+	emitEFUStoreP();
+}
+#endif
+
+#if ISTUB_VU_ESQRT_EFU
+REC_VU1_LOWER_INTERP(ESQRT)
+#else
+void recVU1_ESQRT() {
+	// p = vuDouble(fs[fsf]); if (p >= 0) p = sqrt(p)
+	const u32 fs  = W_Fs(&VU1);
+	const u32 fsf = W_Fsf(&VU1);
+	vfCacheFlushOne(static_cast<int>(fs));
+
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, vfOff(fs) + fsf * 4));
+	emitVuDouble(w0, w1);
+	armAsm->Fmov(s0, w0);
+
+	a64::Label skip;
+	armAsm->Fcmp(s0, 0.0);
+	armAsm->B(&skip, a64::lt);
+	armAsm->Fsqrt(s0, s0);
+	armAsm->Bind(&skip);
+	emitEFUStoreP();
+}
+#endif
+
+#if ISTUB_VU_ERSQRT
+REC_VU1_LOWER_INTERP(ERSQRT)
+#else
+void recVU1_ERSQRT() {
+	// p = vuDouble(fs[fsf]);
+	// if (p >= 0) { p = sqrt(p); if (p != 0) p = 1/p; }
+	const u32 fs  = W_Fs(&VU1);
+	const u32 fsf = W_Fsf(&VU1);
+	vfCacheFlushOne(static_cast<int>(fs));
+
+	armAsm->Ldr(w0, MemOperand(VU1_BASE_REG, vfOff(fs) + fsf * 4));
+	emitVuDouble(w0, w1);
+	armAsm->Fmov(s0, w0);
+
+	a64::Label skip_all, skip_rcp;
+	armAsm->Fcmp(s0, 0.0);
+	armAsm->B(&skip_all, a64::lt);
+	armAsm->Fsqrt(s0, s0);
+	armAsm->Fcmp(s0, 0.0);
+	armAsm->B(&skip_rcp, a64::eq);
+	armAsm->Fmov(s1, 1.0f);
+	armAsm->Fdiv(s0, s1, s0);
+	armAsm->Bind(&skip_rcp);
+	armAsm->Bind(&skip_all);
+	emitEFUStoreP();
+}
+#endif
+
+#if ISTUB_VU_ESIN
+REC_VU1_LOWER_INTERP(ESIN)
+#else
+REC_VU1_LOWER_CALL(ESIN)
+#endif
+
+#if ISTUB_VU_EATAN
+REC_VU1_LOWER_INTERP(EATAN)
+#else
+REC_VU1_LOWER_CALL(EATAN)
+#endif
+
+#if ISTUB_VU_EEXP
+REC_VU1_LOWER_INTERP(EEXP)
+#else
+REC_VU1_LOWER_CALL(EEXP)
+#endif
+
+// ============================================================================
+//  Special — VU/GIF interface
+// ============================================================================
+
+#if ISTUB_VU_XITOP
+REC_VU1_LOWER_INTERP(XITOP)
+#else
+REC_VU1_LOWER_CALL(XITOP)
+#endif
+
+#if ISTUB_VU_XTOP
+REC_VU1_LOWER_INTERP(XTOP)
+#else
+REC_VU1_LOWER_CALL(XTOP)
+#endif
+
+#if ISTUB_VU_XGKICK
+REC_VU1_LOWER_INTERP(XGKICK)
+#else
+// XGKICK has two native paths. CHECK_XGKICKHACK is read at compile time;
+// recArmVU1::Reset() (called on gamefix toggle via VMManager::ApplySettings)
+// flushes s_blocks, so this binding is stable for every cached block's
+// lifetime. See the C-1 comment block above vu1_XGKICK_hack_capture for
+// the full rationale.
+void recVU1_XGKICK()
+{
+	if (CHECK_XGKICKHACK)
+	{
+		armAsm->Mov(x0, VU1_BASE_REG);
+		emitVu1Call(reinterpret_cast<const void*>(vu1_XGKICK_hack_capture));
+		return;
+	}
+	// XGKICK-preserve fast path (ARMSX2_VU1_XGKICK_PRESERVE=1): the capture
+	// helper only computes s_vu1_pending_xgkick_addr = (VI[Is] & 0x3ff) * 16.
+	// Inline those ~4 instructions so the BL — and emitVu1Call's full
+	// VF/VI/broadcast tracker wipe plus the refill storm on every following
+	// pair — disappears entirely. Gated off under IbitHack, where the helper
+	// must decode Is from VU->code live at runtime (same gating as recVU1_LQ).
+	if (g_vu1_xgkick_preserve && !EmuConfig.Gamefixes.IbitHack)
+	{
+		const u32 is = W_Is(&VU1);
+		viCacheLoadInto(is, w4); // w4 = VI[Is] (Mov w4, wzr for vi0)
+		armAsm->Ubfiz(w4, w4, 4, 10); // (w4 & 0x3ff) << 4
+		armMoveAddressToReg(x5, &s_vu1_pending_xgkick_addr);
+		armAsm->Str(w4, MemOperand(x5));
+		return;
+	}
+	armAsm->Mov(x0, VU1_BASE_REG);
+	emitVu1Call(reinterpret_cast<const void*>(vu1_XGKICK));
+}
+#endif
+
+// ============================================================================
+//  Generic fallback emitter for unknown / reserved lower opcode slots.
+//  VU1.code is already set; the interpreter will handle the unknown case
+//  (logging / NOP). Routed through emitVU1InterpBL so pinned regs stay
+//  coherent across the call (same rationale as REC_VU1_LOWER_INTERP).
+// ============================================================================
+static void recVU1_Lower_Unknown()
+{
+	emitVU1InterpBL(reinterpret_cast<const void*>(VU1_LOWER_OPCODE[VU1.code >> 25]));
+}
+
+// ============================================================================
+//  LowerOP sub-table dispatch (compile-time, mirrors interpreter tables)
+//
+//  When recVU1_LowerTable[0x40] is called, VU1.code is set to the lower
+//  instruction word.  The sub-table dispatch reads bits from VU1.code at
+//  compile time to route to the correct rec function.  Non-native entries
+//  fall back to recVU1_Lower_Unknown (interpreter BL chain).
+// ============================================================================
+using VU1RecFn = void (*)();
+
+// T3_00 sub-table: indexed by (VU1.code >> 6) & 0x1f
+static VU1RecFn recVU1_LowerOP_T3_00_Table[32] = {
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x00
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x04
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x08
+	recVU1_MOVE,          recVU1_LQI,           recVU1_DIV,           recVU1_MTIR,           // 0x0C
+	recVU1_RNEXT,         recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x10
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x14
+	recVU1_Lower_Unknown, recVU1_MFP,           recVU1_XTOP,          recVU1_XGKICK,         // 0x18
+	recVU1_ESADD,         recVU1_EATANxy,       recVU1_ESQRT,         recVU1_ESIN,           // 0x1C
+};
+
+// T3_01 sub-table: indexed by (VU1.code >> 6) & 0x1f
+static VU1RecFn recVU1_LowerOP_T3_01_Table[32] = {
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x00
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x04
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x08
+	recVU1_MR32,          recVU1_SQI,           recVU1_SQRT,          recVU1_MFIR,           // 0x0C
+	recVU1_RGET,          recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x10
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x14
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_XITOP,         recVU1_Lower_Unknown, // 0x18
+	recVU1_ERSADD,        recVU1_EATANxz,       recVU1_ERSQRT,        recVU1_EATAN,          // 0x1C
+};
+
+// T3_10 sub-table: indexed by (VU1.code >> 6) & 0x1f
+static VU1RecFn recVU1_LowerOP_T3_10_Table[32] = {
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x00
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x04
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x08
+	recVU1_Lower_Unknown, recVU1_LQD,           recVU1_RSQRT,         recVU1_ILWR,           // 0x0C
+	recVU1_RINIT,         recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x10
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x14
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x18
+	recVU1_ELENG,         recVU1_ESUM,          recVU1_ERCPR,         recVU1_EEXP,           // 0x1C
+};
+
+// T3_11 sub-table: indexed by (VU1.code >> 6) & 0x1f
+static VU1RecFn recVU1_LowerOP_T3_11_Table[32] = {
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x00
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x04
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x08
+	recVU1_Lower_Unknown, recVU1_SQD,           recVU1_WAITQ,         recVU1_ISWR,           // 0x0C
+	recVU1_RXOR,          recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x10
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x14
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x18
+	recVU1_ERLENG,        recVU1_Lower_Unknown, recVU1_WAITP,         recVU1_Lower_Unknown, // 0x1C
+};
+
+// T3 dispatch functions (compile-time)
+static void recVU1_LowerOP_T3_00() { recVU1_LowerOP_T3_00_Table[(VU1.code >> 6) & 0x1f](); }
+static void recVU1_LowerOP_T3_01() { recVU1_LowerOP_T3_01_Table[(VU1.code >> 6) & 0x1f](); }
+static void recVU1_LowerOP_T3_10() { recVU1_LowerOP_T3_10_Table[(VU1.code >> 6) & 0x1f](); }
+static void recVU1_LowerOP_T3_11() { recVU1_LowerOP_T3_11_Table[(VU1.code >> 6) & 0x1f](); }
+
+// LowerOP main sub-table: indexed by VU1.code & 0x3f
+static VU1RecFn recVU1_LowerOP_Table[64] = {
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x00
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x04
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x08
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x0C
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x10
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x14
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x18
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x1C
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x20
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x24
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x28
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x2C
+	recVU1_IADD,          recVU1_ISUB,          recVU1_IADDI,         recVU1_Lower_Unknown, // 0x30
+	recVU1_IAND,          recVU1_IOR,           recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x34
+	recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, recVU1_Lower_Unknown, // 0x38
+	recVU1_LowerOP_T3_00, recVU1_LowerOP_T3_01, recVU1_LowerOP_T3_10, recVU1_LowerOP_T3_11, // 0x3C
+};
+
+// LowerOP dispatch entry point (compile-time)
+static void recVU1_LowerOP() { recVU1_LowerOP_Table[VU1.code & 0x3f](); }
+
+// ============================================================================
+//  emitVU1Lower — top-level lower-opcode dispatch.
+//
+//  Replaces the old recVU1_LowerTable[128] function-pointer array with a
+//  compile-time switch on `lower >> 25`. Same TU as the recVU1_* emitters,
+//  so the compiler can inline small ones (e.g. IADDIU, FCGET) directly into
+//  the dispatcher instead of going through an indirect call.
+//
+//  Layout mirrors VU1_LOWER_OPCODE in VUops.cpp. Index 0x40 dispatches into
+//  the recVU1_LowerOP sub-table chain (still a table-driven sub-dispatch,
+//  which is fine — those paths are much rarer than the direct cases below).
+//  All other unassigned indices land on recVU1_Lower_Unknown via default.
+// ============================================================================
+void emitVU1Lower(u32 lower)
+{
+	switch (lower >> 25)
+	{
+		case 0x00: recVU1_LQ();      break;
+		case 0x01: recVU1_SQ();      break;
+		case 0x04: recVU1_ILW();     break;
+		case 0x05: recVU1_ISW();     break;
+		case 0x08: recVU1_IADDIU();  break;
+		case 0x09: recVU1_ISUBIU();  break;
+		case 0x10: recVU1_FCEQ();    break;
+		case 0x11: recVU1_FCSET();   break;
+		case 0x12: recVU1_FCAND();   break;
+		case 0x13: recVU1_FCOR();    break;
+		case 0x14: recVU1_FSEQ();    break;
+		case 0x15: recVU1_FSSET();   break;
+		case 0x16: recVU1_FSAND();   break;
+		case 0x17: recVU1_FSOR();    break;
+		case 0x18: recVU1_FMEQ();    break;
+		case 0x1A: recVU1_FMAND();   break;
+		case 0x1B: recVU1_FMOR();    break;
+		case 0x1C: recVU1_FCGET();   break;
+		case 0x20: recVU1_B();       break;
+		case 0x21: recVU1_BAL();     break;
+		case 0x24: recVU1_JR();      break;
+		case 0x25: recVU1_JALR();    break;
+		case 0x28: recVU1_IBEQ();    break;
+		case 0x29: recVU1_IBNE();    break;
+		case 0x2C: recVU1_IBLTZ();   break;
+		case 0x2D: recVU1_IBGTZ();   break;
+		case 0x2E: recVU1_IBLEZ();   break;
+		case 0x2F: recVU1_IBGEZ();   break;
+		case 0x40: recVU1_LowerOP(); break;
+		default:   recVU1_Lower_Unknown(); break;
+	}
+}
