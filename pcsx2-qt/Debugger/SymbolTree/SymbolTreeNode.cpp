@@ -319,7 +319,7 @@ QString SymbolTreeNode::generateDisplayString(
 				std::optional<std::string> string = cpu.ReadString(
 					location.address, 256, MemoryInterface::ALLOW_LONG_STRINGS);
 				if (string.has_value())
-					return QString("\"%1\"").arg(*string);
+					return QString("\"%1\"").arg(QString::fromStdString(*string));
 			}
 
 			QString result;
@@ -464,7 +464,7 @@ QString SymbolTreeNode::generateDisplayString(
 				std::optional<std::string> string = cpu.ReadString(
 					address, 256, MemoryInterface::ALLOW_LONG_STRINGS);
 				if (string.has_value())
-					result += QString(" \"%1\"").arg(*string);
+					result += QString(" \"%1\"").arg(QString::fromStdString(*string));
 			}
 			else if (depth == 0)
 			{
