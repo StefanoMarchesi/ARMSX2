@@ -11,6 +11,7 @@ REPEATS="${2:-3}"
 START_FRAME="${START_FRAME:-240}"
 END_FRAME="${END_FRAME:-840}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-240}"
+MIN_SAMPLES="${MIN_SAMPLES:-200}"
 MRT_MODE="${MRT_MODE:-baseline}"
 
 ROMS=/mnt/share/roms/ps2
@@ -170,12 +171,12 @@ run_one() {
 	grep 'FTLOG frame=' "$log" >"$prefix.ftlog" || true
 	cp "$log" "$prefix.emulog.txt"
 
-	python3 - "$prefix.ftlog" "$START_FRAME" "$END_FRAME" "$prefix.json" "$build" "$phase" "$iteration" <<'PY'
+	python3 - "$prefix.ftlog" "$START_FRAME" "$END_FRAME" "$MIN_SAMPLES" "$prefix.json" "$build" "$phase" "$iteration" <<'PY'
 import json, math, re, sys
 
-path, start, end, output, build, phase, iteration = (
-    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4],
-    sys.argv[5], sys.argv[6], int(sys.argv[7])
+path, start, end, minimum, output, build, phase, iteration = (
+    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5],
+    sys.argv[6], sys.argv[7], int(sys.argv[8])
 )
 records = []
 with open(path, encoding="utf-8", errors="replace") as stream:
@@ -186,7 +187,7 @@ with open(path, encoding="utf-8", errors="replace") as stream:
         timestamp, frame, milliseconds = float(match[1]), int(match[2]), float(match[3])
         if start <= frame <= end:
             records.append((frame, milliseconds, timestamp))
-if len(records) < 200:
+if len(records) < minimum:
     raise SystemExit(f"{build} {phase} {iteration}: only {len(records)} samples")
 
 samples = sorted(item[1] for item in records)
