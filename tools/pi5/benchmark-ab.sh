@@ -132,11 +132,7 @@ run_one() {
 	[ -z "$STATE" ] || state_args=(-statefile "$STATE")
 	if [ "$MRT_MODE" = tuned ]; then
 		run_env+=(ARMSX2_MRT_SWBLEND=1 ARMSX2_MRT_ALPHA2=1)
-		if [ "$build" = stable ]; then
-			run_env+=(ARMSX2_MRT_AUTO=1)
-		else
-			run_env+=(ARMSX2_MRT=1)
-		fi
+		run_env+=(ARMSX2_MRT_AUTO=1)
 	elif [ "$MRT_MODE" != baseline ]; then
 		echo "unknown MRT_MODE: $MRT_MODE" >&2
 		exit 2

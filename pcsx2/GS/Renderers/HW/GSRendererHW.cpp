@@ -85,6 +85,7 @@ void GSRendererHW::Reset(bool hardware_reset)
 		g_texture_cache->ReadbackAll();
 
 	g_texture_cache->RemoveAll(true, true, true);
+	m_mrt_auto_pattern = {};
 
 	GSRenderer::Reset(hardware_reset);
 }
@@ -9491,6 +9492,108 @@ __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Ta
 		{
 			m_conf.mrt_rt = other->m_texture;
 			m_conf.mrt_index = (m_cached_ctx.FRAME.Block() == 0x2400) ? 1 : 0;
+		}
+	}
+
+	// Generic opt-in detector for the same pathological access pattern: two
+	// independent, compatible render targets alternating on every draw while
+	// sharing one depth target. Requiring eight consecutive alternations avoids
+	// mistaking ordinary frame-level double buffering for a useful MRT pair.
+	static const bool s_armsx2_mrt_auto = []() {
+		const char* value = std::getenv("ARMSX2_MRT_AUTO");
+		return value && value[0] == '1';
+	}();
+	static const bool s_armsx2_mrt_auto_diag = (std::getenv("ARMSX2_MRT_AUTO_DIAG") != nullptr);
+	if (s_armsx2_mrt_auto && !m_conf.mrt_rt)
+	{
+		MRTAutoPattern& pattern = m_mrt_auto_pattern;
+		const GSVector2i rt_size = rt ? rt->m_texture->GetSize() : GSVector2i();
+		const bool compatible_draw = rt && ds && !m_using_temp_z && m_cached_ctx.FRAME.FBW != 0 &&
+			rt->m_TEX0.TBP0 == m_cached_ctx.FRAME.Block() && ds->m_texture->GetSize() == rt_size;
+		if (!compatible_draw)
+		{
+			if (!pattern.active)
+				pattern = {};
+		}
+		else
+		{
+			const u32 fbp = m_cached_ctx.FRAME.Block();
+			auto start_pattern = [&pattern, &rt_size, this, fbp]() {
+				pattern = {};
+				pattern.fbp[0] = fbp;
+				pattern.fbw = m_cached_ctx.FRAME.FBW;
+				pattern.fpsm = m_cached_ctx.FRAME.PSM;
+				pattern.zbp = m_cached_ctx.ZBUF.Block();
+				pattern.zpsm = m_cached_ctx.ZBUF.PSM;
+				pattern.width = rt_size.x;
+				pattern.height = rt_size.y;
+				pattern.target_count = 1;
+			};
+			const bool same_signature = pattern.target_count != 0 &&
+				pattern.fbw == m_cached_ctx.FRAME.FBW && pattern.fpsm == m_cached_ctx.FRAME.PSM &&
+				pattern.zbp == m_cached_ctx.ZBUF.Block() && pattern.zpsm == m_cached_ctx.ZBUF.PSM &&
+				pattern.width == rt_size.x && pattern.height == rt_size.y;
+			if (!pattern.active)
+			{
+				if (!same_signature)
+				{
+					start_pattern();
+				}
+				else if (pattern.target_count == 1)
+				{
+					if (fbp != pattern.fbp[0])
+					{
+						pattern.fbp[1] = fbp;
+						pattern.target_count = 2;
+						pattern.last_index = 1;
+						pattern.alternations = 1;
+					}
+				}
+				else
+				{
+					const u8 current_index = (fbp == pattern.fbp[0]) ? 0 : ((fbp == pattern.fbp[1]) ? 1 : 2);
+					if (current_index > 1 || current_index == pattern.last_index)
+					{
+						start_pattern();
+					}
+					else
+					{
+						pattern.last_index = current_index;
+						pattern.alternations++;
+						if (pattern.alternations >= 8)
+						{
+							pattern.active = true;
+							if (s_armsx2_mrt_auto_diag)
+							{
+								Console.WriteLn("MRT AUTO promoted FBP=%x/%x FBW=%u PSM=%u ZBP=%x ZPSM=%u size=%dx%d",
+									pattern.fbp[0], pattern.fbp[1], pattern.fbw, pattern.fpsm,
+									pattern.zbp, pattern.zpsm, pattern.width, pattern.height);
+							}
+						}
+					}
+				}
+			}
+
+			if (pattern.active && same_signature)
+			{
+				const u8 active_index = (fbp == pattern.fbp[0]) ? 0 : ((fbp == pattern.fbp[1]) ? 1 : 2);
+				if (active_index < 2)
+				{
+					pattern.last_index = active_index;
+					const u32 other_fbp = pattern.fbp[active_index ^ 1];
+					GSTextureCache::Target* other = g_texture_cache->GetExactTarget(
+						other_fbp, pattern.fbw, GSTextureCache::RenderTarget, other_fbp + 1);
+					const bool non_overlapping = other && !GSTextureCache::CheckOverlap(
+						rt->m_TEX0.TBP0, rt->UnwrappedEndBlock(), other->m_TEX0.TBP0, other->UnwrappedEndBlock());
+					if (other && other != rt && other->m_TEX0.TBP0 == other_fbp &&
+						other->m_TEX0.PSM == pattern.fpsm && other->m_texture->GetSize() == rt_size &&
+						other->m_texture->GetFormat() == rt->m_texture->GetFormat() && non_overlapping)
+					{
+						m_conf.mrt_rt = other->m_texture;
+						m_conf.mrt_index = active_index;
+					}
+				}
+			}
 		}
 	}
 
