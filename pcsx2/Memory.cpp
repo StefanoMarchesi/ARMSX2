@@ -65,7 +65,9 @@ namespace SysMemory
 	static void* s_data_memory_file_handle;
 	static u8* s_code_memory;
 	static std::unique_ptr<SharedMemoryMappingArea> s_memory_mapping_area;
+#if !(defined(__aarch64__) && defined(__linux__))
 	static std::unique_ptr<SharedMemoryMappingArea> s_code_mapping_area;
+#endif
 } // namespace SysMemory
 
 static void memAllocate();
@@ -103,8 +105,16 @@ bool SysMemory::AllocateMemoryMap()
 		return false;
 	}
 
+#if defined(__aarch64__) && defined(__linux__)
+	// The Pi-proven EE recompiler emits PC-relative helpers under the assumption
+	// that data and JIT regions share one reservation. Keep the modern split/W^X
+	// paths on every other platform, particularly iOS.
+	if (!(s_memory_mapping_area = SharedMemoryMappingArea::Create(
+			HostMemoryMap::MainSize + HostMemoryMap::CodeSize, true)))
+#else
 	Console.WriteLn("@@MAC_MEMMAP@@ data_area_begin size=%zu", static_cast<size_t>(HostMemoryMap::MainSize));
 	if (!(s_memory_mapping_area = SharedMemoryMappingArea::Create(HostMemoryMap::MainSize, false)))
+#endif
 	{
 		Host::ReportErrorAsync("Error", "Failed to map main memory.");
 		ReleaseMemoryMap();
@@ -118,8 +128,17 @@ bool SysMemory::AllocateMemoryMap()
 		return false;
 	}
 
+#if defined(__aarch64__) && defined(__linux__)
+	if ((s_code_memory = s_memory_mapping_area->Map(nullptr, 0,
+			s_memory_mapping_area->OffsetPointer(HostMemoryMap::MainSize),
+			HostMemoryMap::CodeSize, PageAccess_Any())) == nullptr)
+	{
+		Host::ReportErrorAsync("Error", "Failed to allocate code memory.");
+		ReleaseMemoryMap();
+		return false;
+	}
+#elif defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
 	Console.WriteLn("@@MAC_MEMMAP@@ code_area_begin size=%zu", static_cast<size_t>(HostMemoryMap::CodeSize));
-#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
 	// [iOS] Code is allocated separately via DarwinMisc dual-mapping (W^X RW/RX aliases),
 	// not through SharedMemoryMappingArea. iOS rejects PROT_NONE MAP_JIT and MAP_FIXED+MAP_JIT,
 	// so the generic SharedMemoryMappingArea code path is unusable here.
@@ -149,6 +168,7 @@ bool SysMemory::AllocateMemoryMap()
 		s_code_memory = nullptr;
 	}
 #else
+	Console.WriteLn("@@MAC_MEMMAP@@ code_area_begin size=%zu", static_cast<size_t>(HostMemoryMap::CodeSize));
 	if (!(s_code_mapping_area = SharedMemoryMappingArea::Create(HostMemoryMap::CodeSize, true)))
 	{
 		Host::ReportErrorAsync("Error", "Failed to map code memory.");
@@ -206,7 +226,9 @@ void SysMemory::ReleaseMemoryMap()
 {
 	if (s_code_memory)
 	{
-#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+#if defined(__aarch64__) && defined(__linux__)
+		s_memory_mapping_area->Unmap(s_code_memory, HostMemoryMap::CodeSize, false);
+#elif defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
 		DarwinMisc::MunmapCodeDualMap(s_code_memory, HostMemoryMap::CodeSize);
 #else
 		if (s_code_mapping_area)
@@ -214,7 +236,9 @@ void SysMemory::ReleaseMemoryMap()
 #endif
 		s_code_memory = nullptr;
 	}
+#if !(defined(__aarch64__) && defined(__linux__))
 	s_code_mapping_area.reset();
+#endif
 
 	if (s_data_memory)
 	{
