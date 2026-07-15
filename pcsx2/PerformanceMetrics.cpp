@@ -143,6 +143,20 @@ void PerformanceMetrics::Update(bool gs_register_write, bool fb_blit, bool is_sk
 	if (!is_skipping_present)
 	{
 		const float frame_time = s_last_frame_time.GetTimeMillisecondsAndReset();
+
+		// ARMSX2_FTLOG=1: tempo di OGNI frame. La media degli fps puo' restare identica
+		// mentre la fluidita' cambia: lo stuttering sta nella coda della distribuzione, e
+		// FRAMELOG (una riga ogni 10 frame) la appiattisce.
+		{
+			static const bool s_ftlog = []() {
+				const char* value = std::getenv("ARMSX2_FTLOG");
+				return value && std::atoi(value) != 0;
+			}();
+			if (s_ftlog)
+				Console.WriteLn("FTLOG frame=%llu ms=%.3f",
+					static_cast<unsigned long long>(s_frame_number + 1), frame_time);
+		}
+
 		s_minimum_frame_time_accumulator = (s_minimum_frame_time_accumulator == 0.0f) ? frame_time : std::min(s_minimum_frame_time_accumulator, frame_time);
 		s_average_frame_time_accumulator += frame_time;
 		s_maximum_frame_time_accumulator = std::max(s_maximum_frame_time_accumulator, frame_time);
