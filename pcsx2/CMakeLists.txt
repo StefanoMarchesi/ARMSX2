@@ -1069,6 +1069,7 @@ set(pcsx2arm64Sources
 	arm64/Vif_Dynarec.cpp
 	arm64/Vif_UnpackNEON.cpp
 	arm64/RecStubs.cpp
+	arm64/aDMAC.cpp
 	arm64/aR3000A.cpp
 	arm64/aR3000Atables.cpp
 	arm64/aR5900.cpp
@@ -1093,6 +1094,7 @@ set(pcsx2arm64Sources
 set(pcsx2arm64Headers
 	arm64/AsmHelpers.h
 	arm64/arm64Emitter.h
+	arm64/aDMAC.h
 	arm64/mac/AsmHelpers.h
 	arm64/mac/aVU.h
 	arm64/mac/aVU_IR.h
