@@ -12,7 +12,7 @@
 
 //EE
 //#define INTERP_EE        // Master
-//#define INTERP_BRANCH    // BEQ, BNE, J, JAL, JR, JALR, SYSCALL, BREAK, etc.
+#define INTERP_BRANCH     // Diagnostic: restore cycle coherence across branch chains.
 //#define INTERP_MOVE      // LUI, MFHI/LO, MTHI/LO, MOVZ, MOVN, MFSA, MTSA, etc.
 #define INTERP_COP0       // Diagnostic: validate COP0/TLB setup against the modern core.
 //#define INTERP_COP1      // MFC1, MTC1, CFC1, CTC1, BC1x, FPU arith/cmp/cvt
