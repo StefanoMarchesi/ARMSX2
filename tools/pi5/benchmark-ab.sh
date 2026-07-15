@@ -17,6 +17,7 @@ MRT_DIAG="${ARMSX2_MRT_DIAG:-}"
 MRT_AUTO_DIAG="${ARMSX2_MRT_AUTO_DIAG:-}"
 STABLE_MAC_EE="${STABLE_MAC_EE:-}"
 MODERN_FASTMEM="${MODERN_FASTMEM:-}"
+MODERN_EE_RECOMPILER="${MODERN_EE_RECOMPILER:-}"
 
 ROMS=/mnt/share/roms/ps2
 SOURCE_DATA=/home/raspi/armsx2-data/PCSX2
@@ -88,6 +89,14 @@ if [ -n "$MODERN_FASTMEM" ]; then
 
 [EmuCore/CPU/Recompiler]
 EnableFastmem = $MODERN_FASTMEM
+EOF
+fi
+
+if [ -n "$MODERN_EE_RECOMPILER" ]; then
+	cat >>"$RUN_ROOT/profile-modern/ARMSX2/inis/PCSX2.ini" <<EOF
+
+[EmuCore/CPU/Recompiler]
+EnableEE = $MODERN_EE_RECOMPILER
 EOF
 fi
 
