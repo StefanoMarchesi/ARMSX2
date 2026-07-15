@@ -79,6 +79,14 @@ static bool IsArmsx2MRTAlpha2Enabled()
 	return enabled;
 }
 
+static bool UsesNativeFeedbackInputAttachments(u32 vendor_id)
+{
+	// Mali and Broadcom V3D both consume the ROAA/subpass feedback path through
+	// real input-attachment descriptors. Adreno intentionally retains sampled
+	// image descriptors due to stale destination-colour issues on proprietary drivers.
+	return vendor_id == 0x13B5u || vendor_id == 0x14E4u;
+}
+
 static VkAttachmentLoadOp GetLoadOpForTexture(GSTextureVK* tex)
 {
 	if (!tex)
@@ -2991,7 +2999,10 @@ bool GSDeviceVK::CheckFeatures()
 	// unit; without fbfetch the per-PRIMITIVE texture-barrier path tanks blend-heavy games
 	// (GT4 = 10-20fps slideshow). No-op on any Mali lacking the extension.
 	//
-	// ADRENO / other non-Mali: OPT-IN only (EnableAdrenoFramebufferFetch, default off).
+	// BROADCOM V3D (0x14E4): ENABLED when ROAA is present. This restores the proven
+	// Pi 5 path: subpassLoad stays in tile memory and avoids per-primitive barriers.
+	//
+	// ADRENO / other vendors: OPT-IN only (EnableAdrenoFramebufferFetch, default off).
 	// ROV is the wrong primitive on a tiler (fragment_shader_interlock serializes same-pixel
 	// fragments + bypasses tile memory), so on Adreno fbfetch is the way to make accurate
 	// blending fast. Historically kept off because the Adreno-840 PROPRIETARY driver returned
@@ -3000,6 +3011,7 @@ bool GSDeviceVK::CheckFeatures()
 	// a toggle to ship dark and be A/B-verified per device+driver. Gated on ROAA presence, so
 	// it is a no-op on any device that does not expose the extension.
 	const bool is_mali_vk = (m_device_properties.vendorID == 0x13B5u);
+	const bool is_v3d_vk = (m_device_properties.vendorID == 0x14E4u);
 	// Turnip/Mesa is the open Adreno driver and does NOT exhibit the proprietary
 	// blob's stale-ROAA reads (the reason Adreno fbfetch shipped opt-in), so default
 	// it ON there — the fast blend path on a tiler that drops the per-primitive
@@ -3021,7 +3033,7 @@ bool GSDeviceVK::CheckFeatures()
 	const bool is_mediatek_mali_vk = is_mali_vk && IsMediaTekSoC();
 	const bool unreliable_mali_fbfetch = is_mediatek_mali_vk || is_mali_g57;
 	const bool vendor_allows_fbfetch = !unreliable_mali_fbfetch &&
-		(is_mali_vk || is_turnip || GSConfig.EnableAdrenoFramebufferFetch) && !is_xclipse_vk;
+		(is_mali_vk || is_v3d_vk || is_turnip || GSConfig.EnableAdrenoFramebufferFetch) && !is_xclipse_vk;
 	m_features.framebuffer_fetch = vendor_allows_fbfetch &&
 		m_optional_extensions.vk_ext_rasterization_order_attachment_access && !GSConfig.DisableFramebufferFetch;
 	m_features.texture_barrier = GSConfig.OverrideTextureBarriers != 0;
@@ -4523,14 +4535,15 @@ bool GSDeviceVK::CreatePipelineLayouts()
 		dslb.SetPushFlag();
 	dslb.AddBinding(TFX_TEXTURE_TEXTURE, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT);
 	dslb.AddBinding(TFX_TEXTURE_PALETTE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT);
-		// Mali needs real input-attachment descriptors for the subpass feedback path; its shader reads
-	// Cd/Zd via subpassLoad. Adreno mishandles input-attachment descriptors here and produces
+	// Mali and Broadcom V3D need real input-attachment descriptors for the subpass feedback path;
+	// their shaders read Cd/Zd via subpassLoad. Adreno mishandles input-attachment descriptors here and produces
 	// alternating stale destination colour (flicker) in accurate-blending draws, so keep Qualcomm on
 	// the long-standing sampled-image descriptor — subpassLoad still reads the render-pass input
 	// attachment (not vendor-scoped). Keep this condition identical to the writes in ApplyTFXState.
 	// Vendor-scoped per sashkinbro/EmuCoreX 30b09c8 (Fix Adreno Vulkan accurate blending flicker).
 	const VkDescriptorType feedback_descriptor_type =
-		(m_features.texture_barrier && !UseFeedbackLoopLayout() && m_device_properties.vendorID == 0x13B5u) ?
+		(m_features.texture_barrier && !UseFeedbackLoopLayout() &&
+			UsesNativeFeedbackInputAttachments(m_device_properties.vendorID)) ?
 			VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT :
 			VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
 	dslb.AddBinding(TFX_TEXTURE_RT, feedback_descriptor_type, 1, VK_SHADER_STAGE_FRAGMENT_BIT);
@@ -6445,7 +6458,8 @@ bool GSDeviceVK::ApplyTFXState(bool already_execed)
 		}
 		if (flags & DIRTY_FLAG_TFX_TEXTURE_RT)
 		{
-			if (m_features.texture_barrier && !UseFeedbackLoopLayout() && m_device_properties.vendorID == 0x13B5u)
+			if (m_features.texture_barrier && !UseFeedbackLoopLayout() &&
+				UsesNativeFeedbackInputAttachments(m_device_properties.vendorID))
 			{
 				dsub.AddInputAttachmentDescriptorWrite(
 					VK_NULL_HANDLE, TFX_TEXTURE_RT, m_tfx_textures[TFX_TEXTURE_RT]->GetView(), VK_IMAGE_LAYOUT_GENERAL);
@@ -6463,7 +6477,8 @@ bool GSDeviceVK::ApplyTFXState(bool already_execed)
 		}
 		if (flags & DIRTY_FLAG_TFX_TEXTURE_DEPTH)
 		{
-			if (m_features.texture_barrier && !UseFeedbackLoopLayout() && m_device_properties.vendorID == 0x13B5u)
+			if (m_features.texture_barrier && !UseFeedbackLoopLayout() &&
+				UsesNativeFeedbackInputAttachments(m_device_properties.vendorID))
 			{
 				dsub.AddInputAttachmentDescriptorWrite(
 					VK_NULL_HANDLE, TFX_TEXTURE_DEPTH, m_tfx_textures[TFX_TEXTURE_DEPTH]->GetView(), VK_IMAGE_LAYOUT_GENERAL);
@@ -6476,7 +6491,8 @@ bool GSDeviceVK::ApplyTFXState(bool already_execed)
 		}
 		if (flags & DIRTY_FLAG_TFX_TEXTURE_MRT_RT)
 		{
-			if (m_features.texture_barrier && !UseFeedbackLoopLayout() && m_device_properties.vendorID == 0x13B5u)
+			if (m_features.texture_barrier && !UseFeedbackLoopLayout() &&
+				UsesNativeFeedbackInputAttachments(m_device_properties.vendorID))
 			{
 				dsub.AddInputAttachmentDescriptorWrite(VK_NULL_HANDLE, TFX_TEXTURE_MRT_RT,
 					m_tfx_textures[TFX_TEXTURE_MRT_RT]->GetView(), VK_IMAGE_LAYOUT_GENERAL);
