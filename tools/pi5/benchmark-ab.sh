@@ -13,6 +13,8 @@ END_FRAME="${END_FRAME:-840}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-240}"
 MIN_SAMPLES="${MIN_SAMPLES:-200}"
 MRT_MODE="${MRT_MODE:-baseline}"
+MRT_DIAG="${ARMSX2_MRT_DIAG:-}"
+MRT_AUTO_DIAG="${ARMSX2_MRT_AUTO_DIAG:-}"
 
 ROMS=/mnt/share/roms/ps2
 SOURCE_DATA=/home/raspi/armsx2-data/PCSX2
@@ -129,6 +131,8 @@ run_one() {
 
 	local -a state_args=()
 	local -a run_env=("XDG_CACHE_HOME=$profile/xdg-cache")
+	[ -z "$MRT_DIAG" ] || run_env+=(ARMSX2_MRT_DIAG="$MRT_DIAG")
+	[ -z "$MRT_AUTO_DIAG" ] || run_env+=(ARMSX2_MRT_AUTO_DIAG="$MRT_AUTO_DIAG")
 	[ -z "$STATE" ] || state_args=(-statefile "$STATE")
 	if [ "$MRT_MODE" = tuned ]; then
 		run_env+=(ARMSX2_MRT_SWBLEND=1 ARMSX2_MRT_ALPHA2=1)
