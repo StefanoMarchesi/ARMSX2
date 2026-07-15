@@ -19,8 +19,8 @@ STABLE_MAC_EE="${STABLE_MAC_EE:-}"
 
 ROMS=/mnt/share/roms/ps2
 SOURCE_DATA=/home/raspi/armsx2-data/PCSX2
-STABLE_BIN=/home/raspi/armsx2-staging/2026-07-15-ftlog/pcsx2-qt
-MODERN_BIN=/home/raspi/armsx2-port-20260715/build-pi5-port/bin/armsx2-qt
+STABLE_BIN="${STABLE_BIN:-/home/raspi/armsx2-staging/2026-07-15-ftlog/pcsx2-qt}"
+MODERN_BIN="${MODERN_BIN:-/home/raspi/armsx2-port-20260715/build-pi5-port/bin/armsx2-qt}"
 RESULT_BASE=/home/raspi/perf-results
 RUN_ID="$(date +%Y%m%d-%H%M%S)-${GAME}-${MRT_MODE}-ab"
 RUN_ROOT="$RESULT_BASE/$RUN_ID"
