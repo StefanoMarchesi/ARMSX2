@@ -66,7 +66,8 @@ fi
 mkdir -p "$RUN_ROOT"
 
 prepare_profile() {
-	local build="$1" app="$2" profile="$RUN_ROOT/profile-$build"
+	local build="$1" app="$2" profile
+	profile="$RUN_ROOT/profile-$build"
 	local target="$profile/$app"
 	mkdir -p "$target"
 	for directory in bios cheats gamesettings inis inputprofiles memcards patches textures; do
