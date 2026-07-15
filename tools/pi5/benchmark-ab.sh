@@ -16,6 +16,7 @@ MRT_MODE="${MRT_MODE:-baseline}"
 MRT_DIAG="${ARMSX2_MRT_DIAG:-}"
 MRT_AUTO_DIAG="${ARMSX2_MRT_AUTO_DIAG:-}"
 STABLE_MAC_EE="${STABLE_MAC_EE:-}"
+MODERN_FASTMEM="${MODERN_FASTMEM:-}"
 
 ROMS=/mnt/share/roms/ps2
 SOURCE_DATA=/home/raspi/armsx2-data/PCSX2
@@ -81,6 +82,14 @@ prepare_profile() {
 
 prepare_profile stable PCSX2
 prepare_profile modern ARMSX2
+
+if [ -n "$MODERN_FASTMEM" ]; then
+	cat >>"$RUN_ROOT/profile-modern/ARMSX2/inis/PCSX2.ini" <<EOF
+
+[EmuCore/CPU/Recompiler]
+EnableFastmem = $MODERN_FASTMEM
+EOF
+fi
 
 if [ -n "$STABLE_MAC_EE" ]; then
 	cat >>"$RUN_ROOT/profile-stable/PCSX2/inis/PCSX2.ini" <<EOF
