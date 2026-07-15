@@ -11,13 +11,14 @@ REPEATS="${2:-3}"
 START_FRAME="${START_FRAME:-240}"
 END_FRAME="${END_FRAME:-840}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-240}"
+MRT_MODE="${MRT_MODE:-baseline}"
 
 ROMS=/mnt/share/roms/ps2
 SOURCE_DATA=/home/raspi/armsx2-data/PCSX2
 STABLE_BIN=/home/raspi/armsx2-staging/2026-07-15-ftlog/pcsx2-qt
 MODERN_BIN=/home/raspi/armsx2-port-20260715/build-pi5-port/bin/armsx2-qt
 RESULT_BASE=/home/raspi/perf-results
-RUN_ID="$(date +%Y%m%d-%H%M%S)-${GAME}-ab"
+RUN_ID="$(date +%Y%m%d-%H%M%S)-${GAME}-${MRT_MODE}-ab"
 RUN_ROOT="$RESULT_BASE/$RUN_ID"
 
 RECORDING=
@@ -42,10 +43,7 @@ case "$GAME" in
 	driv3r)
 		ROM="$ROMS/Driv3r (Europe, Australia) (En,Fr,De,Es,It).chd"
 		STATE="${DRIV3R_STATE:-}"
-		if [ -z "$STATE" ]; then
-			echo "Driv3r needs a representative save state; set DRIV3R_STATE=/path/to/file.p2s" >&2
-			exit 2
-		fi
+		[ -n "$STATE" ] || echo "Driv3r: no save state, measuring the deterministic boot/intro segment" >&2
 		;;
 	*)
 		echo "unknown game: $GAME" >&2
@@ -116,7 +114,7 @@ xrandr --output HDMI-2 --mode 720x480 --rate 60 --primary 2>/dev/null || true
 
 run_one() {
 	local build="$1" phase="$2" iteration="$3"
-	local bin app profile log prefix pid started last
+	local bin app profile log prefix pid started last captured
 	if [ "$build" = stable ]; then
 		bin="$STABLE_BIN"
 		app=PCSX2
@@ -130,18 +128,35 @@ run_one() {
 	: >"$log"
 
 	local -a state_args=()
+	local -a run_env=("XDG_CACHE_HOME=$profile/xdg-cache")
 	[ -z "$STATE" ] || state_args=(-statefile "$STATE")
-	XDG_CACHE_HOME="$profile/xdg-cache" gamemoderun "$bin" \
+	if [ "$MRT_MODE" = tuned ]; then
+		run_env+=(ARMSX2_MRT_SWBLEND=1 ARMSX2_MRT_ALPHA2=1)
+		if [ "$build" = stable ]; then
+			run_env+=(ARMSX2_MRT_AUTO=1)
+		else
+			run_env+=(ARMSX2_MRT=1)
+		fi
+	elif [ "$MRT_MODE" != baseline ]; then
+		echo "unknown MRT_MODE: $MRT_MODE" >&2
+		exit 2
+	fi
+	env "${run_env[@]}" gamemoderun "$bin" \
 		-unlimited -batch -fullscreen -nogui -datapath "$profile" \
 		"${state_args[@]}" -- "$ROM" >"$prefix.launch.log" 2>&1 &
 	pid=$!
 	started="$(date +%s)"
 	last=0
+	captured=0
 	while kill -0 "$pid" 2>/dev/null; do
 		last="$(grep -o 'FRAMEGATE frame=[0-9]*' "$log" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
 		last="${last:-0}"
 		if [ "$last" -ge "$END_FRAME" ]; then
 			break
+		fi
+		if [ "$phase" = warmup ] && [ "$captured" -eq 0 ] && [ "$last" -ge 600 ]; then
+			scrot "$prefix-frame600.png" 2>/dev/null || true
+			captured=1
 		fi
 		if [ "$(( $(date +%s) - started ))" -ge "$TIMEOUT_SECONDS" ]; then
 			echo "$build $phase $iteration timed out at frame $last" >&2
