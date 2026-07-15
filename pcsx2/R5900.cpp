@@ -365,19 +365,6 @@ __fi void _cpuEventTest_Shared()
 	cpuRegs.nextEventCycle = cpuRegs.cycle + eeWaitCycles;
 	cpuRegs.lastEventCycle = cpuRegs.cycle;
 
-	// Android's in-game Exit/Reset can flip the VM to Stopping from another
-	// thread while the EE recompiler is in its generated-code event path. Once
-	// Stopping is visible, do not continue into IOP counters/VU sync; return
-	// immediately so the recompiler's outer recEventTest can fastjmp out of
-	// Cpu->Execute(). Without this, PSX-vsync/IOP work can keep running after
-	// the stop latch and the Java shutdown call times out.
-	const VMState vm_state = VMManager::GetState();
-	if (vm_state == VMState::Stopping || vm_state == VMState::Shutdown)
-	{
-		eeEventTestIsActive = false;
-		return;
-	}
-
 	// ---- INTC / DMAC (CPU-level Exceptions) -----------------
 	// Done first because exceptions raised during event tests need to be postponed a few
 	// cycles (fixes Grandia II [PAL], which does a spin loop on a vsync and expects to
@@ -441,18 +428,6 @@ __fi void _cpuEventTest_Shared()
 		else
 			_cpuTestInterrupts();
 	}
-
-#if defined(__ANDROID__)
-	// Android pause/stop requests can be pumped during the counter/vsync work
-	// above. Once that happens, return to the rec/interpreter wrapper immediately
-	// instead of continuing through VU sync and scheduling a fresh event.
-	if (VMManager::Internal::IsExecutionInterrupted())
-	{
-		eeEventTestIsActive = false;
-		return;
-	}
-#endif
-
 	// ---- VU Sync -------------
 	// We're in a EventTest.  All dynarec registers are flushed
 	// so there is no need to freeze registers here.
@@ -460,10 +435,18 @@ __fi void _cpuEventTest_Shared()
 	CpuVU1->ExecuteBlock();
 
 	// ---- Schedule Next Event Test --------------
-	const float mutiplier = static_cast<float>(PS2CLK) / static_cast<float>(PSXCLK);
-	const int nextIopEventDeta = ((psxRegs.iopNextEventCycle - psxRegs.cycle) * mutiplier);
+	// PS2 mode uses an exact EE:IOP ratio of 8. Keep the float path only for
+	// PS1 mode, where PSXCLK changes and the ratio is fractional.
+	const s32 iop_delta = static_cast<s32>(psxRegs.iopNextEventCycle - psxRegs.cycle);
+	s32 next_iop_event_delta;
+	if (PSXCLK == 36864000) [[likely]]
+		next_iop_event_delta = iop_delta << 3;
+	else
+		next_iop_event_delta = static_cast<s32>(iop_delta *
+			(static_cast<float>(PS2CLK) / static_cast<float>(PSXCLK)));
+
 	// 8 or more cycles behind and there's an event scheduled
-	if (EEsCycle >= nextIopEventDeta)
+	if (EEsCycle >= next_iop_event_delta)
 	{
 		// EE's running way ahead of the IOP still, so we should branch quickly to give the
 		// IOP extra timeslices in short order.
@@ -474,7 +457,7 @@ __fi void _cpuEventTest_Shared()
 	else
 	{
 		// Otherwise IOP is caught up/not doing anything so we can wait for the next event.
-		cpuSetNextEventDelta(((psxRegs.iopNextEventCycle - psxRegs.cycle) * mutiplier) - EEsCycle);
+		cpuSetNextEventDelta(next_iop_event_delta - EEsCycle);
 	}
 
 	// Apply vsync and other counter nextCycles
