@@ -42,8 +42,7 @@ case "$GAME" in
 		;;
 	driv3r)
 		ROM="$ROMS/Driv3r (Europe, Australia) (En,Fr,De,Es,It).chd"
-		STATE="${DRIV3R_STATE:-}"
-		[ -n "$STATE" ] || echo "Driv3r: no save state, measuring the deterministic boot/intro segment" >&2
+		STATE="${DRIV3R_STATE:-$SOURCE_DATA/sstates/SLES-50876 (E94FBF35).01.p2s}"
 		;;
 	*)
 		echo "unknown game: $GAME" >&2
