@@ -18,6 +18,7 @@ MRT_AUTO_DIAG="${ARMSX2_MRT_AUTO_DIAG:-}"
 STABLE_MAC_EE="${STABLE_MAC_EE:-}"
 MODERN_FASTMEM="${MODERN_FASTMEM:-}"
 MODERN_EE_RECOMPILER="${MODERN_EE_RECOMPILER:-}"
+DISABLE_RECORDING="${DISABLE_RECORDING:-false}"
 
 ROMS=/mnt/share/roms/ps2
 SOURCE_DATA=/home/raspi/armsx2-data/PCSX2
@@ -55,6 +56,10 @@ case "$GAME" in
 		exit 2
 		;;
 esac
+
+if [ "$DISABLE_RECORDING" = true ]; then
+	RECORDING=
+fi
 
 test -x "$STABLE_BIN"
 test -x "$MODERN_BIN"
