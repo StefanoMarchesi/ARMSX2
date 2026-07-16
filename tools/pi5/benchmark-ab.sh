@@ -20,6 +20,8 @@ MODERN_FASTMEM="${MODERN_FASTMEM:-}"
 MODERN_EE_RECOMPILER="${MODERN_EE_RECOMPILER:-}"
 MODERN_IOP_RECOMPILER="${MODERN_IOP_RECOMPILER:-}"
 MODERN_DISABLE_FB_FETCH="${MODERN_DISABLE_FB_FETCH:-}"
+STABLE_RENDERER="${STABLE_RENDERER:-}"
+MODERN_RENDERER="${MODERN_RENDERER:-}"
 DISABLE_RECORDING="${DISABLE_RECORDING:-false}"
 
 ROMS=/mnt/share/roms/ps2
@@ -128,6 +130,22 @@ if [ -n "$STABLE_MAC_EE" ]; then
 
 [EmuCore/CPU/Recompiler]
 UseMacEE = $STABLE_MAC_EE
+EOF
+fi
+
+if [ -n "$STABLE_RENDERER" ]; then
+	cat >>"$RUN_ROOT/profile-stable/PCSX2/inis/PCSX2.ini" <<EOF
+
+[EmuCore/GS]
+Renderer = $STABLE_RENDERER
+EOF
+fi
+
+if [ -n "$MODERN_RENDERER" ]; then
+	cat >>"$RUN_ROOT/profile-modern/ARMSX2/inis/PCSX2.ini" <<EOF
+
+[EmuCore/GS]
+Renderer = $MODERN_RENDERER
 EOF
 fi
 
