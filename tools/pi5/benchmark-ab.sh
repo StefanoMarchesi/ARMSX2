@@ -24,6 +24,7 @@ STABLE_RENDERER="${STABLE_RENDERER:-}"
 MODERN_RENDERER="${MODERN_RENDERER:-}"
 STABLE_MTVU="${STABLE_MTVU:-}"
 MODERN_MTVU="${MODERN_MTVU:-}"
+BENCH_WAIT_SPIN_MICROSECONDS="${BENCH_WAIT_SPIN_MICROSECONDS:-2}"
 DISABLE_RECORDING="${DISABLE_RECORDING:-false}"
 
 ROMS=/mnt/share/roms/ps2
@@ -159,7 +160,7 @@ export XDG_RUNTIME_DIR=/run/user/1000
 export PULSE_SERVER=unix:/run/user/1000/pulse/native
 export LD_LIBRARY_PATH=/home/raspi/armsx2-deps/prefix/lib:/opt/mesa-stable/lib/aarch64-linux-gnu
 export VK_DRIVER_FILES=/opt/mesa-stable/share/vulkan/icd.d/broadcom_icd.aarch64.json
-export WAIT_SPIN_MICROSECONDS=2
+export WAIT_SPIN_MICROSECONDS="$BENCH_WAIT_SPIN_MICROSECONDS"
 export ARMSX2_FTLOG=1
 export ARMSX2_FRAMEGATE=1
 export ARMSX2_FRAMELOG=1
