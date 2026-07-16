@@ -22,6 +22,8 @@ MODERN_IOP_RECOMPILER="${MODERN_IOP_RECOMPILER:-}"
 MODERN_DISABLE_FB_FETCH="${MODERN_DISABLE_FB_FETCH:-}"
 STABLE_RENDERER="${STABLE_RENDERER:-}"
 MODERN_RENDERER="${MODERN_RENDERER:-}"
+STABLE_MTVU="${STABLE_MTVU:-}"
+MODERN_MTVU="${MODERN_MTVU:-}"
 DISABLE_RECORDING="${DISABLE_RECORDING:-false}"
 
 ROMS=/mnt/share/roms/ps2
@@ -139,6 +141,16 @@ fi
 if [ -n "$MODERN_RENDERER" ]; then
 	set_ini_value "$RUN_ROOT/profile-modern/ARMSX2/inis/PCSX2.ini" \
 		"EmuCore/GS" "Renderer" "$MODERN_RENDERER"
+fi
+
+if [ -n "$STABLE_MTVU" ]; then
+	set_ini_value "$RUN_ROOT/profile-stable/PCSX2/inis/PCSX2.ini" \
+		"EmuCore/Speedhacks" "vuThread" "$STABLE_MTVU"
+fi
+
+if [ -n "$MODERN_MTVU" ]; then
+	set_ini_value "$RUN_ROOT/profile-modern/ARMSX2/inis/PCSX2.ini" \
+		"EmuCore/Speedhacks" "vuThread" "$MODERN_MTVU"
 fi
 
 export DISPLAY="${DISPLAY:-:0}"
