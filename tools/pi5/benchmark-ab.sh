@@ -24,6 +24,8 @@ STABLE_RENDERER="${STABLE_RENDERER:-}"
 MODERN_RENDERER="${MODERN_RENDERER:-}"
 STABLE_MTVU="${STABLE_MTVU:-}"
 MODERN_MTVU="${MODERN_MTVU:-}"
+STABLE_THREAD_PINNING="${STABLE_THREAD_PINNING:-}"
+MODERN_THREAD_PINNING="${MODERN_THREAD_PINNING:-}"
 BENCH_WAIT_SPIN_MICROSECONDS="${BENCH_WAIT_SPIN_MICROSECONDS:-2}"
 DISABLE_RECORDING="${DISABLE_RECORDING:-false}"
 
@@ -152,6 +154,16 @@ fi
 if [ -n "$MODERN_MTVU" ]; then
 	set_ini_value "$RUN_ROOT/profile-modern/ARMSX2/inis/PCSX2.ini" \
 		"EmuCore/Speedhacks" "vuThread" "$MODERN_MTVU"
+fi
+
+if [ -n "$STABLE_THREAD_PINNING" ]; then
+	set_ini_value "$RUN_ROOT/profile-stable/PCSX2/inis/PCSX2.ini" \
+		"EmuCore" "EnableThreadPinning" "$STABLE_THREAD_PINNING"
+fi
+
+if [ -n "$MODERN_THREAD_PINNING" ]; then
+	set_ini_value "$RUN_ROOT/profile-modern/ARMSX2/inis/PCSX2.ini" \
+		"EmuCore" "EnableThreadPinning" "$MODERN_THREAD_PINNING"
 fi
 
 export DISPLAY="${DISPLAY:-:0}"
