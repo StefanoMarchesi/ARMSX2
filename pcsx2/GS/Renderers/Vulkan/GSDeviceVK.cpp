@@ -117,8 +117,6 @@ struct RenderPassDiagEntry
 };
 
 static std::array<RenderPassDiagEntry, 64> s_render_pass_diag_entries;
-static std::array<u32, 4> s_render_pass_diag_om_reasons;
-static std::array<u32, 16> s_render_pass_diag_ps_slots;
 static u32 s_render_pass_diag_total = 0;
 static u32 s_render_pass_diag_overflow = 0;
 static u32 s_render_pass_diag_presents = 0;
@@ -159,23 +157,6 @@ static void RecordRenderPassEnd(void* caller)
 	s_render_pass_diag_total++;
 }
 
-static void RecordRenderTargetChange(bool rt_changed, bool ds_changed, bool feedback_changed, bool framebuffer_missing)
-{
-	if (!IsRenderPassDiagEnabled())
-		return;
-
-	s_render_pass_diag_om_reasons[0] += static_cast<u32>(rt_changed);
-	s_render_pass_diag_om_reasons[1] += static_cast<u32>(ds_changed);
-	s_render_pass_diag_om_reasons[2] += static_cast<u32>(feedback_changed);
-	s_render_pass_diag_om_reasons[3] += static_cast<u32>(framebuffer_missing);
-}
-
-static void RecordShaderResourceTransition(int slot)
-{
-	if (IsRenderPassDiagEnabled() && slot >= 0 && static_cast<std::size_t>(slot) < s_render_pass_diag_ps_slots.size())
-		s_render_pass_diag_ps_slots[slot]++;
-}
-
 static void DumpRenderPassDiag()
 {
 	if (!IsRenderPassDiagEnabled() || ++s_render_pass_diag_presents < 120)
@@ -183,14 +164,6 @@ static void DumpRenderPassDiag()
 
 	Console.WriteLn("RPDIAG presents=%u total=%u overflow=%u", s_render_pass_diag_presents,
 		s_render_pass_diag_total, s_render_pass_diag_overflow);
-	Console.WriteLn("RPDIAG om_rt=%u om_ds=%u om_feedback=%u om_missing=%u",
-		s_render_pass_diag_om_reasons[0], s_render_pass_diag_om_reasons[1],
-		s_render_pass_diag_om_reasons[2], s_render_pass_diag_om_reasons[3]);
-	for (std::size_t slot = 0; slot < s_render_pass_diag_ps_slots.size(); slot++)
-	{
-		if (s_render_pass_diag_ps_slots[slot] != 0)
-			Console.WriteLn("RPDIAG ps_slot=%zu count=%u", slot, s_render_pass_diag_ps_slots[slot]);
-	}
 	for (const RenderPassDiagEntry& entry : s_render_pass_diag_entries)
 	{
 		if (entry.caller == 0)
@@ -204,8 +177,6 @@ static void DumpRenderPassDiag()
 	}
 
 	s_render_pass_diag_entries = {};
-	s_render_pass_diag_om_reasons = {};
-	s_render_pass_diag_ps_slots = {};
 	s_render_pass_diag_total = 0;
 	s_render_pass_diag_overflow = 0;
 	s_render_pass_diag_presents = 0;
@@ -4141,13 +4112,6 @@ void GSDeviceVK::OMSetRenderTargets(
 		m_current_framebuffer == VK_NULL_HANDLE)
 	{
 		// framebuffer change or feedback loop enabled/disabled
-#if defined(__linux__) || defined(__APPLE__)
-		if (InRenderPass())
-		{
-			RecordRenderTargetChange(m_current_render_target != vkRt, m_current_depth_target != vkDs,
-				m_current_framebuffer_feedback_loop != feedback_loop, m_current_framebuffer == VK_NULL_HANDLE);
-		}
-#endif
 		EndRenderPass();
 
 		if (vkRt)
@@ -6241,9 +6205,6 @@ void GSDeviceVK::PSSetShaderResource(int i, GSTexture* sr, bool check_state, Res
 				if (InRenderPass())
 				{
 					GL_INS("Ending render pass due to resource transition");
-#if defined(__linux__) || defined(__APPLE__)
-					RecordShaderResourceTransition(i);
-#endif
 					EndRenderPass();
 				}
 				vkTex->TransitionToLayout(layout);
