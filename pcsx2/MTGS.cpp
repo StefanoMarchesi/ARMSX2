@@ -77,9 +77,7 @@ namespace MTGS
 	static std::atomic<bool> s_SignalRingEnable;
 	static std::atomic<int> s_SignalRingPosition;
 
-	// This counter crosses the EE/GS boundary every frame. Keep it away from
-	// the signal-ring atomics, which are updated on a different hot path.
-	alignas(__cachelinesize) static std::atomic<int> s_QueuedFrameCount;
+	static std::atomic<int> s_QueuedFrameCount;
 	static std::atomic<bool> s_VsyncSignalListener;
 
 	static std::mutex s_mtx_RingBufferBusy2; // Gets released on semaXGkick waiting...
@@ -465,16 +463,15 @@ void MTGS::MainLoop()
 					if (!vu1Thread.semaXGkick.TryWait())
 					{
 						mtvu_lock.unlock();
-						// VU1 usually completes within a few microseconds. Spin briefly
-						// before entering the kernel so short hand-offs avoid a futex.
-						vu1Thread.semaXGkick.WaitWithSpin();
+						// Wait for MTVU to complete vu1 program
+						vu1Thread.semaXGkick.Wait();
 						mtvu_lock.lock();
 					}
 					Gif_Path& path = gifUnit.gifPath[GIF_PATH_1];
 					GS_Packet gsPack = path.GetGSPacketMTVU(); // Get vu1 program's xgkick packet(s)
 					if (gsPack.size)
 						GSgifTransfer((u8*)&path.buffer[gsPack.offset], gsPack.size / 16);
-					path.readAmount.fetch_sub(gsPack.size + gsPack.readAmount, std::memory_order_release);
+					path.readAmount.fetch_sub(gsPack.size + gsPack.readAmount, std::memory_order_acq_rel);
 					path.PopGSPacketMTVU(); // Should be done last, for proper Gif_MTGS_Wait()
 					break;
 				}
@@ -1070,7 +1067,7 @@ void Gif_AddCompletedGSPacket(GS_Packet& gsPack, GIF_PATH path)
 	else
 	{
 		pxAssertMsg(!gsPack.readAmount, "Gif Unit - gsPack.readAmount only valid for MTVU path 1!");
-		gifUnit.gifPath[path].readAmount.fetch_add(gsPack.size, std::memory_order_release);
+		gifUnit.gifPath[path].readAmount.fetch_add(gsPack.size);
 		MTGS::SendSimpleGSPacket(MTGS::Command::GSPacket, gsPack.offset, gsPack.size, path);
 	}
 }
@@ -1078,7 +1075,7 @@ void Gif_AddCompletedGSPacket(GS_Packet& gsPack, GIF_PATH path)
 void Gif_AddBlankGSPacket(u32 size, GIF_PATH path)
 {
 	//DevCon.WriteLn("Adding Blank Gif Packet [size=%x]", size);
-	gifUnit.gifPath[path].readAmount.fetch_add(size, std::memory_order_release);
+	gifUnit.gifPath[path].readAmount.fetch_add(size);
 	MTGS::SendSimpleGSPacket(MTGS::Command::GSPacket, ~0u, size, path);
 }
 
