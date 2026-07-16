@@ -136,14 +136,19 @@ __fi void PSX_INT( IopEventId n, s32 ecycle )
 	psxRegs.eCycle[n] = ecycle;
 
 	psxSetNextBranchDelta(ecycle);
-	const float mutiplier = static_cast<float>(PS2CLK) / static_cast<float>(PSXCLK);
-	const s32 iopDelta = (psxRegs.iopNextEventCycle - psxRegs.cycle) * mutiplier;
+	const s32 iop_delta = static_cast<s32>(psxRegs.iopNextEventCycle - psxRegs.cycle);
+	// In PS2 mode PS2CLK/PSXCLK is exactly 8. Avoid a float conversion and
+	// multiply on every IOP interrupt; retain the fractional path for PS1 mode.
+	s32 ee_delta;
+	if (PSXCLK == 36864000) [[likely]]
+		ee_delta = iop_delta << 3;
+	else
+		ee_delta = static_cast<s32>(iop_delta * (static_cast<float>(PS2CLK) / static_cast<float>(PSXCLK)));
 
-	if (psxRegs.iopCycleEE < iopDelta)
+	if (psxRegs.iopCycleEE < ee_delta)
 	{
 		// The EE called this int, so inform it to branch as needed:
-		
-		cpuSetNextEventDelta(iopDelta - psxRegs.iopCycleEE);
+		cpuSetNextEventDelta(ee_delta - psxRegs.iopCycleEE);
 	}
 }
 
