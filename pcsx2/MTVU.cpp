@@ -135,6 +135,10 @@ void VU_Thread::ExecuteRingBuffer()
 		if (m_shutdown_flag.load(std::memory_order_acquire))
 			break;
 
+		// Coalesce VU-completion posts while draining a mixed command batch.
+		// Flush before another execute so MTGS can drain an XGKICK buffer while
+		// VU1 runs, which also prevents the producer/consumer deadlock.
+		int pending_xgkick_posts = 0;
 		while (m_ato_read_pos.load(std::memory_order_relaxed) != GetWritePos())
 		{
 			u32 tag = Read();
@@ -142,6 +146,11 @@ void VU_Thread::ExecuteRingBuffer()
 			{
 				case MTVU_VU_EXECUTE:
 				{
+					if (pending_xgkick_posts)
+					{
+						semaXGkick.Post(pending_xgkick_posts);
+						pending_xgkick_posts = 0;
+					}
 					VU1.cycle = 0;
 					s32 addr = Read();
 					vifRegs.top = Read();
@@ -152,7 +161,7 @@ void VU_Thread::ExecuteRingBuffer()
 					CpuVU1->SetStartPC(VU1.VI[REG_TPC].UL << 3);
 					CpuVU1->Execute(vu1RunCycles);
 					gifUnit.gifPath[GIF_PATH_1].FinishGSPacketMTVU();
-					semaXGkick.Post(); // Tell MTGS a path1 packet is complete
+					pending_xgkick_posts++;
 					vuCycles[vuCycleIdx].store(VU1.cycle, std::memory_order_release);
 					vuCycleIdx = (vuCycleIdx + 1) & 3;
 					break;
@@ -202,6 +211,9 @@ void VU_Thread::ExecuteRingBuffer()
 
 			CommitReadPos();
 		}
+
+		if (pending_xgkick_posts)
+			semaXGkick.Post(pending_xgkick_posts);
 	}
 
 	semaEvent.Kill();
