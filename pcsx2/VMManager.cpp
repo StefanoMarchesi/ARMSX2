@@ -2805,7 +2805,7 @@ void VMManager::UpdateCPUImplementations()
 		? static_cast<BaseVUmicroCPU*>(&CpuArmVU0)
 		: static_cast<BaseVUmicroCPU*>(&CpuIntVU0);
 	CpuVU1 = EmuConfig.Cpu.Recompiler.EnableVU1
-		? static_cast<BaseVUmicroCPU*>(&CpuArmVU1)
+		? static_cast<BaseVUmicroCPU*>(&pcsx2_macrec::CpuMicroVU1)
 		: static_cast<BaseVUmicroCPU*>(&CpuIntVU1);
 #endif
 }
