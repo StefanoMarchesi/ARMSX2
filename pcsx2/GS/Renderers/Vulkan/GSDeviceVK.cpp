@@ -33,10 +33,6 @@
 #include <mutex>
 #include <sstream>
 
-#if defined(__linux__) || defined(__APPLE__)
-#include <dlfcn.h>
-#endif
-
 // Tweakables
 enum : u32
 {
@@ -108,80 +104,6 @@ static VkAttachmentLoadOp GetLoadOpForTexture(GSTextureVK* tex)
 }
 
 static constexpr VkClearValue s_present_clear_color = {{{0.0f, 0.0f, 0.0f, 1.0f}}};
-
-#if defined(__linux__) || defined(__APPLE__)
-struct RenderPassDiagEntry
-{
-	std::uintptr_t caller = 0;
-	u32 count = 0;
-};
-
-static std::array<RenderPassDiagEntry, 64> s_render_pass_diag_entries;
-static u32 s_render_pass_diag_total = 0;
-static u32 s_render_pass_diag_overflow = 0;
-static u32 s_render_pass_diag_presents = 0;
-
-static bool IsRenderPassDiagEnabled()
-{
-	static const bool enabled = []() {
-		const char* value = std::getenv("ARMSX2_RP_DIAG");
-		return value && value[0] == '1';
-	}();
-	return enabled;
-}
-
-static void RecordRenderPassEnd(void* caller)
-{
-	if (!IsRenderPassDiagEnabled())
-		return;
-
-	const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(caller);
-	for (RenderPassDiagEntry& entry : s_render_pass_diag_entries)
-	{
-		if (entry.caller == address)
-		{
-			entry.count++;
-			s_render_pass_diag_total++;
-			return;
-		}
-		if (entry.caller == 0)
-		{
-			entry.caller = address;
-			entry.count = 1;
-			s_render_pass_diag_total++;
-			return;
-		}
-	}
-
-	s_render_pass_diag_overflow++;
-	s_render_pass_diag_total++;
-}
-
-static void DumpRenderPassDiag()
-{
-	if (!IsRenderPassDiagEnabled() || ++s_render_pass_diag_presents < 120)
-		return;
-
-	Console.WriteLn("RPDIAG presents=%u total=%u overflow=%u", s_render_pass_diag_presents,
-		s_render_pass_diag_total, s_render_pass_diag_overflow);
-	for (const RenderPassDiagEntry& entry : s_render_pass_diag_entries)
-	{
-		if (entry.caller == 0)
-			continue;
-
-		Dl_info info = {};
-		const bool found = dladdr(reinterpret_cast<void*>(entry.caller), &info) != 0 && info.dli_fbase;
-		const std::uintptr_t offset = found ?
-			(entry.caller - reinterpret_cast<std::uintptr_t>(info.dli_fbase)) : entry.caller;
-		Console.WriteLn("RPDIAG caller=0x%zx count=%u", static_cast<std::size_t>(offset), entry.count);
-	}
-
-	s_render_pass_diag_entries = {};
-	s_render_pass_diag_total = 0;
-	s_render_pass_diag_overflow = 0;
-	s_render_pass_diag_presents = 0;
-}
-#endif
 
 // We need to synchronize instance creation because of adapter enumeration from the UI thread.
 static std::mutex s_instance_mutex;
@@ -2804,10 +2726,6 @@ void GSDeviceVK::EndPresent()
 	MoveToNextCommandBuffer();
 
 	InvalidateCachedState();
-
-#if defined(__linux__) || defined(__APPLE__)
-	DumpRenderPassDiag();
-#endif
 }
 
 bool GSDeviceVK::IsPresenting() const
@@ -6367,10 +6285,6 @@ void GSDeviceVK::EndRenderPass()
 {
 	if (m_current_render_pass == VK_NULL_HANDLE)
 		return;
-
-#if defined(__linux__) || defined(__APPLE__)
-	RecordRenderPassEnd(__builtin_extract_return_addr(__builtin_return_address(0)));
-#endif
 
 	m_current_render_pass = VK_NULL_HANDLE;
 	g_perfmon.Put(GSPerfMon::RenderPasses, 1);
