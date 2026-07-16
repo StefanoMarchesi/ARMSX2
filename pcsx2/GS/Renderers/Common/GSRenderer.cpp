@@ -730,8 +730,10 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 
 			EndPresentFrame();
 
-			const float gpu_time = g_gs_device->GetAndResetAccumulatedGPUTime();
-			GPUPipelineStatistics gpu_stats = g_gs_device->GetAndResetAccumulatedGPUPipelineStatistics();
+			const float gpu_time = (GSConfig.OsdShowGPU || GSDumpReplayer::IsReplayingDump()) ?
+				g_gs_device->GetAndResetAccumulatedGPUTime() : 0.0f;
+			const GPUPipelineStatistics gpu_stats = GSConfig.OsdShowGPUStats ?
+				g_gs_device->GetAndResetAccumulatedGPUPipelineStatistics() : GPUPipelineStatistics{};
 			PerformanceMetrics::OnGPUPresent(gpu_time, gpu_stats.vs_invocations, gpu_stats.ps_invocations);
 		}
 
