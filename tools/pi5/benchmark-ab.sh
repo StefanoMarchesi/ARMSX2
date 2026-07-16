@@ -93,60 +93,52 @@ prepare_profile() {
 prepare_profile stable PCSX2
 prepare_profile modern ARMSX2
 
-if [ -n "$MODERN_FASTMEM" ]; then
-	cat >>"$RUN_ROOT/profile-modern/ARMSX2/inis/PCSX2.ini" <<EOF
+set_ini_value() {
+	local file="$1" section="$2" key="$3" value="$4"
+	if grep -q "^${key}[[:space:]]*=" "$file"; then
+		sed -i "s|^${key}[[:space:]]*=.*|${key} = ${value}|" "$file"
+	else
+		cat >>"$file" <<EOF
 
-[EmuCore/CPU/Recompiler]
-EnableFastmem = $MODERN_FASTMEM
+[$section]
+$key = $value
 EOF
+	fi
+}
+
+if [ -n "$MODERN_FASTMEM" ]; then
+	set_ini_value "$RUN_ROOT/profile-modern/ARMSX2/inis/PCSX2.ini" \
+		"EmuCore/CPU/Recompiler" "EnableFastmem" "$MODERN_FASTMEM"
 fi
 
 if [ -n "$MODERN_EE_RECOMPILER" ]; then
-	cat >>"$RUN_ROOT/profile-modern/ARMSX2/inis/PCSX2.ini" <<EOF
-
-[EmuCore/CPU/Recompiler]
-EnableEE = $MODERN_EE_RECOMPILER
-EOF
+	set_ini_value "$RUN_ROOT/profile-modern/ARMSX2/inis/PCSX2.ini" \
+		"EmuCore/CPU/Recompiler" "EnableEE" "$MODERN_EE_RECOMPILER"
 fi
 
 if [ -n "$MODERN_IOP_RECOMPILER" ]; then
-	cat >>"$RUN_ROOT/profile-modern/ARMSX2/inis/PCSX2.ini" <<EOF
-
-[EmuCore/CPU/Recompiler]
-EnableIOP = $MODERN_IOP_RECOMPILER
-EOF
+	set_ini_value "$RUN_ROOT/profile-modern/ARMSX2/inis/PCSX2.ini" \
+		"EmuCore/CPU/Recompiler" "EnableIOP" "$MODERN_IOP_RECOMPILER"
 fi
 
 if [ -n "$MODERN_DISABLE_FB_FETCH" ]; then
-	cat >>"$RUN_ROOT/profile-modern/ARMSX2/inis/PCSX2.ini" <<EOF
-
-[EmuCore/GS]
-DisableFramebufferFetch = $MODERN_DISABLE_FB_FETCH
-EOF
+	set_ini_value "$RUN_ROOT/profile-modern/ARMSX2/inis/PCSX2.ini" \
+		"EmuCore/GS" "DisableFramebufferFetch" "$MODERN_DISABLE_FB_FETCH"
 fi
 
 if [ -n "$STABLE_MAC_EE" ]; then
-	cat >>"$RUN_ROOT/profile-stable/PCSX2/inis/PCSX2.ini" <<EOF
-
-[EmuCore/CPU/Recompiler]
-UseMacEE = $STABLE_MAC_EE
-EOF
+	set_ini_value "$RUN_ROOT/profile-stable/PCSX2/inis/PCSX2.ini" \
+		"EmuCore/CPU/Recompiler" "UseMacEE" "$STABLE_MAC_EE"
 fi
 
 if [ -n "$STABLE_RENDERER" ]; then
-	cat >>"$RUN_ROOT/profile-stable/PCSX2/inis/PCSX2.ini" <<EOF
-
-[EmuCore/GS]
-Renderer = $STABLE_RENDERER
-EOF
+	set_ini_value "$RUN_ROOT/profile-stable/PCSX2/inis/PCSX2.ini" \
+		"EmuCore/GS" "Renderer" "$STABLE_RENDERER"
 fi
 
 if [ -n "$MODERN_RENDERER" ]; then
-	cat >>"$RUN_ROOT/profile-modern/ARMSX2/inis/PCSX2.ini" <<EOF
-
-[EmuCore/GS]
-Renderer = $MODERN_RENDERER
-EOF
+	set_ini_value "$RUN_ROOT/profile-modern/ARMSX2/inis/PCSX2.ini" \
+		"EmuCore/GS" "Renderer" "$MODERN_RENDERER"
 fi
 
 export DISPLAY="${DISPLAY:-:0}"
