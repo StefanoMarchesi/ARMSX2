@@ -16,11 +16,15 @@ MRT_MODE="${MRT_MODE:-baseline}"
 MRT_DIAG="${ARMSX2_MRT_DIAG:-}"
 MRT_AUTO_DIAG="${ARMSX2_MRT_AUTO_DIAG:-}"
 STABLE_MAC_EE="${STABLE_MAC_EE:-}"
+V3D_RETENTION_AB="${V3D_RETENTION_AB:-0}"
+SETTLE_SECONDS="${SETTLE_SECONDS:-0}"
+WARMUP_SETTLE_SECONDS="${WARMUP_SETTLE_SECONDS:-0}"
 
 ROMS=/mnt/share/roms/ps2
 SOURCE_DATA=/home/raspi/armsx2-data/PCSX2
-STABLE_BIN=/home/raspi/armsx2-staging/2026-07-15-ftlog/pcsx2-qt
-MODERN_BIN=/home/raspi/armsx2-port-20260715/build-pi5-port/bin/armsx2-qt
+STABLE_BIN="${STABLE_BIN:-/home/raspi/armsx2-staging/2026-07-15-ftlog/pcsx2-qt}"
+MODERN_BIN="${MODERN_BIN:-/home/raspi/armsx2-port-20260715/build-pi5-port/bin/armsx2-qt}"
+[ "$V3D_RETENTION_AB" != 1 ] || STABLE_BIN="$MODERN_BIN"
 RESULT_BASE=/home/raspi/perf-results
 RUN_ID="$(date +%Y%m%d-%H%M%S)-${GAME}-${MRT_MODE}-ab"
 RUN_ROOT="$RESULT_BASE/$RUN_ID"
@@ -79,7 +83,7 @@ prepare_profile() {
 	mkdir -p "$target/cache" "$target/logs" "$target/sstates" "$profile/xdg-cache"
 }
 
-prepare_profile stable PCSX2
+prepare_profile stable "$([ "$V3D_RETENTION_AB" = 1 ] && echo ARMSX2 || echo PCSX2)"
 prepare_profile modern ARMSX2
 
 if [ -n "$STABLE_MAC_EE" ]; then
@@ -101,6 +105,7 @@ export ARMSX2_FTLOG=1
 export ARMSX2_FRAMEGATE=1
 export ARMSX2_FRAMELOG=1
 unset ARMSX2_MRT ARMSX2_MRT_AUTO ARMSX2_MRT_SWBLEND ARMSX2_MRT_ALPHA2 ARMSX2_MRT_DIAG
+unset ARMSX2_V3D_FEEDBACK_RETAIN
 unset ARMSX2_SPRITE_FASTPATH ARMSX2_SPRITE_FASTPATH_DIAG ARMSX2_HITCHLOG
 if [ "$GAME" = gow2 ]; then
 	export ARMSX2_DEPTH=d24s8
@@ -126,7 +131,7 @@ xrandr --output HDMI-2 --mode 720x480 --rate 60 --primary 2>/dev/null || true
 run_one() {
 	local build="$1" phase="$2" iteration="$3"
 	local bin app profile log prefix pid started last captured
-	if [ "$build" = stable ]; then
+	if [ "$build" = stable ] && [ "$V3D_RETENTION_AB" != 1 ]; then
 		bin="$STABLE_BIN"
 		app=PCSX2
 	else
@@ -140,6 +145,9 @@ run_one() {
 
 	local -a state_args=()
 	local -a run_env=("XDG_CACHE_HOME=$profile/xdg-cache")
+	if [ "$V3D_RETENTION_AB" = 1 ] && [ "$build" = stable ]; then
+		run_env+=(ARMSX2_V3D_FEEDBACK_RETAIN=0)
+	fi
 	[ -z "$MRT_DIAG" ] || run_env+=(ARMSX2_MRT_DIAG="$MRT_DIAG")
 	[ -z "$MRT_AUTO_DIAG" ] || run_env+=(ARMSX2_MRT_AUTO_DIAG="$MRT_AUTO_DIAG")
 	[ -z "$STATE" ] || state_args=(-statefile "$STATE")
@@ -149,6 +157,11 @@ run_one() {
 	elif [ "$MRT_MODE" != baseline ]; then
 		echo "unknown MRT_MODE: $MRT_MODE" >&2
 		exit 2
+	fi
+	if [ "$phase" = warmup ]; then
+		sleep "$WARMUP_SETTLE_SECONDS"
+	else
+		sleep "$SETTLE_SECONDS"
 	fi
 	env "${run_env[@]}" gamemoderun "$bin" \
 		-unlimited -batch -fullscreen -nogui -datapath "$profile" \
