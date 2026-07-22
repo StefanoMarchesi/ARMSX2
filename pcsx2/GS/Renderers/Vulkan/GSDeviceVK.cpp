@@ -7075,6 +7075,14 @@ void GSDeviceVK::RenderHW(GSHWDrawConfig& config)
 			u64 other = 0;
 		};
 		static BreakCounters s_break;
+		struct OtherTargetEntry
+		{
+			GSTextureVK* rt = nullptr;
+			GSTextureVK* ds = nullptr;
+			u64 count = 0;
+		};
+		static std::array<OtherTargetEntry, 16> s_other_targets;
+		static u64 s_other_target_overflow = 0;
 		s_break.total++;
 
 		GSTextureVK* const candidate = static_cast<GSTextureVK*>(config.mrt_rt);
@@ -7095,7 +7103,31 @@ void GSDeviceVK::RenderHW(GSHWDrawConfig& config)
 					s_break.no_candidate_pair_other_depth++;
 			}
 			else
+			{
 				s_break.no_candidate_other_rt++;
+				OtherTargetEntry* free_entry = nullptr;
+				OtherTargetEntry* entry = nullptr;
+				for (OtherTargetEntry& candidate_entry : s_other_targets)
+				{
+					if (candidate_entry.rt == config_rt && candidate_entry.ds == config_ds)
+					{
+						entry = &candidate_entry;
+						break;
+					}
+					if (!candidate_entry.rt && !free_entry)
+						free_entry = &candidate_entry;
+				}
+				if (!entry)
+					entry = free_entry;
+				if (entry)
+				{
+					entry->rt = config_rt;
+					entry->ds = config_ds;
+					entry->count++;
+				}
+				else
+					s_other_target_overflow++;
+			}
 		}
 		else if (!config.rt || !config.ds)
 			s_break.no_rt_ds++;
@@ -7150,6 +7182,22 @@ void GSDeviceVK::RenderHW(GSHWDrawConfig& config)
 				static_cast<unsigned long long>(s_break.blend_multi),
 				static_cast<unsigned long long>(s_break.state),
 				static_cast<unsigned long long>(s_break.other));
+
+			if ((s_break.total % 4096) == 0)
+			{
+				for (u32 i = 0; i < s_other_targets.size(); i++)
+				{
+					const OtherTargetEntry& entry = s_other_targets[i];
+					if (!entry.rt)
+						continue;
+					Console.WriteLn("MRTOTHER slot=%u count=%llu rt=%p ds=%p size=%dx%d format=%u same_depth=%u",
+						i, static_cast<unsigned long long>(entry.count), static_cast<void*>(entry.rt),
+						static_cast<void*>(entry.ds), entry.rt->GetWidth(), entry.rt->GetHeight(),
+						static_cast<unsigned>(entry.rt->GetFormat()), entry.ds == m_mrt_depth_target);
+				}
+				Console.WriteLn("MRTOTHER overflow=%llu",
+					static_cast<unsigned long long>(s_other_target_overflow));
+			}
 		}
 	}
 
