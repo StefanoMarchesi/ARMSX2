@@ -79,6 +79,15 @@ static bool IsArmsx2MRTAlpha2Enabled()
 	return enabled;
 }
 
+static bool IsV3DFeedbackRetentionEnabled()
+{
+	static const bool enabled = []() {
+		const char* value = std::getenv("ARMSX2_V3D_FEEDBACK_RETAIN");
+		return !value || value[0] != '0';
+	}();
+	return enabled;
+}
+
 static bool UsesNativeFeedbackInputAttachments(u32 vendor_id)
 {
 	// Mali and Broadcom V3D both consume the ROAA/subpass feedback path through
@@ -6930,7 +6939,7 @@ void GSDeviceVK::RenderHW(GSHWDrawConfig& config)
 		// attachments are unchanged, retain the feedback layout until either target
 		// changes. This is the legacy tuned behaviour, scoped to Broadcom because
 		// other drivers have shown flicker when feedback state is carried across draws.
-		if (IsDeviceBroadcom())
+		if (IsDeviceBroadcom() && IsV3DFeedbackRetentionEnabled())
 		{
 			if (draw_rt)
 				pipe.feedback_loop_flags |= m_current_framebuffer_feedback_loop & FeedbackLoopFlag_ReadAndWriteRT;
