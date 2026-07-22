@@ -7057,6 +7057,10 @@ void GSDeviceVK::RenderHW(GSHWDrawConfig& config)
 		{
 			u64 total = 0;
 			u64 no_candidate = 0;
+			u64 no_candidate_pair_depth = 0;
+			u64 no_candidate_pair_other_depth = 0;
+			u64 no_candidate_other_rt = 0;
+			u64 no_candidate_no_rt = 0;
 			u64 no_rt_ds = 0;
 			u64 bad_index = 0;
 			u64 tex_other = 0;
@@ -7077,7 +7081,22 @@ void GSDeviceVK::RenderHW(GSHWDrawConfig& config)
 		const bool supported_feedback = pipe.feedback_loop_flags == FeedbackLoopFlag_None ||
 			(IsArmsx2MRTSWBlendEnabled() && pipe.feedback_loop_flags == FeedbackLoopFlag_ReadAndWriteRT);
 		if (!candidate)
+		{
 			s_break.no_candidate++;
+			GSTextureVK* const config_rt = static_cast<GSTextureVK*>(config.rt);
+			GSTextureVK* const config_ds = static_cast<GSTextureVK*>(config.ds);
+			if (!config_rt)
+				s_break.no_candidate_no_rt++;
+			else if (config_rt == m_mrt_render_targets[0] || config_rt == m_mrt_render_targets[1])
+			{
+				if (config_ds == m_mrt_depth_target)
+					s_break.no_candidate_pair_depth++;
+				else
+					s_break.no_candidate_pair_other_depth++;
+			}
+			else
+				s_break.no_candidate_other_rt++;
+		}
 		else if (!config.rt || !config.ds)
 			s_break.no_rt_ds++;
 		else if (config.mrt_index >= 2)
@@ -7109,11 +7128,16 @@ void GSDeviceVK::RenderHW(GSHWDrawConfig& config)
 
 		if ((s_break.total % 1024) == 0)
 		{
-			Console.WriteLn("MRTBREAK total=%llu nocandidate=%llu nortds=%llu badindex=%llu texother=%llu "
+			Console.WriteLn("MRTBREAK total=%llu nocandidate=%llu ncpairdepth=%llu ncpairotherds=%llu "
+				"ncotherrt=%llu ncnort=%llu nortds=%llu badindex=%llu texother=%llu "
 				"dual=%llu rov=%llu feedback=%llu date=%llu colclip=%llu alpha2=%llu blendmulti=%llu "
 				"state=%llu other=%llu",
 				static_cast<unsigned long long>(s_break.total),
 				static_cast<unsigned long long>(s_break.no_candidate),
+				static_cast<unsigned long long>(s_break.no_candidate_pair_depth),
+				static_cast<unsigned long long>(s_break.no_candidate_pair_other_depth),
+				static_cast<unsigned long long>(s_break.no_candidate_other_rt),
+				static_cast<unsigned long long>(s_break.no_candidate_no_rt),
 				static_cast<unsigned long long>(s_break.no_rt_ds),
 				static_cast<unsigned long long>(s_break.bad_index),
 				static_cast<unsigned long long>(s_break.tex_other),
