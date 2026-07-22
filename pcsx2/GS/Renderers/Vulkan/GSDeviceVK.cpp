@@ -7046,6 +7046,89 @@ void GSDeviceVK::RenderHW(GSHWDrawConfig& config)
 	
 	PSSetROVs(draw_rt_rov, draw_ds_rov, config.ps.HasColorOutput(), config.ps.HasDepthROVWrite());
 
+	// Classify only draws which force an already active MRT pass back through the
+	// ordinary framebuffer path. The broad eligibility counters in
+	// ApplyHWDrawConfig() include every draw and therefore cannot identify the
+	// small set of pass-breaking operations which matter most on a TBDR.
+	if (static const bool s_diag = (std::getenv("ARMSX2_MRT_DIAG") != nullptr);
+		s_diag && m_current_framebuffer_is_mrt && !pipe.mrt)
+	{
+		struct BreakCounters
+		{
+			u64 total = 0;
+			u64 no_candidate = 0;
+			u64 no_rt_ds = 0;
+			u64 bad_index = 0;
+			u64 tex_other = 0;
+			u64 dual_source = 0;
+			u64 rov = 0;
+			u64 feedback = 0;
+			u64 date = 0;
+			u64 colclip = 0;
+			u64 alpha_second = 0;
+			u64 blend_multi = 0;
+			u64 state = 0;
+			u64 other = 0;
+		};
+		static BreakCounters s_break;
+		s_break.total++;
+
+		GSTextureVK* const candidate = static_cast<GSTextureVK*>(config.mrt_rt);
+		const bool supported_feedback = pipe.feedback_loop_flags == FeedbackLoopFlag_None ||
+			(IsArmsx2MRTSWBlendEnabled() && pipe.feedback_loop_flags == FeedbackLoopFlag_ReadAndWriteRT);
+		if (!candidate)
+			s_break.no_candidate++;
+		else if (!config.rt || !config.ds)
+			s_break.no_rt_ds++;
+		else if (config.mrt_index >= 2)
+			s_break.bad_index++;
+		else if (config.tex == config.mrt_rt)
+			s_break.tex_other++;
+		else if (!config.ps.no_color1)
+			s_break.dual_source++;
+		else if (config.ps.HasColorROV() || config.ps.HasDepthROV())
+			s_break.rov++;
+		else if (!supported_feedback)
+			s_break.feedback++;
+		else if (config.destination_alpha != GSHWDrawConfig::DestinationAlphaMode::Off)
+			s_break.date++;
+		else if (config.colclip_mode != GSHWDrawConfig::ColClipMode::NoModify)
+			s_break.colclip++;
+		else if (config.alpha_second_pass.enable && !IsArmsx2MRTAlpha2Enabled())
+			s_break.alpha_second++;
+		else if (config.blend_multi_pass.enable)
+			s_break.blend_multi++;
+		else if (static_cast<GSTextureVK*>(config.rt)->GetState() != GSTexture::State::Dirty ||
+			candidate->GetState() != GSTexture::State::Dirty ||
+			static_cast<GSTextureVK*>(config.ds)->GetState() != GSTexture::State::Dirty)
+		{
+			s_break.state++;
+		}
+		else
+			s_break.other++;
+
+		if ((s_break.total % 1024) == 0)
+		{
+			Console.WriteLn("MRTBREAK total=%llu nocandidate=%llu nortds=%llu badindex=%llu texother=%llu "
+				"dual=%llu rov=%llu feedback=%llu date=%llu colclip=%llu alpha2=%llu blendmulti=%llu "
+				"state=%llu other=%llu",
+				static_cast<unsigned long long>(s_break.total),
+				static_cast<unsigned long long>(s_break.no_candidate),
+				static_cast<unsigned long long>(s_break.no_rt_ds),
+				static_cast<unsigned long long>(s_break.bad_index),
+				static_cast<unsigned long long>(s_break.tex_other),
+				static_cast<unsigned long long>(s_break.dual_source),
+				static_cast<unsigned long long>(s_break.rov),
+				static_cast<unsigned long long>(s_break.feedback),
+				static_cast<unsigned long long>(s_break.date),
+				static_cast<unsigned long long>(s_break.colclip),
+				static_cast<unsigned long long>(s_break.alpha_second),
+				static_cast<unsigned long long>(s_break.blend_multi),
+				static_cast<unsigned long long>(s_break.state),
+				static_cast<unsigned long long>(s_break.other));
+		}
+	}
+
 	if (!pipe.mrt || !OMSetRenderTargetsMRT(draw_rt, static_cast<GSTextureVK*>(config.mrt_rt), draw_ds,
 		config.scissor, pipe.mrt_index, IsArmsx2MRTSWBlendEnabled()))
 	{
