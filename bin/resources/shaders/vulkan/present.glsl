@@ -42,6 +42,78 @@ vec4 sample_c(vec2 uv)
 	return texture(samp0, uv);
 }
 
+#ifdef ps_v3d_sgsr1
+float v3d_sgsr1_fast_lanczos2(float x)
+{
+	float wa = x - 4.0;
+	float wb = x * wa - wa;
+	wa *= wa;
+	return wb * wa;
+}
+
+vec2 v3d_sgsr1_weight_y(float dx, float dy, float contrast, float stddev)
+{
+	float x = (dx * dx + dy * dy) * 0.55 + clamp(abs(contrast) * stddev, 0.0, 1.0);
+	float weight = v3d_sgsr1_fast_lanczos2(x);
+	return vec2(weight, weight * contrast);
+}
+
+void ps_v3d_sgsr1()
+{
+	vec3 color = sample_c(v_tex).rgb;
+	vec2 image_coord = v_tex * u_source_resolution + vec2(-0.5, 0.5);
+	vec2 image_pixel = floor(image_coord);
+	vec2 phase = image_coord - image_pixel;
+	vec2 coord = image_pixel * u_rcp_source_resolution;
+
+	vec4 left = textureGather(samp0, coord, 1);
+	float edge_vote =
+		abs(left.z - left.y) + abs(color.g - left.y) + abs(color.g - left.z);
+	if (edge_vote > 8.0 / 255.0)
+	{
+		coord.x += u_rcp_source_resolution.x;
+		vec4 right =
+			textureGather(samp0, coord + vec2(u_rcp_source_resolution.x, 0.0), 1);
+		vec4 up_down;
+		up_down.xy =
+			textureGather(samp0, coord + vec2(0.0, -u_rcp_source_resolution.y), 1).wz;
+		up_down.zw =
+			textureGather(samp0, coord + vec2(0.0, u_rcp_source_resolution.y), 1).yx;
+
+		float mean = (left.y + left.z + right.x + right.w) * 0.25;
+		left -= vec4(mean);
+		right -= vec4(mean);
+		up_down -= vec4(mean);
+		float center = color.g - mean;
+		float sum = dot(abs(left), vec4(1.0)) + dot(abs(right), vec4(1.0)) +
+		            dot(abs(up_down), vec4(1.0));
+		float stddev = 2.181818 / max(sum, 1.0e-6);
+
+		vec2 weights = v3d_sgsr1_weight_y(phase.x, phase.y + 1.0, up_down.x, stddev);
+		weights += v3d_sgsr1_weight_y(phase.x - 1.0, phase.y + 1.0, up_down.y, stddev);
+		weights += v3d_sgsr1_weight_y(phase.x - 1.0, phase.y - 2.0, up_down.z, stddev);
+		weights += v3d_sgsr1_weight_y(phase.x, phase.y - 2.0, up_down.w, stddev);
+		weights += v3d_sgsr1_weight_y(phase.x + 1.0, phase.y - 1.0, left.x, stddev);
+		weights += v3d_sgsr1_weight_y(phase.x, phase.y - 1.0, left.y, stddev);
+		weights += v3d_sgsr1_weight_y(phase.x, phase.y, left.z, stddev);
+		weights += v3d_sgsr1_weight_y(phase.x + 1.0, phase.y, left.w, stddev);
+		weights += v3d_sgsr1_weight_y(phase.x - 1.0, phase.y - 1.0, right.x, stddev);
+		weights += v3d_sgsr1_weight_y(phase.x - 2.0, phase.y - 1.0, right.y, stddev);
+		weights += v3d_sgsr1_weight_y(phase.x - 2.0, phase.y, right.z, stddev);
+		weights += v3d_sgsr1_weight_y(phase.x - 1.0, phase.y, right.w, stddev);
+
+		float filtered = weights.y / max(weights.x, 1.0e-6);
+		float max_y = max(max(left.y, left.z), max(right.x, right.w));
+		float min_y = min(min(left.y, left.z), min(right.x, right.w));
+		float delta = clamp(2.0 * filtered, min_y, max_y) - center;
+		delta = clamp(delta, -23.0 / 255.0, 23.0 / 255.0);
+		color = clamp(color + vec3(delta), 0.0, 1.0);
+	}
+
+	o_col0 = vec4(color, 1.0);
+}
+#endif
+
 vec4 ps_crt(uint i)
 {
 	vec4 mask[4] = vec4[4](

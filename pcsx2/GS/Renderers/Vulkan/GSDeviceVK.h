@@ -446,6 +446,7 @@ private:
 
 	std::vector<VkPipeline> m_convert;
 	std::array<VkPipeline, static_cast<int>(PresentShader::Count)> m_present{};
+	VkPipeline m_v3d_sgsr1_present_pipeline = VK_NULL_HANDLE;
 	std::array<VkPipeline, 2> m_merge{};
 	std::array<VkPipeline, NUM_INTERLACE_SHADERS> m_interlace{};
 	VkPipeline m_colclip_setup_pipelines[2][2] = {}; // [depth][feedback_loop]

@@ -79,7 +79,16 @@ static bool IsArmsx2MRTAlpha2Enabled()
 	return enabled;
 }
 
-static bool IsV3DSGSR1Enabled()
+static bool IsV3DSGSR1ComputeEnabled()
+{
+	static const bool enabled = []() {
+		const char* value = std::getenv("ARMSX2_V3D_SGSR1");
+		return value && value[0] == '2';
+	}();
+	return enabled;
+}
+
+static bool IsV3DSGSR1PresentEnabled()
 {
 	static const bool enabled = []() {
 		const char* value = std::getenv("ARMSX2_V3D_SGSR1");
@@ -3179,8 +3188,11 @@ void GSDeviceVK::PresentRect(GSTexture* sTex, const GSVector4& sRect, GSTexture*
 	cb.SetTime(shaderTime);
 	SetUtilityPushConstants(&cb, sizeof(cb));
 
-	DoStretchRect(static_cast<GSTextureVK*>(sTex), sRect, static_cast<GSTextureVK*>(dTex), dRect,
-		m_present[static_cast<int>(shader)], filter, true);
+	const VkPipeline pipeline =
+		(IsV3DSGSR1PresentEnabled() && m_v3d_sgsr1_present_pipeline != VK_NULL_HANDLE) ?
+			m_v3d_sgsr1_present_pipeline :
+			m_present[static_cast<int>(shader)];
+	DoStretchRect(static_cast<GSTextureVK*>(sTex), sRect, static_cast<GSTextureVK*>(dTex), dRect, pipeline, filter, true);
 }
 
 void GSDeviceVK::DrawMultiStretchRects(
@@ -4591,6 +4603,23 @@ bool GSDeviceVK::CompilePresentPipelines()
 		Vulkan::SetObjectName(m_device, m_present[index], "Present pipeline %d", i);
 	}
 
+	if (IsV3DSGSR1PresentEnabled())
+	{
+		VkShaderModule ps = GetUtilityFragmentShader(*shader, "ps_v3d_sgsr1");
+		if (ps == VK_NULL_HANDLE)
+			return false;
+
+		ScopedGuard ps_guard([this, &ps]() { vkDestroyShaderModule(m_device, ps, nullptr); });
+		gpb.SetFragmentShader(ps);
+		m_v3d_sgsr1_present_pipeline =
+			gpb.Create(m_device, g_vulkan_shader_cache->GetPipelineCache(true), false);
+		if (m_v3d_sgsr1_present_pipeline == VK_NULL_HANDLE)
+			return false;
+
+		Vulkan::SetObjectName(m_device, m_v3d_sgsr1_present_pipeline, "V3D SGSR1 present pipeline");
+		Console.WriteLn("VK: V3D SGSR1 direct presentation pipeline enabled.");
+	}
+
 	return true;
 }
 
@@ -4825,7 +4854,7 @@ bool GSDeviceVK::CompileCASPipelines()
 			return false;
 	}
 
-	if (IsV3DSGSR1Enabled())
+	if (IsV3DSGSR1ComputeEnabled())
 	{
 		const std::optional<std::string> sgsr1_source = ReadShaderSource("shaders/vulkan/sgsr1_v3d.glsl");
 		if (sgsr1_source.has_value())
@@ -4844,6 +4873,8 @@ bool GSDeviceVK::CompileCASPipelines()
 
 		if (m_v3d_sgsr1_pipeline == VK_NULL_HANDLE)
 			Console.Warning("VK: V3D SGSR1 pipeline compilation failed; falling back to CAS.");
+		else
+			Console.WriteLn("VK: V3D SGSR1 presentation pipeline enabled.");
 	}
 
 	m_features.cas_sharpening = true;
@@ -5037,7 +5068,7 @@ bool GSDeviceVK::DoCAS(
 	}
 
 	const bool use_v3d_sgsr1 =
-		IsV3DSGSR1Enabled() && !sharpen_only && m_v3d_sgsr1_pipeline != VK_NULL_HANDLE;
+		IsV3DSGSR1ComputeEnabled() && !sharpen_only && m_v3d_sgsr1_pipeline != VK_NULL_HANDLE;
 	const int threadGroupWorkRegionDim = use_v3d_sgsr1 ? 8 : 16;
 	const int dispatchX = (dTex->GetWidth() + (threadGroupWorkRegionDim - 1)) / threadGroupWorkRegionDim;
 	const int dispatchY = (dTex->GetHeight() + (threadGroupWorkRegionDim - 1)) / threadGroupWorkRegionDim;
@@ -5086,6 +5117,8 @@ void GSDeviceVK::DestroyResources()
 		if (it != VK_NULL_HANDLE)
 			vkDestroyPipeline(m_device, it, nullptr);
 	}
+	if (m_v3d_sgsr1_present_pipeline != VK_NULL_HANDLE)
+		vkDestroyPipeline(m_device, m_v3d_sgsr1_present_pipeline, nullptr);
 	for (const auto& pipe : m_convert)
 	{
 		if (pipe != VK_NULL_HANDLE)
