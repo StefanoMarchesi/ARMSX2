@@ -79,6 +79,15 @@ static bool IsArmsx2MRTAlpha2Enabled()
 	return enabled;
 }
 
+static bool IsV3DSGSR1Enabled()
+{
+	static const bool enabled = []() {
+		const char* value = std::getenv("ARMSX2_V3D_SGSR1");
+		return value && value[0] == '1';
+	}();
+	return enabled;
+}
+
 static VkAttachmentLoadOp GetLoadOpForTexture(GSTextureVK* tex)
 {
 	if (!tex)
@@ -1011,6 +1020,7 @@ bool GSDeviceVK::CreateCommandBuffers()
 			static constexpr u32 MAX_FRAME_TEXTURE_SETS = 8192;
 			const VkDescriptorPoolSize frame_pool_sizes[] = {
 				{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_FRAME_TEXTURE_SETS * 2},
+				{VK_DESCRIPTOR_TYPE_SAMPLER, MAX_FRAME_TEXTURE_SETS},
 				{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAX_FRAME_TEXTURE_SETS * 5},
 				{VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, MAX_FRAME_TEXTURE_SETS * 2},
 				{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, MAX_FRAME_TEXTURE_SETS * 2},
@@ -4783,6 +4793,7 @@ bool GSDeviceVK::CompileCASPipelines()
 		dslb.SetPushFlag();
 	dslb.AddBinding(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT);
 	dslb.AddBinding(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT);
+	dslb.AddBinding(2, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT);
 	if ((m_cas_ds_layout = dslb.Create(dev)) == VK_NULL_HANDLE)
 		return false;
 	Vulkan::SetObjectName(dev, m_cas_ds_layout, "CAS descriptor layout");
@@ -4812,6 +4823,27 @@ bool GSDeviceVK::CompileCASPipelines()
 		m_cas_pipelines[sharpen_only] = cpb.Create(dev, g_vulkan_shader_cache->GetPipelineCache(true), false);
 		if (!m_cas_pipelines[sharpen_only])
 			return false;
+	}
+
+	if (IsV3DSGSR1Enabled())
+	{
+		const std::optional<std::string> sgsr1_source = ReadShaderSource("shaders/vulkan/sgsr1_v3d.glsl");
+		if (sgsr1_source.has_value())
+		{
+			VkShaderModule sgsr1_mod = g_vulkan_shader_cache->GetComputeShader(sgsr1_source->c_str());
+			if (sgsr1_mod != VK_NULL_HANDLE)
+			{
+				Vulkan::ComputePipelineBuilder cpb;
+				cpb.SetPipelineLayout(m_cas_pipeline_layout);
+				cpb.SetShader(sgsr1_mod, "main");
+				m_v3d_sgsr1_pipeline =
+					cpb.Create(dev, g_vulkan_shader_cache->GetPipelineCache(true), false);
+				vkDestroyShaderModule(m_device, sgsr1_mod, nullptr);
+			}
+		}
+
+		if (m_v3d_sgsr1_pipeline == VK_NULL_HANDLE)
+			Console.Warning("VK: V3D SGSR1 pipeline compilation failed; falling back to CAS.");
 	}
 
 	m_features.cas_sharpening = true;
@@ -4988,6 +5020,7 @@ bool GSDeviceVK::DoCAS(
 	Vulkan::DescriptorSetUpdateBuilder dsub;
 	dsub.AddImageDescriptorWrite(VK_NULL_HANDLE, 0, sTexVK->GetView(), sTexVK->GetVkLayout());
 	dsub.AddStorageImageDescriptorWrite(VK_NULL_HANDLE, 1, dTexVK->GetView(), dTexVK->GetVkLayout());
+	dsub.AddSamplerDescriptorWrite(VK_NULL_HANDLE, 2, m_linear_sampler);
 	if (m_use_push_descriptors)
 	{
 		dsub.PushUpdate(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_cas_pipeline_layout, 0, false);
@@ -5003,14 +5036,16 @@ bool GSDeviceVK::DoCAS(
 		}
 	}
 
-	// the actual meat and potatoes! only four commands.
-	static const int threadGroupWorkRegionDim = 16;
+	const bool use_v3d_sgsr1 =
+		IsV3DSGSR1Enabled() && !sharpen_only && m_v3d_sgsr1_pipeline != VK_NULL_HANDLE;
+	const int threadGroupWorkRegionDim = use_v3d_sgsr1 ? 8 : 16;
 	const int dispatchX = (dTex->GetWidth() + (threadGroupWorkRegionDim - 1)) / threadGroupWorkRegionDim;
 	const int dispatchY = (dTex->GetHeight() + (threadGroupWorkRegionDim - 1)) / threadGroupWorkRegionDim;
 
 	vkCmdPushConstants(cmdbuf, m_cas_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, NUM_CAS_CONSTANTS * sizeof(u32),
 		constants.data());
-	vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_cas_pipelines[static_cast<u8>(sharpen_only)]);
+	vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+		use_v3d_sgsr1 ? m_v3d_sgsr1_pipeline : m_cas_pipelines[static_cast<u8>(sharpen_only)]);
 	vkCmdDispatch(cmdbuf, dispatchX, dispatchY, 1);
 
 	dTexVK->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
@@ -5084,6 +5119,8 @@ void GSDeviceVK::DestroyResources()
 		if (it != VK_NULL_HANDLE)
 			vkDestroyPipeline(m_device, it, nullptr);
 	}
+	if (m_v3d_sgsr1_pipeline != VK_NULL_HANDLE)
+		vkDestroyPipeline(m_device, m_v3d_sgsr1_pipeline, nullptr);
 	if (m_cas_pipeline_layout != VK_NULL_HANDLE)
 		vkDestroyPipelineLayout(m_device, m_cas_pipeline_layout, nullptr);
 	if (m_cas_ds_layout != VK_NULL_HANDLE)

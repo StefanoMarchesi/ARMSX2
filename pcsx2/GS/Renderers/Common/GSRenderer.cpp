@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <deque>
 #include <thread>
 #include <mutex>
@@ -52,6 +53,15 @@ static Common::Timer::Value s_last_gpu_reset_time;
 
 // Screen alignment
 static GSDisplayAlignment s_display_alignment = GSDisplayAlignment::Center;
+
+static bool IsV3DSGSR1Enabled()
+{
+	static const bool enabled = []() {
+		const char* value = std::getenv("ARMSX2_V3D_SGSR1");
+		return value && value[0] == '1';
+	}();
+	return enabled;
+}
 
 GSRenderer::GSRenderer()
 	: m_shader_time_start(Common::Timer::GetCurrentValue())
@@ -666,15 +676,16 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 				GetVideoMode() == GSVideoMode::SDTV_480P);
 			s_last_draw_rect = draw_rect;
 
-			if (GSConfig.CASMode != GSCASMode::Disabled)
+			if (GSConfig.CASMode != GSCASMode::Disabled || IsV3DSGSR1Enabled())
 			{
 				static bool cas_log_once = false;
 				if (g_gs_device->Features().cas_sharpening)
 				{
 					// sharpen only if the IR is higher than the display resolution
-					const bool sharpen_only = (GSConfig.CASMode == GSCASMode::SharpenOnly ||
+					const bool sharpen_only = (!IsV3DSGSR1Enabled() &&
+					                          (GSConfig.CASMode == GSCASMode::SharpenOnly ||
 					                           (current->GetWidth() > g_gs_device->GetWindowWidth() &&
-					                            current->GetHeight() > g_gs_device->GetWindowHeight()));
+					                            current->GetHeight() > g_gs_device->GetWindowHeight())));
 					g_gs_device->CAS(current, src_rect, src_uv, draw_rect, sharpen_only);
 				}
 				else if (!cas_log_once)
